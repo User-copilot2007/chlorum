@@ -60,5 +60,6 @@ in
     };
 
     fileSystems."/persist".neededForBoot = true;
+    boot.initrd.luks.devices.chlorum.crypttabExtraOpts = [ "fido2-device=auto" ];
   };
 }

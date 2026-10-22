@@ -31,11 +31,26 @@
       modules = [
         "${nixpkgs}/nixos/modules/installer/cd-dvd/installation-cd-minimal.nix"
         self.nixosModules.chlorum
-        ({ lib, ... }: {
+        ({ lib, pkgs, ... }: {
           nixpkgs.hostPlatform = "x86_64-linux";
           chlorum.enable = true;
-          image.baseName = lib.mkForce "chlorum-0.0.4-x86_64";
+          image.baseName = lib.mkForce "chlorum-0.0.5-x86_64";
           boot.supportedFilesystems.zfs = lib.mkForce false;
+
+          # Chlorum itself travels inside the ISO
+          environment.etc."chlorum".source = self;
+
+          environment.systemPackages = [
+            (pkgs.writeShellApplication {
+              name = "chlorum-install";
+              runtimeInputs = [
+                disko.packages.x86_64-linux.disko
+                pkgs.mkpasswd
+                pkgs.util-linux
+              ];
+              text = builtins.readFile ./installer/chlorum-install.sh;
+            })
+          ];
         })
       ];
     };

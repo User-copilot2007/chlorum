@@ -15,5 +15,9 @@
   hardware.enableRedistributableFirmware = true;
   networking.networkmanager.enable = true;
 
+  # Temporary admin login until profiles. The installer writes only the hash.
+  users.mutableUsers = false;
+  users.users.root.hashedPasswordFile = "/persist/etc/chlorum/root.hash";
+
   system.stateVersion = "26.05";
 }
