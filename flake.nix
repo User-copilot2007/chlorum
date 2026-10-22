@@ -1,10 +1,29 @@
 {
   description = "Chlorum";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    disko = {
+      url = "github:nix-community/disko";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-  outputs = { self, nixpkgs }: {
-    nixosModules.chlorum = import ./modules/chlorum;
+  outputs = { self, nixpkgs, disko }: {
+    nixosModules.chlorum = {
+      imports = [
+        disko.nixosModules.disko
+        ./modules/chlorum
+      ];
+    };
+
+    # The same system for every PC
+    nixosConfigurations.chlorum = nixpkgs.lib.nixosSystem {
+      modules = [
+        self.nixosModules.chlorum
+        ./systems/chlorum.nix
+      ];
+    };
 
     nixosConfigurations.installer = nixpkgs.lib.nixosSystem {
       modules = [
@@ -13,7 +32,7 @@
         ({ lib, ... }: {
           nixpkgs.hostPlatform = "x86_64-linux";
           chlorum.enable = true;
-          image.baseName = lib.mkForce "chlorum-0.0.2-x86_64";
+          image.baseName = lib.mkForce "chlorum-0.0.3-x86_64";
           boot.supportedFilesystems.zfs = lib.mkForce false;
         })
       ];
