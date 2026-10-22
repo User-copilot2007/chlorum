@@ -1,14 +1,25 @@
 FLAKE=/etc/chlorum
 
+# The disk this live system runs from. Never offered, never touched.
+boot_disk=""
+if iso_src=$(findmnt -no SOURCE /iso 2>/dev/null); then
+  boot_disk=$(lsblk -no PKNAME "$iso_src" | head -n 1)
+fi
+
 echo
 echo "  CHLORUM INSTALLER"
 echo
-lsblk -d -o NAME,SIZE,MODEL,TRAN
+echo "Disks you can install on:"
+lsblk -d -e 7,11 -o NAME,SIZE,MODEL,TRAN | grep -v "^${boot_disk:-NONE} "
 echo
 read -rp "Disk to install on (for example sdb or nvme1n1): " name
 disk="/dev/$name"
 if [ ! -b "$disk" ]; then
   echo "No such disk: $disk"
+  exit 1
+fi
+if [ -n "$boot_disk" ] && [ "$name" = "$boot_disk" ]; then
+  echo "$disk is the USB stick Chlorum is running from. Refusing."
   exit 1
 fi
 
@@ -43,11 +54,29 @@ done
 printf '%s' "$a1" | mkpasswd -m yescrypt -s > /tmp/chlorum-root.hash
 
 echo
+echo "Cleaning $disk"
+lsblk -lnpo NAME "$disk" | while read -r dev; do
+  umount -q "$dev" 2>/dev/null || true
+  swapoff "$dev" 2>/dev/null || true
+done
+lsblk -lnpo NAME "$disk" | tac | xargs -r wipefs -af
+sgdisk --zap-all "$disk"
+blockdev --rereadpt "$disk" || true
+udevadm settle
+
+echo
 echo "Installing. This downloads the system and takes a while."
-disko-install \
+if ! disko-install \
   --flake "$FLAKE#chlorum" \
   --disk main "$disk" \
-  --extra-files /tmp/chlorum-root.hash /persist/etc/chlorum/root.hash
+  --extra-files /tmp/chlorum-root.hash /persist/etc/chlorum/root.hash; then
+  echo
+  echo "INSTALL FAILED. Diagnostics:"
+  lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS "$disk" || true
+  dmsetup ls || true
+  findmnt -R /mnt || true
+  exit 1
+fi
 
 part=/dev/disk/by-partlabel/disk-main-system
 
