@@ -7,12 +7,14 @@
       url = "github:nix-community/disko";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    impermanence.url = "github:nix-community/impermanence";
   };
 
-  outputs = { self, nixpkgs, disko }: {
+  outputs = { self, nixpkgs, disko, impermanence }: {
     nixosModules.chlorum = {
       imports = [
         disko.nixosModules.disko
+        impermanence.nixosModules.impermanence
         ./modules/chlorum
       ];
     };
@@ -32,7 +34,7 @@
         ({ lib, ... }: {
           nixpkgs.hostPlatform = "x86_64-linux";
           chlorum.enable = true;
-          image.baseName = lib.mkForce "chlorum-0.0.3-x86_64";
+          image.baseName = lib.mkForce "chlorum-0.0.4-x86_64";
           boot.supportedFilesystems.zfs = lib.mkForce false;
         })
       ];

@@ -1,6 +1,6 @@
 { config, lib, pkgs, ... }:
 {
-  imports = [ ./disk.nix ];
+  imports = [ ./disk.nix ./persist.nix ];
 
   options.chlorum.enable = lib.mkEnableOption "Chlorum";
 
