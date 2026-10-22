@@ -34,15 +34,7 @@ fi
 umask 077
 
 echo
-echo "Disk password (temporary safety net while Chlorum is in development)"
-while true; do
-  read -rsp "Disk password: " p1; echo
-  read -rsp "Repeat: " p2; echo
-  if [ -n "$p1" ] && [ "$p1" = "$p2" ]; then break; fi
-  echo "Passwords do not match or are empty."
-done
-printf '%s' "$p1" > /tmp/chlorum-disk-password
-
+echo "You will need both keys and their PINs, and paper for the recovery code."
 echo
 echo "Admin password (temporary console login until profiles exist)"
 while true; do
@@ -52,6 +44,9 @@ while true; do
   echo "Passwords do not match or are empty."
 done
 printf '%s' "$a1" | mkpasswd -m yescrypt -s > /tmp/chlorum-root.hash
+
+# One-time random passphrase: only used to set the disk up, then wiped.
+head -c 48 /dev/urandom | base64 -w0 > /tmp/chlorum-disk-password
 
 echo
 echo "Cleaning $disk"
@@ -93,6 +88,7 @@ enroll_key() {
 enroll_key "FIRST"
 echo "Remove the first key."
 enroll_key "SECOND"
+echo "Remove the second key."
 
 echo
 echo "RECOVERY CODE. Write it on paper now and keep it away from this PC."
@@ -100,6 +96,23 @@ systemd-cryptenroll "$part" \
   --unlock-key-file=/tmp/chlorum-disk-password \
   --recovery-key
 
+echo
+while true; do
+  read -rp "Type the recovery code from your paper: " code
+  if printf '%s' "$code" | cryptsetup open --test-passphrase --key-file=- "$part"; then
+    echo "Recovery code works."
+    break
+  fi
+  echo "This code does not open the disk. Check your paper and try again."
+done
+
+echo
+echo "Removing the one-time setup passphrase."
+systemd-cryptenroll "$part" \
+  --unlock-key-file=/tmp/chlorum-disk-password \
+  --wipe-slot=password
+
 shred -u /tmp/chlorum-disk-password /tmp/chlorum-root.hash
 echo
-echo "Done. Remove the USB stick and reboot."
+echo "Done. The disk now opens with either key or the recovery code."
+echo "Remove the USB stick and reboot."

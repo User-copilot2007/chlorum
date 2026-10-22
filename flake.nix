@@ -34,7 +34,7 @@
         ({ lib, pkgs, ... }: {
           nixpkgs.hostPlatform = "x86_64-linux";
           chlorum.enable = true;
-          image.baseName = lib.mkForce "chlorum-0.0.6-x86_64";
+          image.baseName = lib.mkForce "chlorum-0.0.7-x86_64";
           boot.supportedFilesystems.zfs = lib.mkForce false;
 
           # Chlorum itself travels inside the ISO
@@ -49,6 +49,7 @@
                 pkgs.util-linux
                 pkgs.gptfdisk
                 pkgs.lvm2
+                pkgs.cryptsetup
               ];
               text = builtins.readFile ./installer/chlorum-install.sh;
             })
