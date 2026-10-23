@@ -1,6 +1,27 @@
-{ config, lib, ... }:
+{ config, lib, pkgs, ... }:
 let
   cfg = config.chlorum.update;
+
+  chlorum-update = pkgs.writeShellApplication {
+    name = "chlorum-update";
+    runtimeInputs = [ config.systemd pkgs.coreutils ];
+    text = ''
+      if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi
+      echo "Checking for a new Chlorum version..."
+      journalctl -u nixos-upgrade.service -f -n 0 -o cat &
+      log=$!
+      trap 'kill "$log" 2>/dev/null' EXIT
+      if systemctl start nixos-upgrade.service; then
+        echo
+        echo "Done. If there was a new version, it starts after the next reboot."
+      else
+        echo
+        echo "Update failed. Your current version keeps working."
+        echo "Details: journalctl -u nixos-upgrade"
+        exit 1
+      fi
+    '';
+  };
 in
 {
   options.chlorum.update = {
@@ -10,6 +31,12 @@ in
       default = "github:User-copilot2007/chlorum#chlorum";
       description = "Where this machine gets new Chlorum versions.";
     };
+    dates = lib.mkOption {
+      type = lib.types.str;
+      default = "daily";
+      example = "*-*-* 00/6:00:00";
+      description = "How often to check for updates (systemd calendar format).";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -17,10 +44,11 @@ in
       enable = true;
       flake = cfg.source;
       operation = "boot";          # new version starts on next boot
-      dates = "daily";
+      dates = cfg.dates;
       randomizedDelaySec = "45min";
       persistent = true;           # catch up if the PC was off
       allowReboot = false;
     };
+    environment.systemPackages = [ chlorum-update ];
   };
 }
