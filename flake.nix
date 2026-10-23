@@ -30,11 +30,12 @@
     nixosConfigurations.installer = nixpkgs.lib.nixosSystem {
       modules = [
         "${nixpkgs}/nixos/modules/installer/cd-dvd/installation-cd-minimal.nix"
+        ./installer/iso.nix
         self.nixosModules.chlorum
         ({ lib, pkgs, ... }: {
           nixpkgs.hostPlatform = "x86_64-linux";
           chlorum.enable = true;
-          image.baseName = lib.mkForce "chlorum-0.0.8-x86_64";
+          image.baseName = lib.mkForce "chlorum-0.0.9-x86_64";
           boot.supportedFilesystems.zfs = lib.mkForce false;
 
           # Chlorum itself travels inside the ISO
