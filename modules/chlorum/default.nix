@@ -5,7 +5,7 @@
   options.chlorum.enable = lib.mkEnableOption "Chlorum";
 
   config = lib.mkIf config.chlorum.enable {
-    environment.etc."chlorum-release".text = "Chlorum 0.0.7\n";
+    environment.etc."chlorum-release".text = "Chlorum 0.0.8\n";
     system.nixos.distroName = "Chlorum";
     system.nixos.distroId = "chlorum";
     environment.systemPackages = [ pkgs.git ];

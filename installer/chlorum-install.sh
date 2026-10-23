@@ -1,5 +1,13 @@
 FLAKE=/etc/chlorum
 
+# Needs root. Restart through sudo when started as a normal user.
+if [ "$(id -u)" -ne 0 ]; then
+  exec sudo "$0" "$@"
+fi
+
+# Leftovers from an earlier, interrupted run
+rm -f /tmp/chlorum-disk-password /tmp/chlorum-root.hash
+
 # The disk this live system runs from. Never offered, never touched.
 boot_disk=""
 if iso_src=$(findmnt -no SOURCE /iso 2>/dev/null); then
@@ -92,19 +100,13 @@ echo "Remove the second key."
 
 echo
 echo "RECOVERY CODE. Write it on paper now and keep it away from this PC."
+echo "Never photograph it or send it to anyone."
 systemd-cryptenroll "$part" \
   --unlock-key-file=/tmp/chlorum-disk-password \
   --recovery-key
 
 echo
-while true; do
-  read -rp "Type the recovery code from your paper: " code
-  if printf '%s' "$code" | cryptsetup open --test-passphrase --key-file=- "$part"; then
-    echo "Recovery code works."
-    break
-  fi
-  echo "This code does not open the disk. Check your paper and try again."
-done
+read -rp "Press Enter after you have written the code down. " _
 
 echo
 echo "Removing the one-time setup passphrase."
