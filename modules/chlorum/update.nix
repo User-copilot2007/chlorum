@@ -4,7 +4,7 @@ let
 
   chlorum-update = pkgs.writeShellApplication {
     name = "chlorum-update";
-    runtimeInputs = [ config.systemd pkgs.coreutils ];
+    runtimeInputs = [ config.systemd.package pkgs.coreutils ];
     text = ''
       if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi
       echo "Checking for a new Chlorum version..."
