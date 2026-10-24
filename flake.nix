@@ -10,7 +10,10 @@
     impermanence.url = "github:nix-community/impermanence";
   };
 
-  outputs = { self, nixpkgs, disko, impermanence }: {
+  outputs = { self, nixpkgs, disko, impermanence }:
+  let
+    version = nixpkgs.lib.fileContents ./VERSION;
+  in {
     nixosModules.chlorum = {
       imports = [
         disko.nixosModules.disko
@@ -35,7 +38,7 @@
         ({ lib, pkgs, ... }: {
           nixpkgs.hostPlatform = "x86_64-linux";
           chlorum.enable = true;
-          image.baseName = lib.mkForce "chlorum-0.0.10-x86_64";
+          image.baseName = lib.mkForce "chlorum-${version}-x86_64";
           boot.supportedFilesystems.zfs = lib.mkForce false;
 
           # Chlorum itself travels inside the ISO

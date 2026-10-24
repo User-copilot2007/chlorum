@@ -7,7 +7,10 @@ let
   } ''
     mkdir -p $out
     rsvg-convert -w 256 -h 256 ${logo} -o $out/logo.png
-    magick -size 8x8 xc:'#FFD60A' $out/select_c.png
+    # GRUB draws the selection bar from nine pieces; all must exist
+    for p in nw n ne w c e sw s se; do
+      magick -size 8x8 xc:'#FFD60A' $out/select_$p.png
+    done
     cat > $out/theme.txt <<'THEME'
     title-text: ""
     desktop-color: "#000000"
@@ -55,6 +58,7 @@ in
   };
   services.getty.autologinUser = lib.mkForce "chlorum";
 
-  # Boot menu in Chlorum style
+  # Boot menu and drive name in Chlorum style
   isoImage.grubTheme = grubTheme;
+  isoImage.volumeID = "CHLORUM";
 }
