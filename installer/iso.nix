@@ -9,7 +9,9 @@ let
     rsvg-convert -w 256 -h 256 ${logo} -o $out/logo.png
     # GRUB draws the selection bar from nine pieces; all must exist
     for p in nw n ne w c e sw s se; do
-      magick -size 8x8 xc:'#FFD60A' $out/select_$p.png
+      # PNG32: full-colour RGBA. A one-colour image is otherwise saved as a
+      # 1-bit palette PNG, which GRUB cannot read, and the bar vanishes.
+      magick -size 8x8 xc:'#FFD60A' PNG32:$out/select_$p.png
     done
     cat > $out/theme.txt <<'THEME'
     title-text: ""

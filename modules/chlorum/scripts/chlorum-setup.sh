@@ -39,6 +39,30 @@ title() {
   printf '\n  %sCHLORUM SETUP%s\n\n' "$Y" "$N"
 }
 
+# Profiles are created through the system message bus (D-Bus).
+# Make sure it runs; start it again once if it failed during boot.
+wait_for_bus() {
+  local i
+  for i in $(seq 1 30); do
+    busctl --system status >/dev/null 2>&1 && return 0
+    if [ "$i" -eq 5 ]; then
+      systemctl reset-failed dbus.socket dbus.service >/dev/null 2>&1 || true
+      systemctl start dbus.socket dbus.service >/dev/null 2>&1 || true
+    fi
+    sleep 1
+  done
+  echo "The system message bus (D-Bus) is not running."
+  return 1
+}
+
+# Shown on every failure, so a photo of the screen is enough to find the cause.
+diagnostics() {
+  echo
+  echo "Diagnostics:"
+  systemctl --failed --no-pager --plain --no-legend 2>&1 | head -n 10 || true
+  journalctl -b -p err --no-pager -o cat 2>&1 | tail -n 12 || true
+}
+
 setup() {
   mkdir -p "$STATE"
 
@@ -113,6 +137,7 @@ setup() {
     fi
     echo
     echo "Creating your encrypted profile. This takes a minute."
+    wait_for_bus
     if NEWPASSWORD="$pass" homectl create "$user" \
          --real-name="$user" \
          --member-of=chlorum-owner \
@@ -127,8 +152,9 @@ setup() {
       return 1
     fi
     echo
-    echo "That did not work. Choose a profile name and password yourself."
-    choice=c
+    echo "That did not work (see the message above)."
+    echo "Press Enter to try again, or type c and Enter to choose your own."
+    read -r choice
   done
 
   # 5. The only screen to remember
@@ -157,6 +183,7 @@ while true; do
   set -e
   [ "$rc" -eq 0 ] && exit 0
 
+  diagnostics
   echo
   echo "Setup failed (error $rc)."
   echo "  r  try again"
