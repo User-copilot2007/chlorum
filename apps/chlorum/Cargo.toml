@@ -1,0 +1,28 @@
+[package]
+name = "chlorum"
+version = "0.4.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "Chlorum shell: Home, system menu, app layouts, login screen and Library"
+
+[dependencies]
+tokio = { version = "1", features = ["process", "net", "io-util", "time", "fs"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+niri-ipc = "=26.4.0"
+serde_json = "1"
+
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic.git"
+rev = "f0f68933f1552857e2165fc0fa953228107bddef"
+default-features = false
+features = ["winit", "wayland", "tokio", "wgpu", "multi-window"]
+
+# Same iced as libcosmic, with the canvas widget switched on.
+[dependencies.iced]
+git = "https://github.com/pop-os/libcosmic.git"
+rev = "f0f68933f1552857e2165fc0fa953228107bddef"
+default-features = false
+features = ["canvas"]
+
+[profile.release]
+lto = "thin"

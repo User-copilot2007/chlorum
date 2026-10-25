@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Chlorum
+Description=Chlorum logo with a turning chlorine atom
+ModuleName=script
+
+[script]
+ImageDir=@out@/share/plymouth/themes/chlorum
+ScriptFile=@out@/share/plymouth/themes/chlorum/chlorum.script

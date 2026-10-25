@@ -154,7 +154,7 @@ def serve(api):
 
 
 def kiosk(url, name, profile_dir):
-    """A Firefox window with no browser interface, showing one Chlorum page."""
+    """A browser window with no browser interface, showing one Chlorum page."""
     os.makedirs(profile_dir, exist_ok=True)
     with open(os.path.join(profile_dir, "user.js"), "w") as f:
         f.write('user_pref("browser.shell.checkDefaultBrowser", false);\n'
@@ -164,7 +164,8 @@ def kiosk(url, name, profile_dir):
                 'user_pref("datareporting.policy.dataSubmissionEnabled", false);\n'
                 'user_pref("browser.preonboarding.enabled", false);\n'
                 'user_pref("toolkit.startup.max_resumed_crashes", -1);\n')
-    return subprocess.Popen(["firefox", "--kiosk", "--no-remote", "--new-instance",
+    browser = os.environ.get("CHLORUM_KIOSK_BROWSER", "firefox")
+    return subprocess.Popen([browser, "--kiosk", "--no-remote", "--new-instance",
                              "--name", name, "--profile", profile_dir, url])
 
 

@@ -1,0 +1,6 @@
+/* The Chlorum focus mark on web pages: clear yellow, never hidden by the site. */
+:focus-visible {
+  outline: 3px solid #FFD60A !important;
+  outline-offset: 2px !important;
+  box-shadow: 0 0 0 6px rgba(0, 0, 0, 0.55) !important;
+}

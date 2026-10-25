@@ -1,0 +1,125 @@
+# Chlorum boot screen: the big logo, the name, and a chlorine atom turning
+# while the system starts (17 electrons on shells of 2, 8 and 7; the eighth
+# place on the outer shell stays open and blinks).
+# If the disk asks for its recovery code, the question appears under the atom.
+
+Window.SetBackgroundTopColor(0, 0, 0);
+Window.SetBackgroundBottomColor(0, 0, 0);
+
+W = Window.GetWidth();
+H = Window.GetHeight();
+u = H / 1080;                       # one "logical pixel" for this screen
+
+# ---------------------------------------------------------------- logo + name
+logo_img = Image("logo.png");
+lh = 430 * u;
+logo = Sprite(logo_img.Scale(lh * logo_img.GetWidth() / logo_img.GetHeight(), lh));
+logo.SetX(W / 2 - logo.GetImage().GetWidth() / 2);
+logo.SetY(H * 0.11);
+
+word_img = Image("word.png");
+wh = 46 * u;
+word = Sprite(word_img.Scale(wh * word_img.GetWidth() / word_img.GetHeight(), wh));
+word.SetX(W / 2 - word.GetImage().GetWidth() / 2);
+word.SetY(H * 0.11 + lh + 40 * u);
+
+# ---------------------------------------------------------------- the atom
+size = 210 * u;
+cx = W / 2;
+cy = H * 0.11 + lh + 40 * u + wh + 60 * u + size / 2;
+
+radius[0] = 0.20 * size; places[0] = 2; count[0] = 2; speed[0] = 0.110;
+radius[1] = 0.33 * size; places[1] = 8; count[1] = 8; speed[1] = -0.055;
+radius[2] = 0.47 * size; places[2] = 8; count[2] = 7; speed[2] = 0.034;
+
+for (s = 0; s < 3; s++) {
+  ring_img = Image("ring.png");
+  d = radius[s] * 2;
+  ring[s] = Sprite(ring_img.Scale(d, d));
+  ring[s].SetX(cx - d / 2);
+  ring[s].SetY(cy - d / 2);
+  ring[s].SetZ(1);
+}
+
+dot = 0.064 * size;
+e_img = Image("electron.png").Scale(dot, dot);
+hole_img = Image("hole.png").Scale(dot, dot);
+n = 0;
+for (s = 0; s < 3; s++) {
+  for (i = 0; i < places[s]; i++) {
+    if (i < count[s]) electron[n] = Sprite(e_img);
+    else electron[n] = Sprite(hole_img);
+    electron[n].SetZ(3);
+    shell_of[n] = s;
+    slot_of[n] = i;
+    n++;
+  }
+}
+total = n;
+
+nuc_img = Image("nucleus.png");
+nd = 0.25 * size;
+nucleus = Sprite(nuc_img.Scale(nd, nd));
+nucleus.SetX(cx - nd / 2);
+nucleus.SetY(cy - nd / 2);
+nucleus.SetZ(4);
+
+tick = 0;
+fun refresh() {
+  tick++;
+  for (k = 0; k < total; k++) {
+    s = shell_of[k];
+    a = tick * speed[s] + slot_of[k] / places[s] * 6.2832 - 1.5708;
+    electron[k].SetX(cx + Math.Cos(a) * radius[s] - dot / 2);
+    electron[k].SetY(cy + Math.Sin(a) * radius[s] - dot / 2);
+    if (s == 2 && slot_of[k] == 7)
+      electron[k].SetOpacity(0.35 + 0.65 * (0.5 + 0.5 * Math.Sin(tick * 0.09)));
+  }
+}
+Plymouth.SetRefreshFunction(refresh);
+
+# ---------------------------------------------------------------- questions
+question = Sprite();
+answer = Sprite();
+note = Sprite();
+question.SetZ(5); answer.SetZ(5); note.SetZ(5);
+qy = cy + size / 2 + 50 * u;
+
+fun center(sprite, img, y) {
+  sprite.SetImage(img);
+  sprite.SetX(W / 2 - img.GetWidth() / 2);
+  sprite.SetY(y);
+  sprite.SetOpacity(1);
+}
+
+fun show_password(prompt, bullets) {
+  if (prompt == "") prompt = "Enter the recovery code for this disk";
+  center(question, Image.Text(prompt, 0.96, 0.96, 0.96), qy);
+  stars = "";
+  for (i = 0; i < bullets; i++) stars += "•";
+  if (bullets == 0) stars = "_";
+  center(answer, Image.Text(stars, 1.0, 0.839, 0.039), qy + 40 * u);
+}
+Plymouth.SetDisplayPasswordFunction(show_password);
+
+fun show_question(prompt, entry) {
+  center(question, Image.Text(prompt, 0.96, 0.96, 0.96), qy);
+  center(answer, Image.Text(entry + "_", 1.0, 0.839, 0.039), qy + 40 * u);
+}
+Plymouth.SetDisplayQuestionFunction(show_question);
+
+fun normal() {
+  question.SetOpacity(0);
+  answer.SetOpacity(0);
+}
+Plymouth.SetDisplayNormalFunction(normal);
+
+fun message(text) {
+  center(note, Image.Text(text, 0.64, 0.64, 0.64), H - 80 * u);
+}
+Plymouth.SetMessageFunction(message);
+
+fun quit() {
+  normal();
+}
+Plymouth.SetQuitFunction(quit);

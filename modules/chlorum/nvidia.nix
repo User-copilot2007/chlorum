@@ -26,5 +26,12 @@
     boot.extraModprobeConfig = ''
       softdep nvidia post: nvidia-modeset nvidia-drm
     '';
+
+    # The NVIDIA driver keeps freed video memory for itself in compositors;
+    # this makes niri give it back (from niri's own NVIDIA notes).
+    environment.etc."nvidia/nvidia-application-profiles-rc.d/50-niri.json".text = builtins.toJSON {
+      rules = [ { pattern = { feature = "procname"; matches = "niri"; }; profile = "Chlorum compositor"; } ];
+      profiles = [ { name = "Chlorum compositor"; settings = [ { key = "GLVidHeapReuseRatio"; value = 0; } ]; } ];
+    };
   };
 }

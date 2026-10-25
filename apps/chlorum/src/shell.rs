@@ -1,0 +1,1569 @@
+//! Chlorum Shell: everything the system itself shows.
+//!
+//! * Home: clock, the ribbon of apps, Center and All apps. Shown when no app
+//!   is open, or when chosen from the system menu.
+//! * System menu: the PS-button menu, opened with Super over any app.
+//! * The templates: one app on the whole screen, or two side by side.
+//!
+//! Every screen is driven with the arrows, Enter and Esc. Hints at the bottom
+//! say which keys do what.
+
+use crate::apps::{self, App};
+use crate::layout::{Layout, Stage};
+use crate::niri::{self, Action, Event};
+use crate::system::{self, Power, Sound, Update, Wallpaper};
+use crate::ui::*;
+use chrono::{Local, Offset, Timelike};
+use cosmic::app::{Core, Settings, Task};
+use cosmic::iced::futures::SinkExt;
+use cosmic::iced::platform_specific::runtime::wayland::layer_surface::{IcedOutput, SctkLayerSurfaceSettings};
+use cosmic::iced::platform_specific::shell::commands::layer_surface::{
+    Anchor, KeyboardInteractivity, Layer, destroy_layer_surface, get_layer_surface,
+};
+use cosmic::iced::{self, Alignment, Color, Length, Subscription, event, keyboard, window};
+use cosmic::{Application, Element, widget};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+pub fn run() -> cosmic::iced::Result {
+    let settings = Settings::default()
+        .no_main_window(true)
+        .default_font(SANS)
+        .transparent(true)
+        .default_icon_theme("Papirus-Dark");
+    cosmic::app::run::<Shell>(settings, ())
+}
+
+/// `chlorum msg <what>`: what niri's key bindings send to the running shell.
+pub fn msg(what: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut s = std::os::unix::net::UnixStream::connect(apps::runtime_dir().join("shell.sock"))?;
+    s.write_all(format!("{what}\n").as_bytes())
+}
+
+const SUPER_DELAY: Duration = Duration::from_millis(140);
+
+#[derive(Clone, Debug)]
+enum Tile {
+    Running { id: u64, name: String, icon: String },
+    App(App),
+    Center,
+    AllApps,
+}
+
+impl Tile {
+    fn key(&self) -> String {
+        match self {
+            Tile::Running { id, .. } => format!("w{id}"),
+            Tile::App(a) => format!("a{}", a.id),
+            Tile::Center => "center".into(),
+            Tile::AllApps => "all".into(),
+        }
+    }
+    fn name(&self) -> &str {
+        match self {
+            Tile::Running { name, .. } => name,
+            Tile::App(a) => &a.name,
+            Tile::Center => "Center",
+            Tile::AllApps => "All apps",
+        }
+    }
+    fn icon(&self) -> &str {
+        match self {
+            Tile::Running { icon, .. } => icon,
+            Tile::App(a) => &a.icon,
+            Tile::Center => "preferences-system",
+            Tile::AllApps => "view-app-grid-symbolic",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HomeAct {
+    Open,
+    Beside,
+    Close,
+}
+
+impl HomeAct {
+    fn label(self) -> &'static str {
+        match self {
+            HomeAct::Open => "Open",
+            HomeAct::Beside => "Open beside",
+            HomeAct::Close => "Close app",
+        }
+    }
+    fn key(self) -> &'static str {
+        match self {
+            HomeAct::Open => "ENTER",
+            HomeAct::Beside => "S",
+            HomeAct::Close => "X",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Page {
+    Main,
+    AllApps,
+    Center,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Section {
+    Wallpaper,
+    Sound,
+    Updates,
+    About,
+}
+
+impl Section {
+    const ALL: [Section; 4] = [Section::Wallpaper, Section::Sound, Section::Updates, Section::About];
+    fn label(self) -> &'static str {
+        match self {
+            Section::Wallpaper => "Wallpaper",
+            Section::Sound => "Sound",
+            Section::Updates => "Updates",
+            Section::About => "About",
+        }
+    }
+    fn rows(self) -> usize {
+        match self {
+            Section::Wallpaper => 5,
+            Section::Sound => 2,
+            Section::Updates => 1,
+            Section::About => 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Card {
+    Layout,
+    Apps,
+    Update,
+    Sound,
+    Home,
+    Center,
+    Power,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sub {
+    None,
+    Apps(usize),
+    Power(usize),
+    Sound,
+}
+
+#[derive(Clone, Debug)]
+pub enum Message {
+    Frame,
+    Tick,
+    Key(window::Id, keyboard::Key, keyboard::Modifiers),
+    Niri(Event),
+    Arranged,
+    StartupOver,
+    Command(String),
+    SuperFire(u64),
+    Sound(Sound),
+    Network(String),
+    Update(Update),
+}
+
+pub struct Shell {
+    core: Core,
+    layout: Layout,
+    installed: HashMap<String, App>,
+    pinned: Vec<String>,
+    started: bool,
+
+    home: Option<window::Id>,
+    home_show: f32,
+    home_closing: bool,
+    page: Page,
+    sel: usize,
+    act: Option<usize>,
+    grow: HashMap<String, f32>,
+    all_sel: usize,
+    section: usize,
+    row: Option<usize>,
+
+    menu: Option<window::Id>,
+    menu_show: f32,
+    menu_closing: bool,
+    card: usize,
+    sub: Sub,
+    power_armed: bool,
+
+    wallpaper: Wallpaper,
+    sound: Sound,
+    network: String,
+    update: Update,
+    user: String,
+
+    super_seq: u64,
+    /// focus moves the shell asked for itself; niri reports them back
+    expect_focus: Vec<u64>,
+    quiet_until: Instant,
+    arranging: bool,
+    arrange_again: bool,
+    toast: Option<(String, Instant)>,
+    last_frame: Instant,
+}
+
+impl Application for Shell {
+    type Executor = cosmic::executor::Default;
+    type Flags = ();
+    type Message = Message;
+    const APP_ID: &'static str = "com.chlorum.Shell";
+
+    fn core(&self) -> &Core {
+        &self.core
+    }
+    fn core_mut(&mut self) -> &mut Core {
+        &mut self.core
+    }
+
+    fn init(core: Core, _: ()) -> (Self, Task<Message>) {
+        let mut shell = Shell {
+            core,
+            layout: Layout::default(),
+            installed: apps::installed(),
+            pinned: apps::id_list("home-apps", apps::DEFAULT_PINNED),
+            started: false,
+            home: None,
+            home_show: 0.0,
+            home_closing: false,
+            page: Page::Main,
+            sel: 0,
+            act: None,
+            grow: HashMap::new(),
+            all_sel: 0,
+            section: 0,
+            row: None,
+            menu: None,
+            menu_show: 0.0,
+            menu_closing: false,
+            card: 0,
+            sub: Sub::None,
+            power_armed: false,
+            wallpaper: Wallpaper::load(),
+            sound: Sound::default(),
+            network: String::new(),
+            update: Update::Idle,
+            user: system::display_name(),
+            super_seq: 0,
+            expect_focus: Vec::new(),
+            quiet_until: Instant::now(),
+            arranging: false,
+            arrange_again: false,
+            toast: None,
+            last_frame: Instant::now(),
+        };
+        system::pause_wallpaper(false);
+        let t = Task::batch([
+            shell.open_home(),
+            Task::perform(system::sound(), |s| cosmic::Action::App(Message::Sound(s))),
+            Task::perform(system::network(), |s| cosmic::Action::App(Message::Network(s))),
+        ]);
+        (shell, t)
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let mut subs = vec![
+            Subscription::run(niri::events).map(Message::Niri),
+            Subscription::run(commands),
+            iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick),
+            event::listen_with(|e, _status, id| match e {
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+                    Some(Message::Key(id, key, modifiers))
+                }
+                _ => None,
+            }),
+        ];
+        if self.animating() {
+            subs.push(iced::time::every(Duration::from_millis(8)).map(|_| Message::Frame));
+        }
+        Subscription::batch(subs)
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        let t = self.handle(message);
+        self.sync_grow();
+        t
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        widget::Space::new().into()
+    }
+
+    fn view_window(&self, id: window::Id) -> Element<'_, Message> {
+        if Some(id) == self.menu {
+            self.menu_view()
+        } else if Some(id) == self.home {
+            self.home_view()
+        } else {
+            widget::Space::new().into()
+        }
+    }
+}
+
+impl Shell {
+    fn handle(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Frame => return self.step(),
+            Message::Tick => {
+                if self.toast.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(3)) {
+                    self.toast = None;
+                }
+                // sound and network change outside the shell too: look every few seconds
+                let now = Local::now().second();
+                if now % 5 == 0 && Local::now().timestamp_subsec_millis() < 250 {
+                    return Task::batch([
+                        Task::perform(system::sound(), |s| cosmic::Action::App(Message::Sound(s))),
+                        Task::perform(system::network(), |s| cosmic::Action::App(Message::Network(s))),
+                    ]);
+                }
+            }
+            Message::Sound(s) => self.sound = s,
+            Message::Network(n) => self.network = n,
+            Message::Update(u) => {
+                let start = u == Update::Available && self.update == Update::Installing;
+                self.update = u;
+                if start {
+                    return Task::perform(system::install_update(), |u| cosmic::Action::App(Message::Update(u)));
+                }
+            }
+            Message::Niri(ev) => return self.niri_event(ev),
+            Message::StartupOver => self.layout.startup_left = 0,
+            Message::Arranged => {
+                self.arranging = false;
+                self.quiet_until = Instant::now() + Duration::from_millis(300);
+                if std::mem::take(&mut self.arrange_again) {
+                    return self.arrange();
+                }
+            }
+            Message::Command(c) => return self.command(c.trim()),
+            Message::SuperFire(seq) => {
+                if seq == self.super_seq {
+                    return self.toggle_menu();
+                }
+            }
+            Message::Key(id, key, mods) => {
+                if Some(id) == self.menu && !self.menu_closing {
+                    return self.menu_key(key);
+                }
+                if Some(id) == self.home && !self.home_closing {
+                    return self.home_key(key, mods);
+                }
+            }
+        }
+        Task::none()
+    }
+
+    /// Every tile has a size that eases between resting and chosen.
+    fn sync_grow(&mut self) {
+        let keys: Vec<String> = self.tiles().iter().map(|t| t.key()).collect();
+        self.grow.retain(|k, _| keys.contains(k));
+        for k in keys {
+            if !self.grow.contains_key(&k) {
+                let g = self.grow_target(&k);
+                self.grow.insert(k, g);
+            }
+        }
+    }
+}
+
+/// Lines written to $XDG_RUNTIME_DIR/chlorum/shell.sock by `chlorum msg`.
+fn commands() -> impl cosmic::iced::futures::Stream<Item = Message> {
+    cosmic::iced::stream::channel(16, async |mut out| {
+        let dir = apps::runtime_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("shell.sock");
+        let _ = std::fs::remove_file(&path);
+        let Ok(listener) = tokio::net::UnixListener::bind(&path) else { return };
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { continue };
+            let mut line = String::new();
+            if BufReader::new(stream).read_line(&mut line).await.is_ok() && !line.trim().is_empty() {
+                if out.send(Message::Command(line)).await.is_err() {
+                    return;
+                }
+            }
+        }
+    })
+}
+
+fn layer(id: window::Id, layer: Layer, namespace: &str) -> SctkLayerSurfaceSettings {
+    SctkLayerSurfaceSettings {
+        id,
+        layer,
+        keyboard_interactivity: KeyboardInteractivity::Exclusive,
+        anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
+        output: IcedOutput::Active,
+        namespace: namespace.into(),
+        size: Some((None, None)),
+        exclusive_zone: -1,
+        size_limits: iced::Limits::NONE.min_width(1.0).min_height(1.0).max_width(100_000.0).max_height(100_000.0),
+        ..Default::default()
+    }
+}
+
+impl Shell {
+    // ================================================================ surfaces
+
+    fn open_home(&mut self) -> Task<Message> {
+        self.home_closing = false;
+        self.page = Page::Main;
+        self.act = None;
+        self.sel = 0;
+        self.kick();
+        system::pause_wallpaper(false);
+        if self.home.is_some() {
+            return Task::none();
+        }
+        let id = window::Id::unique();
+        self.home = Some(id);
+        self.home_show = 0.0;
+        get_layer_surface(layer(id, Layer::Overlay, "chlorum-home"))
+    }
+
+    fn close_home(&mut self) {
+        if self.home.is_some() && !self.layout.on_stage().is_empty() {
+            self.home_closing = true;
+            self.kick();
+        }
+    }
+
+    fn toggle_menu(&mut self) -> Task<Message> {
+        if self.menu.is_some() && !self.menu_closing {
+            self.close_menu();
+            return Task::none();
+        }
+        self.menu_closing = false;
+        self.card = 0;
+        self.sub = Sub::None;
+        self.power_armed = false;
+        self.kick();
+        if self.menu.is_some() {
+            return Task::none();
+        }
+        let id = window::Id::unique();
+        self.menu = Some(id);
+        self.menu_show = 0.0;
+        get_layer_surface(layer(id, Layer::Overlay, "chlorum-menu"))
+    }
+
+    fn close_menu(&mut self) {
+        if self.menu.is_some() {
+            self.menu_closing = true;
+            self.kick();
+        }
+    }
+
+    fn animating(&self) -> bool {
+        (self.home.is_some() && (self.home_closing || self.home_show < 1.0))
+            || (self.menu.is_some() && (self.menu_closing || self.menu_show < 1.0))
+            || self.grow.iter().any(|(k, g)| (g - self.grow_target(k)).abs() > 0.002)
+    }
+
+    fn kick(&mut self) {
+        self.last_frame = Instant::now();
+    }
+
+    fn step(&mut self) -> Task<Message> {
+        let dt = self.last_frame.elapsed().as_secs_f32().min(0.05);
+        self.last_frame = Instant::now();
+        let mut tasks = Vec::new();
+        if self.home.is_some() {
+            if self.home_closing {
+                self.home_show = (self.home_show - dt / 0.16).max(0.0);
+                if self.home_show <= 0.0 {
+                    tasks.push(destroy_layer_surface(self.home.take().unwrap()));
+                    self.home_closing = false;
+                    self.update_pause();
+                }
+            } else {
+                self.home_show = (self.home_show + dt / 0.22).min(1.0);
+            }
+        }
+        if self.menu.is_some() {
+            if self.menu_closing {
+                self.menu_show = (self.menu_show - dt / 0.14).max(0.0);
+                if self.menu_show <= 0.0 {
+                    tasks.push(destroy_layer_surface(self.menu.take().unwrap()));
+                    self.menu_closing = false;
+                }
+            } else {
+                self.menu_show = (self.menu_show + dt / 0.2).min(1.0);
+            }
+        }
+        let keys: Vec<String> = self.grow.keys().cloned().collect();
+        for k in keys {
+            let t = self.grow_target(&k);
+            if let Some(g) = self.grow.get_mut(&k) {
+                ease(g, t, dt, 16.0);
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    fn update_pause(&self) {
+        let covered = self.home.is_none() && !self.layout.on_stage().is_empty();
+        system::pause_wallpaper(covered);
+    }
+
+    fn toast(&mut self, s: &str) {
+        self.toast = Some((s.to_string(), Instant::now()));
+    }
+
+    // ================================================================ niri
+
+    fn niri_event(&mut self, ev: Event) -> Task<Message> {
+        let mut new_window = false;
+        match ev {
+            Event::WorkspacesChanged { workspaces } => self.layout.set_workspaces(&workspaces),
+            Event::WindowsChanged { windows } => {
+                self.layout.set_windows(windows);
+                if !self.started {
+                    self.started = true;
+                    return Task::batch([self.startup(), self.arrange()]);
+                }
+            }
+            Event::WindowOpenedOrChanged { window } => new_window = self.layout.window_changed(window),
+            Event::WindowClosed { id } => {
+                self.layout.window_closed(id);
+                if self.layout.on_stage().is_empty() {
+                    let t = self.open_home();
+                    return Task::batch([t, self.arrange()]);
+                }
+            }
+            Event::WindowLayoutsChanged { changes } => self.layout.layouts_changed(changes),
+            Event::WindowFocusChanged { id } => {
+                self.layout.set_focused(id);
+                // the focus moves the shell makes itself are not choices
+                let expected = id.is_some_and(|i| self.expect_focus.contains(&i));
+                if expected {
+                    self.expect_focus.retain(|x| Some(*x) != id);
+                } else if !self.arranging && Instant::now() >= self.quiet_until {
+                    self.layout.focus_changed(id);
+                }
+            }
+            _ => return Task::none(),
+        }
+        if new_window {
+            self.close_home();
+            self.close_menu();
+        }
+        self.update_pause();
+        self.arrange()
+    }
+
+    fn startup(&mut self) -> Task<Message> {
+        if !self.layout.windows.is_empty() {
+            // the shell restarted inside a running session
+            if !self.layout.on_stage().is_empty() {
+                self.close_home();
+            }
+            return Task::none();
+        }
+        let ids = apps::id_list("startup", apps::DEFAULT_STARTUP);
+        let list: Vec<String> = ids.iter().filter_map(|id| self.installed.get(id)).take(2).map(|a| a.exec.clone()).collect();
+        self.layout.startup_left = list.len();
+        Task::batch([
+            // the second app a moment later, so they open in order
+            Task::perform(
+                async move {
+                    for (i, exec) in list.into_iter().enumerate() {
+                        if i > 0 {
+                            tokio::time::sleep(Duration::from_millis(900)).await;
+                        }
+                        niri::run(vec![Action::SpawnSh { command: exec }]).await;
+                    }
+                },
+                |_| cosmic::Action::App(Message::Tick),
+            ),
+            // an app that never opens must not change what the next one does
+            Task::perform(tokio::time::sleep(Duration::from_secs(20)), |_| cosmic::Action::App(Message::StartupOver)),
+        ])
+    }
+
+    fn arrange(&mut self) -> Task<Message> {
+        if self.arranging {
+            self.arrange_again = true;
+            return Task::none();
+        }
+        let plan = self.layout.plan();
+        if plan.is_empty() {
+            return Task::none();
+        }
+        self.expect_focus = plan
+            .iter()
+            .filter_map(|a| match a {
+                Action::FocusWindow { id } => Some(*id),
+                _ => None,
+            })
+            .collect();
+        self.arranging = true;
+        Task::perform(niri::run(plan), |_| cosmic::Action::App(Message::Arranged))
+    }
+
+    fn command(&mut self, c: &str) -> Task<Message> {
+        // anything other than Super itself cancels a menu about to open
+        if c != "super" {
+            self.super_seq += 1;
+        }
+        match c {
+            "super" => {
+                self.super_seq += 1;
+                let seq = self.super_seq;
+                if self.menu.is_some() && !self.menu_closing {
+                    return self.toggle_menu();
+                }
+                return Task::perform(tokio::time::sleep(SUPER_DELAY), move |_| {
+                    cosmic::Action::App(Message::SuperFire(seq))
+                });
+            }
+            "home" => {
+                self.close_menu();
+                return self.open_home();
+            }
+            "left" | "right" | "grow" | "shrink" | "swap" | "template" => self.close_menu(),
+            _ => {}
+        }
+        match c {
+            "left" => self.layout.focus_side(false),
+            "right" => self.layout.focus_side(true),
+            "grow" => self.layout.resize(true),
+            "shrink" => self.layout.resize(false),
+            "swap" => self.layout.swap(),
+            "template" => {
+                if !self.layout.toggle_two() {
+                    self.toast("Open a second app first");
+                }
+            }
+            _ => {}
+        }
+        self.arrange()
+    }
+
+    // ================================================================ home
+
+    fn tiles(&self) -> Vec<Tile> {
+        let mut out = Vec::new();
+        let mut running_apps: Vec<String> = Vec::new();
+        for w in self.layout.apps() {
+            let app = w.app_id.as_deref().and_then(|aid| self.installed.values().find(|a| a.owns(aid)));
+            if let Some(a) = app {
+                running_apps.push(a.id.clone());
+            }
+            out.push(Tile::Running {
+                id: w.id,
+                name: app.map(|a| a.name.clone()).or_else(|| w.title.clone()).unwrap_or_else(|| "App".into()),
+                icon: app.map(|a| a.icon.clone()).or_else(|| w.app_id.clone()).unwrap_or_default(),
+            });
+        }
+        for id in &self.pinned {
+            if running_apps.contains(id) {
+                continue;
+            }
+            if let Some(a) = self.installed.get(id) {
+                out.push(Tile::App(a.clone()));
+            }
+        }
+        out.push(Tile::Center);
+        out.push(Tile::AllApps);
+        out
+    }
+
+    fn acts(&self, t: &Tile) -> Vec<HomeAct> {
+        let stage = self.layout.on_stage();
+        match t {
+            Tile::Running { id, .. } => {
+                let mut v = vec![HomeAct::Open];
+                if !stage.is_empty() && !(stage.len() == 1 && stage[0] == *id) {
+                    v.push(HomeAct::Beside);
+                }
+                v.push(HomeAct::Close);
+                v
+            }
+            Tile::App(_) => {
+                if stage.is_empty() { vec![HomeAct::Open] } else { vec![HomeAct::Open, HomeAct::Beside] }
+            }
+            _ => vec![HomeAct::Open],
+        }
+    }
+
+    fn grow_target(&self, key: &str) -> f32 {
+        if self.page != Page::Main {
+            return 0.0;
+        }
+        let tiles = self.tiles();
+        match tiles.get(self.sel.min(tiles.len().saturating_sub(1))) {
+            Some(t) if t.key() == key => 1.0,
+            _ => 0.0,
+        }
+    }
+
+    fn do_act(&mut self, tile: Tile, act: HomeAct) -> Task<Message> {
+        match (tile, act) {
+            (Tile::Center, _) => {
+                self.page = Page::Center;
+                self.section = 0;
+                self.row = None;
+            }
+            (Tile::AllApps, _) => {
+                self.page = Page::AllApps;
+                self.all_sel = 0;
+            }
+            (Tile::Running { id, .. }, HomeAct::Open) => {
+                self.layout.bring(id);
+                self.close_home_now();
+                return self.arrange();
+            }
+            (Tile::Running { id, .. }, HomeAct::Beside) => {
+                self.layout.beside(id);
+                self.close_home_now();
+                return self.arrange();
+            }
+            (Tile::Running { id, .. }, HomeAct::Close) => {
+                return Task::perform(niri::run(vec![Action::CloseWindow { id: Some(id) }]), |_| {
+                    cosmic::Action::App(Message::Tick)
+                });
+            }
+            (Tile::App(a), act) => {
+                self.layout.beside_next = act == HomeAct::Beside;
+                self.toast(&format!("Opening {}…", a.name));
+                // started by niri, so apps live on even if the shell restarts
+                return Task::perform(niri::run(vec![Action::SpawnSh { command: a.exec.clone() }]), |_| {
+                    cosmic::Action::App(Message::Tick)
+                });
+            }
+        }
+        self.kick();
+        Task::none()
+    }
+
+    fn close_home_now(&mut self) {
+        self.home_closing = true;
+        self.kick();
+    }
+
+    fn home_key(&mut self, key: keyboard::Key, _mods: keyboard::Modifiers) -> Task<Message> {
+        use keyboard::key::Named;
+        let named = match key.as_ref() {
+            keyboard::Key::Named(n) => Some(n),
+            _ => None,
+        };
+        let ch = match key.as_ref() {
+            keyboard::Key::Character(c) => c.to_lowercase(),
+            _ => String::new(),
+        };
+        let page = self.page;
+        let t = match self.page {
+            Page::Main => self.main_key(named, &ch),
+            Page::AllApps => self.all_key(named),
+            Page::Center => self.center_key(named),
+        };
+        if named == Some(Named::Escape) && page == Page::Main && self.act.is_none() {
+            self.close_home();
+        }
+        self.kick();
+        t
+    }
+
+    fn main_key(&mut self, named: Option<keyboard::key::Named>, ch: &str) -> Task<Message> {
+        use keyboard::key::Named;
+        let tiles = self.tiles();
+        let n = tiles.len();
+        self.sel = self.sel.min(n.saturating_sub(1));
+        let tile = tiles[self.sel].clone();
+        let acts = self.acts(&tile);
+        match (named, self.act) {
+            (Some(Named::ArrowRight), None) => self.sel = (self.sel + 1).min(n - 1),
+            (Some(Named::ArrowLeft), None) => self.sel = self.sel.saturating_sub(1),
+            (Some(Named::Home), None) => self.sel = 0,
+            (Some(Named::End), None) => self.sel = n - 1,
+            (Some(Named::ArrowDown), None) => self.act = Some(0),
+            (Some(Named::ArrowRight), Some(a)) => self.act = Some((a + 1).min(acts.len() - 1)),
+            (Some(Named::ArrowLeft), Some(a)) => self.act = Some(a.saturating_sub(1)),
+            (Some(Named::ArrowUp), Some(_)) | (Some(Named::Escape), Some(_)) => self.act = None,
+            (Some(Named::Enter), a) => {
+                let act = acts[a.unwrap_or(0).min(acts.len() - 1)];
+                self.act = None;
+                return self.do_act(tile, act);
+            }
+            _ => {}
+        }
+        match ch {
+            "s" if acts.contains(&HomeAct::Beside) => return self.do_act(tile, HomeAct::Beside),
+            "x" if acts.contains(&HomeAct::Close) => return self.do_act(tile, HomeAct::Close),
+            _ => {}
+        }
+        Task::none()
+    }
+
+    fn all_apps(&self) -> Vec<App> {
+        let mut v: Vec<App> = self.installed.values().filter(|a| a.id != "chlorum-shell").cloned().collect();
+        v.sort_by_key(|a| a.name.to_lowercase());
+        v
+    }
+
+    fn all_key(&mut self, named: Option<keyboard::key::Named>) -> Task<Message> {
+        use keyboard::key::Named;
+        const COLS: usize = 6;
+        let list = self.all_apps();
+        let n = list.len().max(1);
+        match named {
+            Some(Named::ArrowRight) => self.all_sel = (self.all_sel + 1).min(n - 1),
+            Some(Named::ArrowLeft) => self.all_sel = self.all_sel.saturating_sub(1),
+            Some(Named::ArrowDown) => self.all_sel = (self.all_sel + COLS).min(n - 1),
+            Some(Named::ArrowUp) => self.all_sel = self.all_sel.saturating_sub(COLS),
+            Some(Named::Escape) => self.page = Page::Main,
+            Some(Named::Enter) => {
+                if let Some(a) = list.get(self.all_sel) {
+                    self.page = Page::Main;
+                    return self.do_act(Tile::App(a.clone()), HomeAct::Open);
+                }
+            }
+            _ => {}
+        }
+        Task::none()
+    }
+
+    fn center_key(&mut self, named: Option<keyboard::key::Named>) -> Task<Message> {
+        use keyboard::key::Named;
+        let section = Section::ALL[self.section];
+        let Some(row) = self.row else {
+            match named {
+                Some(Named::ArrowDown) => self.section = (self.section + 1).min(Section::ALL.len() - 1),
+                Some(Named::ArrowUp) => self.section = self.section.saturating_sub(1),
+                Some(Named::ArrowRight) | Some(Named::Enter) if section.rows() > 0 => self.row = Some(0),
+                Some(Named::Escape) => self.page = Page::Main,
+                _ => {}
+            }
+            return Task::none();
+        };
+        match named {
+            Some(Named::Escape) => self.row = None,
+            Some(Named::ArrowDown) => self.row = Some((row + 1).min(section.rows() - 1)),
+            Some(Named::ArrowUp) => self.row = Some(row.saturating_sub(1)),
+            Some(Named::ArrowLeft) => return self.change(section, row, -1),
+            Some(Named::ArrowRight) => return self.change(section, row, 1),
+            Some(Named::Enter) => return self.change(section, row, 0),
+            _ => {}
+        }
+        Task::none()
+    }
+
+    /// ← → change the value on a row, Enter presses it.
+    fn change(&mut self, section: Section, row: usize, dir: i32) -> Task<Message> {
+        let d = dir as f32;
+        match section {
+            Section::Wallpaper => {
+                let w = &mut self.wallpaper;
+                match row {
+                    0 => {
+                        let i = system::STYLES.iter().position(|s| s.0 == w.style).unwrap_or(0) as i32;
+                        let i = (i + dir).clamp(0, system::STYLES.len() as i32 - 1);
+                        w.style = system::STYLES[i as usize].0.into();
+                    }
+                    1 => w.speed = ((w.speed + d * 0.1) * 10.0).round().clamp(0.0, 10.0) / 10.0,
+                    2 => w.brightness = ((w.brightness + d * 0.1) * 10.0).round().clamp(1.0, 10.0) / 10.0,
+                    3 => w.amount = (w.amount + d).clamp(1.0, 10.0),
+                    _ => {
+                        let i = system::COLORS.iter().position(|c| c.0.eq_ignore_ascii_case(&w.color)).unwrap_or(0) as i32;
+                        let i = (i + dir).clamp(0, system::COLORS.len() as i32 - 1);
+                        w.color = system::COLORS[i as usize].0.into();
+                    }
+                }
+                self.wallpaper.save();
+            }
+            Section::Sound => {
+                if row == 0 && dir != 0 {
+                    let v = ((self.sound.volume + d * 0.05) * 20.0).round() / 20.0;
+                    return Task::perform(system::set_volume(v), |s| cosmic::Action::App(Message::Sound(s)));
+                }
+                if row == 1 {
+                    return Task::perform(system::toggle_mute(), |s| cosmic::Action::App(Message::Sound(s)));
+                }
+            }
+            Section::Updates => {
+                if dir == 0 {
+                    return self.update_action();
+                }
+            }
+            Section::About => {}
+        }
+        Task::none()
+    }
+
+    fn update_action(&mut self) -> Task<Message> {
+        match self.update {
+            Update::Checking | Update::Installing => Task::none(),
+            Update::Available => {
+                self.update = Update::Installing;
+                Task::perform(system::install_update(), |u| cosmic::Action::App(Message::Update(u)))
+            }
+            _ => {
+                self.update = Update::Checking;
+                Task::perform(system::check_update(), |u| cosmic::Action::App(Message::Update(u)))
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- views
+
+    fn home_view(&self) -> Element<'_, Message> {
+        let f = ease_out(self.home_show);
+        let body = match self.page {
+            Page::Main => self.main_view(f),
+            Page::AllApps => self.all_view(f),
+            Page::Center => self.center_view(f),
+        };
+        // darker behind the text on the left, the wallpaper shows on the right
+        let shade = alpha(Color::from_rgba(0.0, 0.0, 0.0, if self.page == Page::Main { 0.35 } else { 0.8 }), f);
+        fill(body, shade).width(Length::Fill).height(Length::Fill).into()
+    }
+
+    fn top_bar(&self, f: f32) -> Element<'_, Message> {
+        let now = Local::now();
+        let clock = widget::Row::new()
+            .push(text(format!("{:02}:{:02}", now.hour(), now.minute()), MONO_BOLD, 88.0, alpha(TEXT, f)))
+            .push(text(format!(":{:02}", now.second()), MONO_BOLD, 88.0, alpha(YELLOW, f)));
+        let date = text(format!("{}  ·  {}", now.format("%A, %-d %B"), zone_label(&now)), SANS, 22.0, alpha(TEXT_2, f));
+        let chip = |s: String, strong: bool| -> Element<'_, Message> {
+            boxed(text(s, MONO, 15.0, alpha(if strong { YELLOW } else { TEXT }, f)), alpha(Color::from_rgba(0.0, 0.0, 0.0, 0.55), f), alpha(if strong { YELLOW } else { LINE }, f), 1.5)
+                .padding([9, 16])
+                .into()
+        };
+        let mut chips = widget::Row::new().spacing(12);
+        chips = chips.push(chip(format!("NET · {}", self.network.to_uppercase()), false));
+        if self.sound.present {
+            let v = if self.sound.muted { "MUTED".to_string() } else { format!("VOL {:.0}", self.sound.volume * 100.0) };
+            chips = chips.push(chip(v, false));
+        }
+        if matches!(self.update, Update::Available | Update::Installed) {
+            chips = chips.push(chip("UPDATE READY".into(), true));
+        }
+        chips = chips.push(chip(self.user.to_uppercase(), false));
+        widget::Row::new()
+            .push(widget::Column::new().push(clock).push(date).spacing(6))
+            .push(hfill())
+            .push(chips)
+            .into()
+    }
+
+    fn main_view(&self, f: f32) -> Element<'_, Message> {
+        let tiles = self.tiles();
+        let sel = self.sel.min(tiles.len().saturating_sub(1));
+        let mut ribbon = widget::Row::new().spacing(22).align_y(Alignment::End).height(Length::Fixed(272.0));
+        for (i, t) in tiles.iter().enumerate() {
+            ribbon = ribbon.push(self.tile_view(i, t, f));
+        }
+        let tile = &tiles[sel];
+        let sub = match tile {
+            Tile::Running { id, .. } => {
+                if self.layout.on_stage().contains(id) { "On screen now".to_string() } else { "Open, waiting in the background".to_string() }
+            }
+            Tile::App(_) => "Not open".into(),
+            Tile::Center => "Wallpaper, sound, updates".into(),
+            Tile::AllApps => format!("{} apps", self.all_apps().len()),
+        };
+        let mut acts = widget::Row::new().spacing(18);
+        for (i, a) in self.acts(tile).into_iter().enumerate() {
+            let on = self.act == Some(i);
+            let primary = i == 0;
+            let bg = if on || (primary && self.act.is_none()) { YELLOW } else { PANEL_2 };
+            let fg = if bg == YELLOW { BLACK } else { TEXT };
+            let b = fill(
+                widget::Row::new()
+                    .push(text(a.key(), MONO_BOLD, 15.0, alpha(fg, f)))
+                    .push(text(a.label(), SANS_BOLD, 21.0, alpha(fg, f)))
+                    .spacing(14)
+                    .align_y(Alignment::Center),
+                alpha(bg, f),
+            )
+            .padding([14, 26]);
+            acts = acts.push(bracket(b, if on { f } else { 0.0 }, 8.0));
+        }
+
+        let logo = widget::icon::from_name("com.chlorum.Logo").size(220);
+        let mut col = widget::Column::new()
+            .push(widget::Row::new().push(self.top_bar(f)))
+            .push(widget::Row::new().push(hfill()).push(if f > 0.05 { Element::from(logo) } else { space(220.0, 220.0) }))
+            .push(vfill())
+            .push(ribbon)
+            .push(space(1.0, 22.0))
+            .push(text(tile.name().to_string(), SANS_BOLD, 46.0, alpha(TEXT, f)))
+            .push(text(sub, SANS, 21.0, alpha(TEXT_2, f)))
+            .push(space(1.0, 16.0))
+            .push(acts)
+            .push(space(1.0, 28.0));
+        if let Some((t, _)) = &self.toast {
+            col = col.push(text(t.clone(), MONO, 17.0, alpha(YELLOW, f))).push(space(1.0, 10.0));
+        }
+        let mut h: Vec<(&str, &str, bool)> = vec![("← →", "Choose", false), ("↓", "More", false), ("ENTER", "Open", true)];
+        if !self.layout.on_stage().is_empty() {
+            h.push(("S", "Open beside", false));
+            h.push(("ESC", "Back to app", false));
+        }
+        h.push(("SUPER", "System menu", false));
+        col.push(hints(&h, f)).padding([48, 72]).into()
+    }
+
+    fn tile_view<'a>(&'a self, i: usize, t: &Tile, f: f32) -> Element<'a, Message> {
+        let g = self.grow.get(&t.key()).copied().unwrap_or(if i == self.sel { 1.0 } else { 0.0 });
+        let size = 150.0 + 90.0 * g;
+        let running = matches!(t, Tile::Running { .. });
+        let bg = alpha(mix(Color::from_rgba(0.08, 0.08, 0.08, 0.86), YELLOW, g), f);
+        let icon: Element<'a, Message> = if f > 0.05 {
+            widget::icon::from_name(t.icon().to_string()).size((size * 0.5) as u16).into()
+        } else {
+            space(size * 0.5, size * 0.5)
+        };
+        let mut inner = widget::Column::new().align_x(Alignment::Center).width(Length::Fill).height(Length::Fill);
+        inner = inner.push(vfill()).push(icon).push(vfill());
+        if running {
+            // a small bar: this app is open
+            inner = inner.push(fill(space(size * 0.3, 4.0), alpha(if g > 0.5 { BLACK } else { YELLOW }, f))).push(space(1.0, 12.0));
+        }
+        let body = fill(inner, bg).width(Length::Fixed(size)).height(Length::Fixed(size));
+        bracket(body, if g > 0.5 && self.act.is_none() { f * g } else { 0.0 }, 9.0)
+    }
+
+    fn all_view(&self, f: f32) -> Element<'_, Message> {
+        let list = self.all_apps();
+        let mut grid = widget::Column::new().spacing(24);
+        for (r, chunk) in list.chunks(6).enumerate() {
+            let mut row = widget::Row::new().spacing(24);
+            for (c, a) in chunk.iter().enumerate() {
+                let i = r * 6 + c;
+                let on = i == self.all_sel;
+                let card = fill(
+                    widget::Column::new()
+                        .push(widget::icon::from_name(a.icon.clone()).size(72))
+                        .push(text(a.name.clone(), SANS_BOLD, 19.0, alpha(if on { BLACK } else { TEXT }, f)))
+                        .spacing(16)
+                        .align_x(Alignment::Center),
+                    alpha(if on { YELLOW } else { PANEL }, f),
+                )
+                .width(Length::Fixed(240.0))
+                .height(Length::Fixed(180.0))
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center);
+                row = row.push(bracket(card, if on { f } else { 0.0 }, 8.0));
+            }
+            grid = grid.push(row);
+        }
+        // keep the chosen row in view
+        let scroll = widget::scrollable(grid).height(Length::Fill);
+        widget::Column::new()
+            .push(text("All apps", SANS_BOLD, 52.0, alpha(TEXT, f)))
+            .push(space(1.0, 30.0))
+            .push(scroll)
+            .push(space(1.0, 20.0))
+            .push(hints(&[("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("ESC", "Back", false)], f))
+            .padding([48, 72])
+            .into()
+    }
+
+    fn center_view(&self, f: f32) -> Element<'_, Message> {
+        let mut sections = widget::Column::new().spacing(6).width(Length::Fixed(340.0));
+        for (i, s) in Section::ALL.iter().enumerate() {
+            let on = i == self.section;
+            let active = on && self.row.is_none();
+            let bg = if on { if active { YELLOW } else { PANEL_2 } } else { Color::TRANSPARENT };
+            let fg = if active { BLACK } else if on { YELLOW } else { TEXT_2 };
+            sections = sections.push(
+                fill(text(s.label(), SANS_BOLD, 26.0, alpha(fg, f)), alpha(bg, f))
+                    .padding([18, 28])
+                    .width(Length::Fill),
+            );
+        }
+        let content = match Section::ALL[self.section] {
+            Section::Wallpaper => self.wallpaper_view(f),
+            Section::Sound => self.sound_view(f),
+            Section::Updates => self.updates_view(f),
+            Section::About => self.about_view(f),
+        };
+        let h: &[(&str, &str, bool)] = if self.row.is_none() {
+            &[("↑ ↓", "Section", false), ("→", "Change", true), ("ESC", "Home", false)]
+        } else {
+            &[("↑ ↓", "Setting", false), ("← →", "Change", true), ("ENTER", "Press", false), ("ESC", "Sections", false)]
+        };
+        widget::Column::new()
+            .push(text("Center", SANS_BOLD, 52.0, alpha(TEXT, f)))
+            .push(space(1.0, 36.0))
+            .push(widget::Row::new().push(sections).push(space(70.0, 1.0)).push(content).height(Length::Fill))
+            .push(hints(h, f))
+            .padding([48, 72])
+            .into()
+    }
+
+    fn row_box<'a>(&self, i: usize, label: &str, value: String, body: Element<'a, Message>, f: f32) -> Element<'a, Message> {
+        let on = self.row == Some(i);
+        let head = widget::Row::new()
+            .push(text(label.to_string(), SANS_BOLD, 22.0, alpha(if on { TEXT } else { TEXT_2 }, f)))
+            .push(hfill())
+            .push(text(value, MONO_BOLD, 20.0, alpha(YELLOW, f)))
+            .width(Length::Fixed(900.0));
+        let col = widget::Column::new().push(head).push(body).spacing(16);
+        bracket(fill(col, Color::TRANSPARENT).padding([10, 4]), if on { f } else { 0.0 }, 12.0)
+    }
+
+    fn wallpaper_view(&self, f: f32) -> Element<'_, Message> {
+        let w = &self.wallpaper;
+        let mut styles = widget::Row::new().spacing(14);
+        for (id, name) in system::STYLES {
+            let on = w.style == *id;
+            styles = styles.push(
+                fill(text(name.to_string(), SANS_BOLD, 17.0, alpha(if on { BLACK } else { TEXT }, f)), alpha(if on { YELLOW } else { PANEL_2 }, f))
+                    .padding([16, 18]),
+            );
+        }
+        let mut colors = widget::Row::new().spacing(18);
+        for (hex, _) in system::COLORS {
+            let c = parse_hex(hex);
+            let on = w.color.eq_ignore_ascii_case(hex);
+            let sw = fill(space(52.0, 52.0), alpha(c, f));
+            colors = colors.push(boxed(sw, Color::TRANSPARENT, alpha(if on { TEXT } else { Color::TRANSPARENT }, f), 3.0).padding(5));
+        }
+        let style_name = system::STYLES.iter().find(|s| s.0 == w.style).map(|s| s.1).unwrap_or("").to_string();
+        let color_name = system::COLORS.iter().find(|c| c.0.eq_ignore_ascii_case(&w.color)).map(|c| c.1).unwrap_or("").to_string();
+        widget::Column::new()
+            .push(self.row_box(0, "Style", style_name, styles.into(), f))
+            .push(self.row_box(1, "Speed", format!("{:.0}%", w.speed * 100.0), slider(w.speed, 900.0, self.row == Some(1), f), f))
+            .push(self.row_box(2, "Brightness", format!("{:.0}%", w.brightness * 100.0), slider(w.brightness, 900.0, self.row == Some(2), f), f))
+            .push(self.row_box(3, "Amount", format!("{:.0}", w.amount), slider((w.amount - 1.0) / 9.0, 900.0, self.row == Some(3), f), f))
+            .push(self.row_box(4, "Colour", color_name, colors.into(), f))
+            .spacing(26)
+            .into()
+    }
+
+    fn sound_view(&self, f: f32) -> Element<'_, Message> {
+        if !self.sound.present {
+            return text("No speakers or headphones found.", SANS, 24.0, alpha(TEXT_2, f));
+        }
+        let mute = fill(
+            text(if self.sound.muted { "Sound is off" } else { "Sound is on" }, SANS_BOLD, 20.0, alpha(TEXT, f)),
+            alpha(PANEL_2, f),
+        )
+        .padding([16, 22]);
+        widget::Column::new()
+            .push(self.row_box(0, "Volume", format!("{:.0}%", self.sound.volume * 100.0), slider(self.sound.volume, 900.0, self.row == Some(0), f), f))
+            .push(self.row_box(1, "Mute", if self.sound.muted { "ON".into() } else { "OFF".into() }, mute.into(), f))
+            .spacing(26)
+            .into()
+    }
+
+    fn updates_view(&self, f: f32) -> Element<'_, Message> {
+        let label = match self.update {
+            Update::Available => "Install now",
+            Update::Checking | Update::Installing => "Please wait…",
+            _ => "Check for updates",
+        };
+        let b = fill(text(label, SANS_BOLD, 21.0, alpha(BLACK, f)), alpha(YELLOW, f)).padding([16, 26]);
+        widget::Column::new()
+            .push(text(format!("Chlorum {}", system::version()), SANS_BOLD, 30.0, alpha(TEXT, f)))
+            .push(text(self.update.text(), SANS, 22.0, alpha(TEXT_2, f)))
+            .push(space(1.0, 20.0))
+            .push(self.row_box(0, "Updates", String::new(), b.into(), f))
+            .spacing(10)
+            .into()
+    }
+
+    fn about_view(&self, f: f32) -> Element<'_, Message> {
+        let line = |k: &str, v: String| -> Element<'_, Message> {
+            widget::Row::new()
+                .push(text(k.to_string(), MONO, 18.0, alpha(TEXT_2, f)).apply_width(260.0))
+                .push(text(v, SANS_BOLD, 22.0, alpha(TEXT, f)))
+                .align_y(Alignment::Center)
+                .into()
+        };
+        widget::Column::new()
+            .push(widget::icon::from_name("com.chlorum.Logo").size(200))
+            .push(space(1.0, 20.0))
+            .push(line("VERSION", system::version()))
+            .push(line("COMPUTER", system::computer_name()))
+            .push(line("PROFILE", self.user.clone()))
+            .push(line("MOTTO", "Order by default, freedom by choice".into()))
+            .spacing(14)
+            .into()
+    }
+
+    // ================================================================ system menu
+
+    fn cards(&self) -> Vec<Card> {
+        let mut v = vec![Card::Layout, Card::Apps];
+        if matches!(self.update, Update::Available | Update::Installing | Update::Installed) {
+            v.push(Card::Update);
+        }
+        v.extend([Card::Sound, Card::Home, Card::Center, Card::Power]);
+        v
+    }
+
+    fn menu_key(&mut self, key: keyboard::Key) -> Task<Message> {
+        use keyboard::key::Named;
+        let named = match key.as_ref() {
+            keyboard::Key::Named(n) => Some(n),
+            _ => None,
+        };
+        let ch = match key.as_ref() {
+            keyboard::Key::Character(c) => c.to_lowercase(),
+            _ => String::new(),
+        };
+        self.kick();
+        let cards = self.cards();
+        self.card = self.card.min(cards.len() - 1);
+        match self.sub {
+            Sub::Apps(i) => {
+                let list: Vec<u64> = self.layout.apps().iter().map(|w| w.id).collect();
+                let n = list.len();
+                match named {
+                    Some(Named::ArrowRight) if n > 0 => self.sub = Sub::Apps((i + 1).min(n - 1)),
+                    Some(Named::ArrowLeft) => self.sub = Sub::Apps(i.saturating_sub(1)),
+                    Some(Named::Escape) | Some(Named::ArrowUp) => self.sub = Sub::None,
+                    Some(Named::Enter) => {
+                        if let Some(id) = list.get(i) {
+                            self.layout.bring(*id);
+                            self.close_menu();
+                            self.close_home_now_if_open();
+                            return self.arrange();
+                        }
+                    }
+                    _ => {}
+                }
+                if ch == "s" {
+                    if let Some(id) = list.get(i) {
+                        self.layout.beside(*id);
+                        self.close_menu();
+                        self.close_home_now_if_open();
+                        return self.arrange();
+                    }
+                }
+                if ch == "x" {
+                    if let Some(id) = list.get(i) {
+                        let id = *id;
+                        if i + 1 >= n {
+                            self.sub = if n > 1 { Sub::Apps(i - 1) } else { Sub::None };
+                        }
+                        return Task::perform(niri::run(vec![Action::CloseWindow { id: Some(id) }]), |_| {
+                            cosmic::Action::App(Message::Tick)
+                        });
+                    }
+                }
+                return Task::none();
+            }
+            Sub::Power(i) => {
+                match named {
+                    Some(Named::ArrowRight) => {
+                        self.sub = Sub::Power((i + 1).min(3));
+                        self.power_armed = false;
+                    }
+                    Some(Named::ArrowLeft) => {
+                        self.sub = Sub::Power(i.saturating_sub(1));
+                        self.power_armed = false;
+                    }
+                    Some(Named::Escape) | Some(Named::ArrowUp) => self.sub = Sub::None,
+                    Some(Named::Enter) => {
+                        if i == 3 {
+                            self.sub = Sub::None;
+                        } else if self.power_armed {
+                            if Power::ALL[i] == Power::LogOut {
+                                return Task::perform(niri::run(vec![Action::Quit { skip_confirmation: true }]), |_| {
+                                    cosmic::Action::App(Message::Tick)
+                                });
+                            }
+                            Power::ALL[i].run();
+                        } else {
+                            // nothing switches off by accident: Enter twice
+                            self.power_armed = true;
+                        }
+                    }
+                    _ => {}
+                }
+                return Task::none();
+            }
+            Sub::Sound => {
+                match named {
+                    Some(Named::ArrowRight) | Some(Named::ArrowLeft) => {
+                        let d = if named == Some(Named::ArrowRight) { 0.05 } else { -0.05 };
+                        let v = ((self.sound.volume + d) * 20.0).round() / 20.0;
+                        self.sound.volume = v.clamp(0.0, 1.0);
+                        return Task::perform(system::set_volume(v), |s| cosmic::Action::App(Message::Sound(s)));
+                    }
+                    Some(Named::Enter) | Some(Named::Escape) | Some(Named::ArrowUp) => self.sub = Sub::None,
+                    _ => {}
+                }
+                return Task::none();
+            }
+            Sub::None => {}
+        }
+        match named {
+            Some(Named::ArrowRight) => self.card = (self.card + 1).min(cards.len() - 1),
+            Some(Named::ArrowLeft) => self.card = self.card.saturating_sub(1),
+            Some(Named::Escape) => self.close_menu(),
+            Some(Named::Enter) | Some(Named::ArrowDown) => return self.press_card(cards[self.card]),
+            Some(Named::F10) => self.sub = Sub::Power(0),
+            _ => {}
+        }
+        match ch.as_str() {
+            "h" => return self.press_card(Card::Home),
+            "c" => return self.press_card(Card::Center),
+            _ => {}
+        }
+        Task::none()
+    }
+
+    fn close_home_now_if_open(&mut self) {
+        if self.home.is_some() {
+            self.close_home_now();
+        }
+    }
+
+    fn press_card(&mut self, card: Card) -> Task<Message> {
+        match card {
+            Card::Layout => {
+                if !self.layout.toggle_two() {
+                    self.toast("Open a second app first");
+                }
+                return self.arrange();
+            }
+            Card::Apps => {
+                if !self.layout.apps().is_empty() {
+                    self.sub = Sub::Apps(0);
+                }
+            }
+            Card::Update => return self.update_action(),
+            Card::Sound => self.sub = Sub::Sound,
+            Card::Home => {
+                self.close_menu();
+                return self.open_home();
+            }
+            Card::Center => {
+                self.close_menu();
+                let t = self.open_home();
+                self.page = Page::Center;
+                self.section = 0;
+                self.row = None;
+                return t;
+            }
+            Card::Power => {
+                self.sub = Sub::Power(0);
+                self.power_armed = false;
+            }
+        }
+        Task::none()
+    }
+
+    fn app_name(&self, id: u64) -> String {
+        let Some(w) = self.layout.windows.get(&id) else { return "App".into() };
+        w.app_id
+            .as_deref()
+            .and_then(|aid| self.installed.values().find(|a| a.owns(aid)))
+            .map(|a| a.name.clone())
+            .or_else(|| w.title.clone())
+            .unwrap_or_else(|| "App".into())
+    }
+
+    fn app_icon(&self, id: u64) -> String {
+        let Some(w) = self.layout.windows.get(&id) else { return String::new() };
+        w.app_id
+            .as_deref()
+            .and_then(|aid| self.installed.values().find(|a| a.owns(aid)))
+            .map(|a| a.icon.clone())
+            .or_else(|| w.app_id.clone())
+            .unwrap_or_default()
+    }
+
+    fn menu_view(&self) -> Element<'_, Message> {
+        let f = ease_out(self.menu_show);
+        let now = Local::now();
+        let what = match self.layout.stage() {
+            Stage::Empty => "Home".to_string(),
+            Stage::One(a) => format!("{}  ·  one app", self.app_name(a)),
+            Stage::Two { left, right, .. } => format!("{}  +  {}", self.app_name(left), self.app_name(right)),
+        };
+        let head = widget::Row::new()
+            .push(if f > 0.05 { Element::from(widget::icon::from_name("com.chlorum.Logo").size(84)) } else { space(84.0, 84.0) })
+            .push(space(22.0, 1.0))
+            .push(text(what, SANS_BOLD, 26.0, alpha(TEXT, f)))
+            .push(hfill())
+            .push(text(format!("{:02}:{:02}", now.hour(), now.minute()), MONO_BOLD, 34.0, alpha(TEXT, f)))
+            .push(text(format!(":{:02}", now.second()), MONO_BOLD, 34.0, alpha(YELLOW, f)))
+            .align_y(Alignment::Center);
+
+        let cards = self.cards();
+        let mut row = widget::Row::new().spacing(22).align_y(Alignment::Start);
+        for (i, c) in cards.iter().enumerate() {
+            row = row.push(self.card_view(*c, i == self.card && self.sub == Sub::None, i == self.card, f));
+        }
+
+        let sub: Element<'_, Message> = match self.sub {
+            Sub::Apps(sel) => {
+                let mut r = widget::Row::new().spacing(18);
+                for (i, w) in self.layout.apps().iter().enumerate() {
+                    let on = i == sel;
+                    let tile = fill(
+                        widget::Column::new()
+                            .push(widget::icon::from_name(self.app_icon(w.id)).size(56))
+                            .push(text(self.app_name(w.id), SANS_BOLD, 17.0, alpha(if on { BLACK } else { TEXT }, f)))
+                            .spacing(10)
+                            .align_x(Alignment::Center),
+                        alpha(if on { YELLOW } else { PANEL_2 }, f),
+                    )
+                    .width(Length::Fixed(190.0))
+                    .height(Length::Fixed(130.0))
+                    .align_x(Alignment::Center)
+                    .align_y(Alignment::Center);
+                    r = r.push(bracket(tile, if on { f } else { 0.0 }, 8.0));
+                }
+                r.into()
+            }
+            Sub::Power(sel) => {
+                let mut r = widget::Row::new().spacing(18);
+                let labels = ["Log out", "Restart", "Shut down", "Cancel"];
+                for (i, l) in labels.iter().enumerate() {
+                    let on = i == sel;
+                    let armed = on && self.power_armed;
+                    let label = if armed { format!("Press Enter to {}", l.to_lowercase()) } else { l.to_string() };
+                    let bg = if armed { RED } else if on { YELLOW } else { PANEL_2 };
+                    let b = fill(text(label, SANS_BOLD, 21.0, alpha(if on { BLACK } else { TEXT }, f)), alpha(bg, f)).padding([18, 28]);
+                    r = r.push(bracket(b, if on { f } else { 0.0 }, 8.0));
+                }
+                r.into()
+            }
+            _ => space(1.0, 1.0),
+        };
+
+        let h: &[(&str, &str, bool)] = match self.sub {
+            Sub::None => &[("← →", "Move", false), ("ENTER", "Choose", true), ("H", "Home", false), ("C", "Center", false), ("F10", "Power", false), ("SUPER", "Close", false)],
+            Sub::Apps(_) => &[("← →", "App", false), ("ENTER", "Show", true), ("S", "Show beside", false), ("X", "Close app", false), ("ESC", "Back", false)],
+            Sub::Power(_) => &[("← →", "Choose", false), ("ENTER", "Twice to confirm", true), ("ESC", "Back", false)],
+            Sub::Sound => &[("← →", "Volume", true), ("ENTER", "Done", false)],
+        };
+
+        let mut sheet_col = widget::Column::new().push(head).push(space(1.0, 30.0)).push(row).push(space(1.0, 22.0)).push(sub);
+        if let Some((t, _)) = &self.toast {
+            sheet_col = sheet_col.push(space(1.0, 12.0)).push(text(t.clone(), MONO, 17.0, alpha(YELLOW, f)));
+        }
+        sheet_col = sheet_col.push(vfill()).push(hints(h, f));
+        let sheet = widget::Column::new()
+            .push(fill(space(1.0, 3.0), alpha(YELLOW, f)).width(Length::Fill))
+            .push(fill(sheet_col.padding([34, 72]), alpha(Color::from_rgba(0.035, 0.035, 0.035, 0.97), f)).width(Length::Fill).height(Length::Fixed(560.0)));
+        // rises from the bottom edge
+        let drawer = widget::container(sheet)
+            .height(Length::Fixed(563.0 * f))
+            .width(Length::Fill)
+            .align_y(Alignment::Start)
+            .clip(true);
+        let content = widget::Column::new().push(vfill()).push(drawer);
+        fill(content, alpha(Color::from_rgba(0.0, 0.0, 0.0, 0.55), f)).width(Length::Fill).height(Length::Fill).into()
+    }
+
+    fn card_view(&self, c: Card, focused: bool, current: bool, f: f32) -> Element<'_, Message> {
+        let (label, value, extra): (&str, String, Element<'_, Message>) = match c {
+            Card::Layout => {
+                let two = matches!(self.layout.stage(), Stage::Two { .. });
+                let pic = |is_two: bool, sel: bool| -> Element<'_, Message> {
+                    let line = alpha(
+                        match (focused, sel) {
+                            (true, true) => BLACK,
+                            (true, false) => Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+                            (false, true) => YELLOW,
+                            (false, false) => MUTED,
+                        },
+                        f,
+                    );
+                    let inner: Element<'_, Message> = if is_two {
+                        widget::Row::new()
+                            .push(space(44.0, 40.0))
+                            .push(fill(space(3.0, 40.0), line))
+                            .into()
+                    } else {
+                        space(80.0, 40.0)
+                    };
+                    boxed(inner, Color::TRANSPARENT, line, 3.0).into()
+                };
+                let pics = widget::Row::new().push(pic(false, !two)).push(pic(true, two)).spacing(14);
+                let v = match self.layout.stage() {
+                    Stage::Two { ratio, .. } => format!("Two apps · {:.0}:{:.0}", ratio * 100.0, (1.0 - ratio) * 100.0),
+                    Stage::One(_) => "One app".into(),
+                    Stage::Empty => "Nothing open".into(),
+                };
+                ("LAYOUT", v, pics.into())
+            }
+            Card::Apps => {
+                let n = self.layout.apps().len();
+                ("OPEN APPS", if n == 0 { "None".into() } else { format!("{n} open") }, text("SWITCH · CLOSE", MONO, 13.0, alpha(TEXT_2, f)))
+            }
+            Card::Update => ("UPDATE", "New version".into(), text(self.update.text().to_uppercase(), MONO, 12.0, alpha(TEXT_2, f))),
+            Card::Sound => {
+                let v = if self.sound.muted { "Off".to_string() } else { format!("{:.0}", self.sound.volume * 100.0) };
+                ("SOUND", v, slider(self.sound.volume, 196.0, self.sub == Sub::Sound, f))
+            }
+            Card::Home => ("HOME", "Home".into(), text("H", MONO, 13.0, alpha(TEXT_2, f))),
+            Card::Center => ("CENTER", "Settings".into(), text("C", MONO, 13.0, alpha(TEXT_2, f))),
+            Card::Power => ("POWER", "Off · restart".into(), text("F10", MONO, 13.0, alpha(TEXT_2, f))),
+        };
+        let strong = focused;
+        let fg = if strong { BLACK } else { TEXT };
+        let lab = if strong { BLACK } else { TEXT_2 };
+        let width = if c == Card::Layout { 360.0 } else { 240.0 };
+        let body = widget::Column::new()
+            .push(text(label, MONO, 14.0, alpha(lab, f)))
+            .push(vfill())
+            .push(text(value, SANS_BOLD, 25.0, alpha(fg, f)))
+            .push(space(1.0, 12.0))
+            .push(extra)
+            .padding(22)
+            .width(Length::Fixed(width))
+            .height(Length::Fixed(220.0));
+        let bg = if strong { YELLOW } else if current { PANEL_2 } else { PANEL };
+        bracket(fill(body, alpha(bg, f)), if current { f } else { 0.0 }, 9.0)
+    }
+}
+
+trait ApplyWidth<'a> {
+    fn apply_width(self, w: f32) -> Element<'a, Message>;
+}
+
+impl<'a> ApplyWidth<'a> for Element<'a, Message> {
+    fn apply_width(self, w: f32) -> Element<'a, Message> {
+        widget::container(self).width(Length::Fixed(w)).into()
+    }
+}
+
+fn ease_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(3)
+}
+
+fn parse_hex(s: &str) -> Color {
+    let v = u32::from_str_radix(s.trim_start_matches('#'), 16).unwrap_or(0xFFD60A);
+    Color::from_rgb8((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+fn zone_label(now: &chrono::DateTime<Local>) -> String {
+    let zone = std::env::var("TZ")
+        .ok()
+        .filter(|z| !z.is_empty())
+        .or_else(|| {
+            std::fs::read_link("/etc/localtime").ok().and_then(|p| {
+                let s = p.to_string_lossy().to_string();
+                s.split("zoneinfo/").nth(1).map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| "UTC".into());
+    let city = zone.rsplit('/').next().unwrap_or(&zone).replace('_', " ");
+    let off = now.offset().fix().local_minus_utc() / 60;
+    let sign = if off < 0 { '-' } else { '+' };
+    if off % 60 == 0 {
+        format!("{city} (UTC{sign}{})", off.abs() / 60)
+    } else {
+        format!("{city} (UTC{sign}{}:{:02})", off.abs() / 60, off.abs() % 60)
+    }
+}
