@@ -3,7 +3,7 @@ let
   version = lib.fileContents ../../VERSION;
 in
 {
-  imports = [ ./disk.nix ./persist.nix ./look.nix ./update.nix ./profiles.nix ./keys.nix ./desktop.nix ];
+  imports = [ ./disk.nix ./persist.nix ./look.nix ./update.nix ./profiles.nix ./keys.nix ./desktop.nix ./nvidia.nix ];
 
   options.chlorum.enable = lib.mkEnableOption "Chlorum";
 

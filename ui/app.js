@@ -350,7 +350,7 @@ async function createProfile(name, password, custom) {
   }
   const f = await api("setup/finish", {});
   if (f.error) return errorBox(f.error, () => createProfile(name, password, custom));
-  initLogin({ profiles: [name] });
+  busy("All set. Starting Chlorum...");
 }
 
 function escapeHtml(s) {

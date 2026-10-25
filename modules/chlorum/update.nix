@@ -2,25 +2,50 @@
 let
   cfg = config.chlorum.update;
 
+  # chlorum-update           check, then install if there is something new
+  # chlorum-update check     prints "up-to-date" or "available"
+  # chlorum-update apply     installs now (no password for the owner)
   chlorum-update = pkgs.writeShellApplication {
     name = "chlorum-update";
-    runtimeInputs = [ config.systemd.package pkgs.coreutils ];
+    runtimeInputs = [ config.systemd.package config.nix.package pkgs.jq pkgs.coreutils ];
     text = ''
-      # No password needed: an update only applies what Chlorum publishes,
-      # like a phone update. The owner may start it (polkit rule below).
-      echo "Checking for a new Chlorum version. This can take a while..."
-      journalctl -u nixos-upgrade.service -f -n 0 -o cat 2>/dev/null &
-      log=$!
-      trap 'kill "$log" 2>/dev/null' EXIT
-      if systemctl start nixos-upgrade.service; then
-        echo
-        echo "Done. If there was a new version, it starts after the next reboot."
-      else
-        echo
-        echo "Update failed. Your current version keeps working."
-        echo "Details: run0 journalctl -u nixos-upgrade"
-        exit 1
-      fi
+      source_flake="${lib.head (lib.splitString "#" cfg.source)}"
+
+      check() {
+        local remote installed
+        remote=$(nix flake metadata --refresh --json "$source_flake" | jq -r .locked.rev)
+        installed=$(cat /run/current-system/configuration-revision 2>/dev/null || echo unknown)
+        if [ -z "$remote" ] || [ "$remote" = null ]; then
+          echo "Could not reach the Chlorum update server." >&2
+          return 1
+        fi
+        if [ "$remote" = "$installed" ]; then echo up-to-date; else echo available; fi
+      }
+
+      apply() {
+        systemctl start nixos-upgrade.service
+      }
+
+      case "''${1:-}" in
+        check) check ;;
+        apply) apply ;;
+        "")
+          echo "Checking for a new Chlorum version..."
+          state=$(check)
+          if [ "$state" = up-to-date ]; then
+            echo "Chlorum is up to date."
+            exit 0
+          fi
+          echo "A new version is available. Installing; this can take a while..."
+          if apply; then
+            echo "Done. The new version starts after the next restart."
+          else
+            echo "The update failed. Your current version keeps working."
+            exit 1
+          fi
+          ;;
+        *) echo "usage: chlorum-update [check|apply]" >&2; exit 2 ;;
+      esac
     '';
   };
 in
@@ -51,6 +76,11 @@ in
       allowReboot = false;
     };
     environment.systemPackages = [ chlorum-update ];
+
+    # Which Chlorum commit is installed, so updates can tell if anything is new
+    system.systemBuilderCommands = ''
+      echo -n ${lib.escapeShellArg (toString config.system.configurationRevision)} > $out/configuration-revision
+    '';
 
     # The owner starts updates without a password, but nothing else.
     security.polkit.extraConfig = ''

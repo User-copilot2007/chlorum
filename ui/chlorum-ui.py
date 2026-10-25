@@ -359,7 +359,8 @@ def cmd_setupd():
         os.unlink(SETUP_SOCK)
     except OSError:
         pass
-    gid = int(subprocess.run(["getent", "group", "greeter"], capture_output=True,
+    group = os.environ.get("CHLORUM_GREETER_GROUP", "greeter")
+    gid = int(subprocess.run(["getent", "group", group], capture_output=True,
                              text=True).stdout.split(":")[2])
     os.chown(RUN_DIR, 0, gid)
     os.chmod(RUN_DIR, 0o750)
@@ -412,8 +413,9 @@ def cmd_greeter():
             msg = dict(body or {})
             msg["op"] = {"layout": "set_layout"}.get(op, op) if method == "POST" else op
             res = setup_call(msg)
-            if op == "layout" and method == "POST" and res.get("ok"):
-                # The new keyboard layout applies when this window restarts.
+            if method == "POST" and res.get("ok") and op in ("layout", "finish"):
+                # Restart this screen: with the new keyboard layout, or, once
+                # setup is done, as the regular login screen.
                 restart.set()
             return res
         return {"error": "Unknown request."}
