@@ -678,14 +678,20 @@ checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
 name = "chlorum"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
+ "glow",
  "iced",
+ "khronos-egl",
  "libcosmic",
  "niri-ipc",
  "serde_json",
+ "smithay-client-toolkit",
  "tokio",
+ "wayland-client",
+ "wayland-egl",
+ "zbus",
 ]
 
 [[package]]
@@ -5088,6 +5094,16 @@ dependencies = [
  "rustix 1.1.5",
  "wayland-client",
  "xcursor",
+]
+
+[[package]]
+name = "wayland-egl"
+version = "0.32.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b97bdb7c49e5bd9b7562f38ff84f0dad47079fdc9e926f691a787f6dbc05451"
+dependencies = [
+ "wayland-backend",
+ "wayland-sys",
 ]
 
 [[package]]

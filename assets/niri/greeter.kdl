@@ -1,0 +1,64 @@
+// niri for the first start and the login screen: one full-screen window,
+// nothing else. @LAYOUT@ is filled in when it starts; the first start
+// changes it here live when you pick your keyboard.
+
+input {
+    keyboard {
+        xkb {
+            layout "@LAYOUT@"
+            options "grp:alt_shift_toggle"
+        }
+        repeat-delay 300
+        repeat-rate 40
+    }
+    touchpad {
+        tap
+    }
+}
+
+cursor {
+    hide-when-typing
+    hide-after-inactive-ms 3000
+}
+
+layout {
+    gaps 0
+    default-column-width { proportion 1.0; }
+    focus-ring { off; }
+    border { off; }
+    shadow { off; }
+    background-color "#000000"
+}
+
+prefer-no-csd
+screenshot-path null
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+gestures {
+    hot-corners {
+        off
+    }
+}
+
+window-rule {
+    open-fullscreen true
+}
+
+animations {
+    window-open {
+        duration-ms 300
+        curve "ease-out-expo"
+    }
+}
+
+// If the login screen ever stops, it starts again.
+spawn-sh-at-startup "until chlorum greeter; do sleep 1; done"
+
+binds {
+    XF86AudioRaiseVolume { spawn "wpctl" "set-volume" "-l" "1" "@DEFAULT_AUDIO_SINK@" "5%+"; }
+    XF86AudioLowerVolume { spawn "wpctl" "set-volume" "@DEFAULT_AUDIO_SINK@" "5%-"; }
+    XF86AudioMute { spawn "wpctl" "set-mute" "@DEFAULT_AUDIO_SINK@" "toggle"; }
+}

@@ -207,13 +207,6 @@ pub enum Power {
 
 impl Power {
     pub const ALL: [Power; 3] = [Power::LogOut, Power::Restart, Power::ShutDown];
-    pub fn label(self) -> &'static str {
-        match self {
-            Power::LogOut => "Log out",
-            Power::Restart => "Restart",
-            Power::ShutDown => "Shut down",
-        }
-    }
     pub fn run(self) {
         let (cmd, args): (&str, &[&str]) = match self {
             Power::LogOut => ("niri", &["msg", "action", "quit", "--skip-confirmation"]),
@@ -253,4 +246,158 @@ pub fn display_name() -> String {
         }
     }
     user
+}
+
+// ---------------------------------------------------------------- Wi-Fi
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Wifi {
+    pub ssid: String,
+    pub signal: u8,
+    pub secure: bool,
+    pub active: bool,
+}
+
+/// nmcli -t escapes ':' inside values as '\:'.
+fn split_terse(line: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut esc = false;
+    for c in line.chars() {
+        if esc {
+            out.last_mut().unwrap().push(c);
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == ':' {
+            out.push(String::new());
+        } else {
+            out.last_mut().unwrap().push(c);
+        }
+    }
+    out
+}
+
+pub fn parse_wifi(text: &str) -> Vec<Wifi> {
+    let mut v: Vec<Wifi> = Vec::new();
+    for line in text.lines() {
+        let f = split_terse(line);
+        if f.len() < 4 || f[1].is_empty() {
+            continue;
+        }
+        let w = Wifi {
+            active: f[0] == "*",
+            ssid: f[1].clone(),
+            signal: f[2].parse().unwrap_or(0),
+            secure: !(f[3].is_empty() || f[3] == "--"),
+        };
+        match v.iter_mut().find(|x| x.ssid == w.ssid) {
+            Some(x) => {
+                x.active |= w.active;
+                x.signal = x.signal.max(w.signal);
+            }
+            None => v.push(w),
+        }
+    }
+    v.sort_by(|a, b| b.active.cmp(&a.active).then(b.signal.cmp(&a.signal)));
+    v.truncate(12);
+    v
+}
+
+pub const WIFI_ARGS: &[&str] = &["-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY", "device", "wifi", "list", "--rescan", "yes"];
+
+/// For the first-run helper (no async runtime there).
+pub fn wifi_scan_blocking(text: &str) -> serde_json::Value {
+    serde_json::Value::Array(
+        parse_wifi(text)
+            .into_iter()
+            .map(|w| serde_json::json!({"ssid": w.ssid, "signal": w.signal, "secure": w.secure}))
+            .collect(),
+    )
+}
+
+pub async fn wifi_list() -> Vec<Wifi> {
+    match output("nmcli", WIFI_ARGS).await {
+        Ok(s) => parse_wifi(&s),
+        Err(_) => vec![],
+    }
+}
+
+pub async fn wifi_connect(ssid: String, password: String) -> Result<(), String> {
+    let mut args = vec!["device", "wifi", "connect", ssid.as_str()];
+    if !password.is_empty() {
+        args.extend(["password", password.as_str()]);
+    }
+    output("nmcli", &args).await.map(|_| ()).map_err(|e| {
+        // nmcli says why: wrong password, network gone, not allowed…
+        let why = e.lines().last().unwrap_or("").trim().trim_start_matches("Error:").trim().to_string();
+        if why.is_empty() { "Could not connect.".to_string() } else { format!("Could not connect: {why}") }
+    })
+}
+
+// ---------------------------------------------------------------- keyboard
+
+/// The person's own layout, or the one chosen on first start.
+pub fn keyboard() -> String {
+    std::fs::read_to_string(config_dir().join("chlorum/keyboard"))
+        .or_else(|_| std::fs::read_to_string("/var/lib/chlorum/xkb-layout"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "us".into())
+}
+
+/// The niri layout string: the chosen layout plus US. Passwords are Latin
+/// words, so a non-Latin layout (Ukrainian) comes second: what you type at
+/// the login and lock screens is always Latin, Alt+Shift switches.
+pub fn xkb_layouts(id: &str) -> String {
+    match id {
+        "us" | "" => "us".into(),
+        "ua" => "us,ua".into(),
+        other => format!("{other},us"),
+    }
+}
+
+/// Saves the layout and switches to it now: niri reloads its config file.
+pub fn set_keyboard(id: &str) {
+    let dir = config_dir().join("chlorum");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("keyboard"), format!("{id}\n"));
+    if let Ok(path) = std::env::var("CHLORUM_NIRI_CONFIG") {
+        set_niri_layout(std::path::Path::new(&path), id);
+    }
+}
+
+pub fn set_niri_layout(path: &std::path::Path, id: &str) {
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let new: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("layout \"") {
+                let indent = &l[..l.len() - l.trim_start().len()];
+                format!("{indent}layout \"{}\"", xkb_layouts(id))
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    let tmp = path.with_extension("new");
+    if std::fs::write(&tmp, new.join("\n") + "\n").is_ok() {
+        let _ = std::fs::rename(tmp, path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn wifi_lines() {
+        let v = parse_wifi("*:Home\\:5G:70:WPA2\n :Cafe:80:\n :Home\\:5G:40:WPA2\n ::30:WPA2\n");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0], Wifi { ssid: "Home:5G".into(), signal: 70, secure: true, active: true });
+        assert_eq!(v[1], Wifi { ssid: "Cafe".into(), signal: 80, secure: false, active: false });
+    }
+    #[test]
+    fn layouts() {
+        assert_eq!(xkb_layouts("ua"), "us,ua");
+        assert_eq!(xkb_layouts("de"), "de,us");
+        assert_eq!(xkb_layouts("us"), "us");
+    }
 }

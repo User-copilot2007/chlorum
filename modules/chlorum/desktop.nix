@@ -5,8 +5,9 @@ let
 
   # ---------------------------------------------------------------- programs
 
-  # The shell (Home, system menu, the two layouts), the login screen and
-  # Library: one Rust program on libcosmic.
+  # Everything Chlorum shows is one Rust program (libcosmic): the shell
+  # (Home, system menu, the two layouts, Center), first start and login,
+  # the lock screen, Library, the live wallpaper and the first-start helper.
   chlorum = pkgs.rustPlatform.buildRustPackage {
     pname = "chlorum";
     inherit version;
@@ -16,10 +17,9 @@ let
       allowBuiltinFetchGit = true;
     };
     nativeBuildInputs = [ pkgs.libcosmicAppHook pkgs.pkg-config ];
-    buildInputs = [ pkgs.fontconfig pkgs.freetype ];
-    # the template logic has unit tests; they need nothing graphical
+    buildInputs = [ pkgs.fontconfig pkgs.freetype pkgs.libGL pkgs.wayland pkgs.pam ];
+    # unit tests (layouts, Wi-Fi lists, names) need nothing graphical
     doCheck = true;
-    checkFlags = [ "layout::" ];
     postInstall = ''
       install -Dm644 ${../../assets/logo/chlorum-logo.svg} \
         $out/share/icons/hicolor/scalable/apps/com.chlorum.Logo.svg
@@ -35,18 +35,6 @@ let
       EOF
     '';
     meta.mainProgram = "chlorum";
-  };
-
-  # Live wallpapers drawn by the graphics card (GLSL shaders on the
-  # background layer). Settings: ~/.config/chlorum/wallpaper, set in Center.
-  wallpaper = pkgs.rustPlatform.buildRustPackage {
-    pname = "chlorum-wallpaper";
-    inherit version;
-    src = ../../apps/chlorum-wallpaper;
-    cargoLock.lockFile = ../../apps/chlorum-wallpaper/Cargo.lock;
-    nativeBuildInputs = [ pkgs.pkg-config ];
-    buildInputs = [ pkgs.libGL pkgs.wayland ];
-    meta.mainProgram = "chlorum-wallpaper";
   };
 
   # ---------------------------------------------------------------- browser
@@ -114,13 +102,16 @@ let
     mkdir -p "$dir"
 
     # keyboard: the layout chosen on first start, plus US for shortcuts
-    layout=$(cat /var/lib/chlorum/xkb-layout 2>/dev/null || echo us)
+    layout=$(cat "$HOME/.config/chlorum/keyboard" 2>/dev/null || cat /var/lib/chlorum/xkb-layout 2>/dev/null || echo us)
     case "$layout" in
       us|"") layout=us ;;
+      ua) layout="us,ua" ;;   # passwords are Latin: Ukrainian second
       *) layout="$layout,us" ;;
     esac
     sed "s/@LAYOUT@/$layout/" ${../../assets/niri/config.kdl} > "$dir/niri.kdl"
     export NIRI_CONFIG="$dir/niri.kdl"
+    # Center changes the keyboard live by rewriting this file
+    export CHLORUM_NIRI_CONFIG="$dir/niri.kdl"
 
     # Where apps save things: new files land in Downloads, where Library
     # asks where they belong; the rest lives in Library's collections.
@@ -149,56 +140,23 @@ let
 
   # ---------------------------------------------------------------- login
 
-  # Until the first run is done, the Chlorum first run (keyboard, network,
-  # profile) is shown; afterwards the Chlorum login screen.
-  firstRunUi = pkgs.runCommand "chlorum-ui" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
-    mkdir -p $out/share/chlorum-ui $out/bin
-    cp -r ${../../ui}/. $out/share/chlorum-ui/
-    chmod -R u+w $out/share/chlorum-ui
-    cp ${../../assets/logo/chlorum-icon-small.svg} $out/share/chlorum-ui/logo.svg
-    makeWrapper ${pkgs.python3}/bin/python3 $out/bin/chlorum-ui \
-      --add-flags $out/share/chlorum-ui/chlorum-ui.py \
-      --set CHLORUM_UI_DIR $out/share/chlorum-ui \
-      --set CHLORUM_GREETER_GROUP greeter \
-      --set CHLORUM_KIOSK_BROWSER librewolf \
-      --prefix PATH : ${lib.makeBinPath [
-        browser
-        config.systemd.package
-        config.networking.networkmanager.package
-        pkgs.xkcdpass
-        pkgs.kbd
-        pkgs.getent
-        pkgs.coreutils
-      ]}
-  '';
+  # First start and login run in niri too, as the user "greeter": one
+  # full-screen Chlorum window. greetd starts it after every logout.
   greeter = pkgs.writeShellScript "chlorum-greeter" ''
-    # cage draws at the screen's real size: scale 2 on 4K, like the session
-    export COSMIC_SCALE=1
-    for m in /sys/class/drm/card*-*/modes; do
-      [ "$(cat "''${m%modes}status" 2>/dev/null)" = connected ] || continue
-      h=$(head -n1 "$m" | cut -dx -f2)
-      [ "''${h:-0}" -ge 2000 ] && export COSMIC_SCALE=2
-      break
-    done
-    export XKB_DEFAULT_LAYOUT="$(cat /var/lib/chlorum/xkb-layout 2>/dev/null || echo us)"
-    [ -e "${pkgs.xkeyboard_config}/share/X11/xkb/symbols/$XKB_DEFAULT_LAYOUT" ] || XKB_DEFAULT_LAYOUT=us
+    dir="''${XDG_RUNTIME_DIR:-/tmp}/chlorum"
+    mkdir -p "$dir"
+    layout=$(cat /var/lib/chlorum/xkb-layout 2>/dev/null || echo us)
+    case "$layout" in
+      us|"") layout=us ;;
+      ua) layout="us,ua" ;;   # passwords are Latin: Ukrainian second
+      *) layout="$layout,us" ;;
+    esac
+    sed "s/@LAYOUT@/$layout/" ${../../assets/niri/greeter.kdl} > "$dir/greeter.kdl"
+    export CHLORUM_NIRI_CONFIG="$dir/greeter.kdl"
     export XDG_DATA_DIRS=/run/current-system/sw/share
     export XCURSOR_THEME=Adwaita
-    if [ -e /var/lib/chlorum/setup-done ]; then
-      export PATH=${lib.makeBinPath [ config.systemd.package pkgs.getent ]}:$PATH
-      # The native login screen; if it cannot start three times in a row
-      # (graphics trouble), the web login screen takes over.
-      status="''${XDG_RUNTIME_DIR:-/tmp}/chlorum-greeter-status"
-      for try in 1 2 3; do
-        rm -f "$status"
-        ${pkgs.cage}/bin/cage -s -d -- ${pkgs.bash}/bin/bash -c \
-          '${chlorum}/bin/chlorum greeter; echo $? > "$1"' sh "$status"
-        [ "$(cat "$status" 2>/dev/null)" = 0 ] && exit 0
-        sleep 1
-      done
-    fi
-    export MOZ_ENABLE_WAYLAND=1
-    exec ${pkgs.cage}/bin/cage -s -d -- ${firstRunUi}/bin/chlorum-ui greeter
+    export PATH=${lib.makeBinPath [ chlorum config.systemd.package pkgs.getent pkgs.coreutils pkgs.wireplumber ]}:$PATH
+    exec ${config.programs.niri.package}/bin/niri -c "$dir/greeter.kdl"
   '';
 
   # ---------------------------------------------------------------- boot
@@ -295,7 +253,7 @@ in
       unitConfig.ConditionEnvironment = "NIRI_SOCKET";
       enableDefaultPath = false;
       serviceConfig = {
-        ExecStart = "${wallpaper}/bin/chlorum-wallpaper";
+        ExecStart = "${chlorum}/bin/chlorum wallpaper";
         Restart = "on-failure";
         RestartSec = 2;
         Nice = 5;
@@ -339,11 +297,21 @@ in
         RequiresMountsFor = "/var/lib/chlorum";
       };
       environment.CHLORUM_GREETER_GROUP = "greeter";
+      path = [
+        config.systemd.package
+        config.networking.networkmanager.package
+        pkgs.xkcdpass
+        pkgs.kbd
+        pkgs.getent
+      ];
       serviceConfig = {
-        ExecStart = "${firstRunUi}/bin/chlorum-ui setupd";
+        ExecStart = "${chlorum}/bin/chlorum setupd";
         Restart = "on-failure";
       };
     };
+
+    # The lock screen checks the profile password through PAM (homed)
+    security.pam.services.chlorum-lock = { };
 
     # Logging out ends everything the profile started, so its encrypted
     # volume can close.
@@ -352,7 +320,6 @@ in
     # ---- Apps ----------------------------------------------------------------
     environment.systemPackages = [
       chlorum
-      wallpaper
       session
       browser
       cosmicDefaults

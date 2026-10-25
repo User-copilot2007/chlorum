@@ -1,4 +1,4 @@
-//! Chlorum live wallpaper: a fragment shader drawn on the background layer
+//! `chlorum wallpaper` — live wallpaper: a fragment shader drawn on the background layer
 //! of every screen. Settings come from ~/.config/chlorum/wallpaper and are
 //! picked up while running. Drawing stops while an app covers the screen
 //! (the shell creates $XDG_RUNTIME_DIR/chlorum/wallpaper-paused).
@@ -387,7 +387,7 @@ delegate_output!(App);
 delegate_layer!(App);
 delegate_registry!(App);
 
-fn main() {
+pub fn run() {
     let conn = Connection::connect_to_env().expect("not in a Wayland session");
     let (globals, queue) = registry_queue_init::<App>(&conn).expect("Wayland registry");
     let qh = queue.handle();

@@ -156,3 +156,28 @@ pub fn slider<'a, M: 'a>(value: f32, width: f32, active: bool, fade: f32) -> Ele
     let track = widget::container(track).height(Length::Fixed(knob)).align_y(Alignment::Center);
     cosmic::iced::widget::stack![track, knob_el].into()
 }
+
+/// Text fields: dark, square, yellow selection.
+
+pub fn field_style() -> cosmic::theme::TextInput {
+    let look = move |_: &cosmic::Theme| cosmic::widget::text_input::Appearance {
+        background: cosmic::iced::Background::Color(Color::from_rgb(0.05, 0.05, 0.05)),
+        border_radius: 0.0.into(),
+        border_offset: None,
+        border_width: 0.0,
+        border_color: Color::TRANSPARENT,
+        label_color: TEXT_2,
+        placeholder_color: MUTED,
+        selected_text_color: BLACK,
+        icon_color: Some(TEXT),
+        text_color: Some(TEXT),
+        selected_fill: YELLOW,
+    };
+    cosmic::theme::TextInput::Custom {
+        active: Box::new(look),
+        error: Box::new(look),
+        hovered: Box::new(look),
+        focused: Box::new(look),
+        disabled: Box::new(look),
+    }
+}

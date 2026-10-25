@@ -10,13 +10,15 @@
 
 use crate::apps::{self, App};
 use crate::layout::{Layout, Stage};
-use crate::niri::{self, Action, Event};
-use crate::system::{self, Power, Sound, Update, Wallpaper};
+use crate::niri::{self, Action, Event, WorkspaceReferenceArg};
+use crate::notify::{self, Note};
+use crate::system::{self, Power, Sound, Update, Wallpaper, Wifi};
 use crate::ui::*;
 use chrono::{Local, Offset, Timelike};
 use cosmic::app::{Core, Settings, Task};
 use cosmic::iced::futures::SinkExt;
-use cosmic::iced::platform_specific::runtime::wayland::layer_surface::{IcedOutput, SctkLayerSurfaceSettings};
+use cosmic::iced::platform_specific::runtime::wayland::layer_surface::{IcedMargin, IcedOutput, SctkLayerSurfaceSettings};
+use cosmic::widget::text_input;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
     Anchor, KeyboardInteractivity, Layer, destroy_layer_surface, get_layer_surface,
 };
@@ -113,27 +115,24 @@ enum Page {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Section {
     Wallpaper,
+    Network,
     Sound,
+    Keyboard,
     Updates,
     About,
 }
 
 impl Section {
-    const ALL: [Section; 4] = [Section::Wallpaper, Section::Sound, Section::Updates, Section::About];
+    const ALL: [Section; 6] =
+        [Section::Wallpaper, Section::Network, Section::Sound, Section::Keyboard, Section::Updates, Section::About];
     fn label(self) -> &'static str {
         match self {
             Section::Wallpaper => "Wallpaper",
+            Section::Network => "Network",
             Section::Sound => "Sound",
+            Section::Keyboard => "Keyboard",
             Section::Updates => "Updates",
             Section::About => "About",
-        }
-    }
-    fn rows(self) -> usize {
-        match self {
-            Section::Wallpaper => 5,
-            Section::Sound => 2,
-            Section::Updates => 1,
-            Section::About => 0,
         }
     }
 }
@@ -142,6 +141,7 @@ impl Section {
 enum Card {
     Layout,
     Apps,
+    Notes,
     Update,
     Sound,
     Home,
@@ -155,6 +155,7 @@ enum Sub {
     Apps(usize),
     Power(usize),
     Sound,
+    Notes(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +171,11 @@ pub enum Message {
     Sound(Sound),
     Network(String),
     Update(Update),
+    WifiList(Vec<Wifi>),
+    WifiDone(Result<(), String>),
+    WifiInput(String),
+    WifiSubmit,
+    Note(notify::Event),
 }
 
 pub struct Shell {
@@ -209,8 +215,23 @@ pub struct Shell {
     quiet_until: Instant,
     arranging: bool,
     arrange_again: bool,
+    /// Home closed: show the apps' workspace again
+    back_to_stage: bool,
     toast: Option<(String, Instant)>,
     last_frame: Instant,
+
+    wifi: Vec<Wifi>,
+    wifi_busy: bool,
+    wifi_entry: Option<String>,
+    wifi_pw: String,
+    wifi_note: Option<String>,
+    keyboard: String,
+
+    notes: Vec<Note>,
+    note_surface: Option<(window::Id, Instant)>,
+
+    started_at: Instant,
+    ids: [widget::Id; 1], // Wi-Fi password
 }
 
 impl Application for Shell {
@@ -259,8 +280,19 @@ impl Application for Shell {
             quiet_until: Instant::now(),
             arranging: false,
             arrange_again: false,
+            back_to_stage: false,
             toast: None,
             last_frame: Instant::now(),
+            wifi: vec![],
+            wifi_busy: false,
+            wifi_entry: None,
+            wifi_pw: String::new(),
+            wifi_note: None,
+            keyboard: system::keyboard(),
+            notes: vec![],
+            note_surface: None,
+            started_at: Instant::now(),
+            ids: [widget::Id::unique()],
         };
         system::pause_wallpaper(false);
         let t = Task::batch([
@@ -275,6 +307,8 @@ impl Application for Shell {
         let mut subs = vec![
             Subscription::run(niri::events).map(Message::Niri),
             Subscription::run(commands),
+            Subscription::run(notify::events).map(Message::Note),
+            Subscription::run(notify::sleeps).map(|_| Message::Command("lock".into())),
             iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick),
             event::listen_with(|e, _status, id| match e {
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
@@ -283,7 +317,7 @@ impl Application for Shell {
                 _ => None,
             }),
         ];
-        if self.animating() {
+        if self.animating() || self.wifi_busy {
             subs.push(iced::time::every(Duration::from_millis(8)).map(|_| Message::Frame));
         }
         Subscription::batch(subs)
@@ -292,6 +326,12 @@ impl Application for Shell {
     fn update(&mut self, message: Message) -> Task<Message> {
         let t = self.handle(message);
         self.sync_grow();
+        if std::mem::take(&mut self.back_to_stage) {
+            if let Some(f) = self.layout.focused() {
+                self.expect_focus.push(f);
+                return Task::batch([t, Task::perform(niri::run(vec![Action::FocusWindow { id: f }]), |_| cosmic::Action::App(Message::Tick))]);
+            }
+        }
         t
     }
 
@@ -300,6 +340,9 @@ impl Application for Shell {
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Message> {
+        if self.note_surface.is_some_and(|(n, _)| n == id) {
+            return self.note_view();
+        }
         if Some(id) == self.menu {
             self.menu_view()
         } else if Some(id) == self.home {
@@ -317,6 +360,12 @@ impl Shell {
             Message::Tick => {
                 if self.toast.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(3)) {
                     self.toast = None;
+                }
+                if let Some((id, at)) = self.note_surface {
+                    if at.elapsed() > Duration::from_secs(5) {
+                        self.note_surface = None;
+                        return destroy_layer_surface(id);
+                    }
                 }
                 // sound and network change outside the shell too: look every few seconds
                 let now = Local::now().second();
@@ -351,6 +400,42 @@ impl Shell {
                     return self.toggle_menu();
                 }
             }
+            Message::WifiList(v) => {
+                self.wifi = v;
+                self.wifi_busy = false;
+            }
+            Message::WifiDone(r) => {
+                self.wifi_busy = false;
+                match r {
+                    Ok(()) => {
+                        self.wifi_entry = None;
+                        self.wifi_note = Some("Connected.".into());
+                        return Task::batch([
+                            Task::perform(system::network(), |s| cosmic::Action::App(Message::Network(s))),
+                            Task::perform(system::wifi_list(), |v| cosmic::Action::App(Message::WifiList(v))),
+                        ]);
+                    }
+                    Err(e) => {
+                        self.wifi_note = Some(e);
+                        self.wifi_pw.clear();
+                        if self.wifi_entry.is_some() {
+                            return text_input::focus(self.ids[0].clone());
+                        }
+                    }
+                }
+            }
+            Message::WifiInput(v) => self.wifi_pw = v,
+            Message::WifiSubmit => {
+                if let Some(ssid) = self.wifi_entry.clone() {
+                    self.wifi_busy = true;
+                    self.wifi_note = Some(format!("Connecting to {ssid}…"));
+                    return Task::perform(system::wifi_connect(ssid, self.wifi_pw.clone()), |r| {
+                        cosmic::Action::App(Message::WifiDone(r))
+                    });
+                }
+            }
+            Message::Note(notify::Event::Show(n)) => return self.show_note(n),
+            Message::Note(notify::Event::Close(id)) => self.notes.retain(|n| n.id != id),
             Message::Key(id, key, mods) => {
                 if Some(id) == self.menu && !self.menu_closing {
                     return self.menu_key(key);
@@ -421,18 +506,29 @@ impl Shell {
         self.sel = 0;
         self.kick();
         system::pause_wallpaper(false);
+        // slide the apps away: Home has its own empty workspace, so the live
+        // wallpaper shows behind it
+        let away = if self.layout.on_stage().is_empty() {
+            Task::none()
+        } else {
+            Task::perform(
+                niri::run(vec![Action::FocusWorkspace { reference: WorkspaceReferenceArg::Name(crate::layout::HOME.into()) }]),
+                |_| cosmic::Action::App(Message::Tick),
+            )
+        };
         if self.home.is_some() {
-            return Task::none();
+            return away;
         }
         let id = window::Id::unique();
         self.home = Some(id);
         self.home_show = 0.0;
-        get_layer_surface(layer(id, Layer::Overlay, "chlorum-home"))
+        Task::batch([away, get_layer_surface(layer(id, Layer::Overlay, "chlorum-home"))])
     }
 
     fn close_home(&mut self) {
-        if self.home.is_some() && !self.layout.on_stage().is_empty() {
+        if self.home.is_some() && !self.home_closing && !self.layout.on_stage().is_empty() {
             self.home_closing = true;
+            self.back_to_stage = true;
             self.kick();
         }
     }
@@ -595,9 +691,13 @@ impl Shell {
             self.arrange_again = true;
             return Task::none();
         }
-        let plan = self.layout.plan();
+        let mut plan = self.layout.plan();
         if plan.is_empty() {
             return Task::none();
+        }
+        // while Home is up, the apps stay out of sight
+        if self.home.is_some() && !self.home_closing && plan.iter().any(|a| matches!(a, Action::FocusWindow { .. })) {
+            plan.push(Action::FocusWorkspace { reference: WorkspaceReferenceArg::Name(crate::layout::HOME.into()) });
         }
         self.expect_focus = plan
             .iter()
@@ -629,6 +729,10 @@ impl Shell {
             "home" => {
                 self.close_menu();
                 return self.open_home();
+            }
+            "lock" => {
+                self.close_menu();
+                return lock();
             }
             "left" | "right" | "grow" | "shrink" | "swap" | "template" => self.close_menu(),
             _ => {}
@@ -747,6 +851,9 @@ impl Shell {
     }
 
     fn close_home_now(&mut self) {
+        if !self.home_closing {
+            self.back_to_stage = true;
+        }
         self.home_closing = true;
         self.kick();
     }
@@ -761,6 +868,13 @@ impl Shell {
             keyboard::Key::Character(c) => c.to_lowercase(),
             _ => String::new(),
         };
+        if self.wifi_entry.is_some() && self.page == Page::Center {
+            if named == Some(keyboard::key::Named::Escape) && !self.wifi_busy {
+                self.wifi_entry = None;
+                self.wifi_note = None;
+            }
+            return Task::none();
+        }
         let page = self.page;
         let t = match self.page {
             Page::Main => self.main_key(named, &ch),
@@ -836,19 +950,27 @@ impl Shell {
     fn center_key(&mut self, named: Option<keyboard::key::Named>) -> Task<Message> {
         use keyboard::key::Named;
         let section = Section::ALL[self.section];
+        let rows = self.rows(section);
         let Some(row) = self.row else {
             match named {
                 Some(Named::ArrowDown) => self.section = (self.section + 1).min(Section::ALL.len() - 1),
                 Some(Named::ArrowUp) => self.section = self.section.saturating_sub(1),
-                Some(Named::ArrowRight) | Some(Named::Enter) if section.rows() > 0 => self.row = Some(0),
+                Some(Named::ArrowRight) | Some(Named::Enter) if rows > 0 => self.row = Some(0),
                 Some(Named::Escape) => self.page = Page::Main,
                 _ => {}
             }
+            // opening Network looks for Wi-Fi right away
+            if Section::ALL[self.section] == Section::Network && self.wifi.is_empty() && !self.wifi_busy {
+                self.wifi_busy = true;
+                return Task::perform(system::wifi_list(), |v| cosmic::Action::App(Message::WifiList(v)));
+            }
             return Task::none();
         };
+        let flat = matches!(section, Section::Network | Section::Keyboard);
         match named {
             Some(Named::Escape) => self.row = None,
-            Some(Named::ArrowDown) => self.row = Some((row + 1).min(section.rows() - 1)),
+            Some(Named::ArrowLeft) | Some(Named::ArrowRight) if flat => {}
+            Some(Named::ArrowDown) => self.row = Some((row + 1).min(rows.max(1) - 1)),
             Some(Named::ArrowUp) => self.row = Some(row.saturating_sub(1)),
             Some(Named::ArrowLeft) => return self.change(section, row, -1),
             Some(Named::ArrowRight) => return self.change(section, row, 1),
@@ -895,9 +1017,52 @@ impl Shell {
                     return self.update_action();
                 }
             }
+            Section::Network => {
+                if dir != 0 {
+                    return Task::none();
+                }
+                if row == 0 {
+                    self.wifi_busy = true;
+                    self.wifi_note = None;
+                    return Task::perform(system::wifi_list(), |v| cosmic::Action::App(Message::WifiList(v)));
+                }
+                if let Some(w) = self.wifi.get(row - 1).cloned() {
+                    if w.active {
+                        return Task::none();
+                    }
+                    self.wifi_note = None;
+                    self.wifi_pw.clear();
+                    if w.secure {
+                        self.wifi_entry = Some(w.ssid);
+                        return text_input::focus(self.ids[0].clone());
+                    }
+                    self.wifi_entry = Some(w.ssid);
+                    return self.update(Message::WifiSubmit);
+                }
+            }
+            Section::Keyboard => {
+                if dir == 0 {
+                    if let Some(l) = crate::setupd::LAYOUTS.get(row) {
+                        system::set_keyboard(l.0);
+                        self.keyboard = l.0.to_string();
+                        self.toast(&format!("Keyboard: {}", l.2));
+                    }
+                }
+            }
             Section::About => {}
         }
         Task::none()
+    }
+
+    fn rows(&self, s: Section) -> usize {
+        match s {
+            Section::Wallpaper => 5,
+            Section::Network => 1 + self.wifi.len(),
+            Section::Sound => if self.sound.present { 2 } else { 0 },
+            Section::Keyboard => crate::setupd::LAYOUTS.len(),
+            Section::Updates => 1,
+            Section::About => 0,
+        }
     }
 
     fn update_action(&mut self) -> Task<Message> {
@@ -1085,12 +1250,19 @@ impl Shell {
         }
         let content = match Section::ALL[self.section] {
             Section::Wallpaper => self.wallpaper_view(f),
+            Section::Network => self.network_view(f),
             Section::Sound => self.sound_view(f),
+            Section::Keyboard => self.keyboard_view(f),
             Section::Updates => self.updates_view(f),
             Section::About => self.about_view(f),
         };
-        let h: &[(&str, &str, bool)] = if self.row.is_none() {
+        let flat = matches!(Section::ALL[self.section], Section::Network | Section::Keyboard);
+        let h: &[(&str, &str, bool)] = if self.wifi_entry.is_some() {
+            &[("ENTER", "Connect", true), ("ESC", "Cancel", false)]
+        } else if self.row.is_none() {
             &[("↑ ↓", "Section", false), ("→", "Change", true), ("ESC", "Home", false)]
+        } else if flat {
+            &[("↑ ↓", "Choose", false), ("ENTER", "Use", true), ("ESC", "Sections", false)]
         } else {
             &[("↑ ↓", "Setting", false), ("← →", "Change", true), ("ENTER", "Press", false), ("ESC", "Sections", false)]
         };
@@ -1141,6 +1313,73 @@ impl Shell {
             .push(self.row_box(4, "Colour", color_name, colors.into(), f))
             .spacing(26)
             .into()
+    }
+
+    /// A one-line choice in a list: chosen = yellow.
+    fn list_row<'a>(&self, i: usize, name: String, detail: String, f: f32) -> Element<'a, Message> {
+        let on = self.row == Some(i);
+        fill(
+            widget::Row::new()
+                .push(text(name, SANS_BOLD, 21.0, alpha(if on { BLACK } else { TEXT }, f)))
+                .push(hfill())
+                .push(text(detail, MONO, 15.0, alpha(if on { BLACK } else { TEXT_2 }, f)))
+                .align_y(Alignment::Center),
+            alpha(if on { YELLOW } else { PANEL }, f),
+        )
+        .padding([14, 22])
+        .width(Length::Fixed(900.0))
+        .into()
+    }
+
+    fn network_view(&self, f: f32) -> Element<'_, Message> {
+        let mut col = widget::Column::new().spacing(8);
+        col = col
+            .push(text(format!("Now: {}", if self.network.is_empty() { "Offline" } else { &self.network }), SANS_BOLD, 28.0, alpha(TEXT, f)))
+            .push(space(1.0, 14.0));
+        let search = if self.wifi_busy && self.wifi_entry.is_none() { "Searching…" } else { "Search for Wi-Fi again" };
+        col = col.push(self.list_row(0, search.into(), "ENTER".into(), f));
+        for (i, w) in self.wifi.iter().enumerate() {
+            let detail = if w.active {
+                "CONNECTED".to_string()
+            } else {
+                format!("{}{}%", if w.secure { "LOCKED · " } else { "" }, w.signal)
+            };
+            col = col.push(self.list_row(i + 1, w.ssid.clone(), detail, f));
+        }
+        if let Some(ssid) = &self.wifi_entry {
+            let input = text_input::text_input("Wi-Fi password", self.wifi_pw.as_str())
+                .id(self.ids[0].clone())
+                .password()
+                .style(field_style())
+                .size(24)
+                .padding([16, 20])
+                .width(Length::Fixed(640.0))
+                .on_input(Message::WifiInput)
+                .on_submit(|_| Message::WifiSubmit);
+            col = col
+                .push(space(1.0, 12.0))
+                .push(text(format!("PASSWORD FOR {}", ssid.to_uppercase()), MONO, 15.0, alpha(TEXT_2, f)))
+                .push(bracket(input, f, 8.0));
+        }
+        if self.wifi_busy && self.wifi_entry.is_some() {
+            col = col.push(crate::atom::Atom::view(64.0, self.started_at));
+        }
+        if let Some(n) = &self.wifi_note {
+            col = col.push(text(n.clone(), SANS_BOLD, 20.0, alpha(YELLOW, f)));
+        }
+        widget::scrollable(col).height(Length::Fill).into()
+    }
+
+    fn keyboard_view(&self, f: f32) -> Element<'_, Message> {
+        let mut col = widget::Column::new().spacing(8);
+        col = col
+            .push(text("Alt + Shift switches between this layout and English (US).", SANS, 20.0, alpha(TEXT_2, f)))
+            .push(space(1.0, 10.0));
+        for (i, (id, _, name)) in crate::setupd::LAYOUTS.iter().enumerate() {
+            let detail = if *id == self.keyboard { "IN USE".to_string() } else { id.to_uppercase() };
+            col = col.push(self.list_row(i, name.to_string(), detail, f));
+        }
+        widget::scrollable(col).height(Length::Fill).into()
     }
 
     fn sound_view(&self, f: f32) -> Element<'_, Message> {
@@ -1197,7 +1436,7 @@ impl Shell {
     // ================================================================ system menu
 
     fn cards(&self) -> Vec<Card> {
-        let mut v = vec![Card::Layout, Card::Apps];
+        let mut v = vec![Card::Layout, Card::Apps, Card::Notes];
         if matches!(self.update, Update::Available | Update::Installing | Update::Installed) {
             v.push(Card::Update);
         }
@@ -1257,10 +1496,24 @@ impl Shell {
                 }
                 return Task::none();
             }
+            Sub::Notes(i) => {
+                let n = self.notes.len();
+                match named {
+                    Some(Named::ArrowRight) if n > 0 => self.sub = Sub::Notes((i + 1).min(n - 1)),
+                    Some(Named::ArrowLeft) => self.sub = Sub::Notes(i.saturating_sub(1)),
+                    Some(Named::Escape) | Some(Named::ArrowUp) => self.sub = Sub::None,
+                    _ => {}
+                }
+                if ch == "x" && i < n {
+                    self.notes.remove(i);
+                    self.sub = if self.notes.is_empty() { Sub::None } else { Sub::Notes(i.min(self.notes.len() - 1)) };
+                }
+                return Task::none();
+            }
             Sub::Power(i) => {
                 match named {
                     Some(Named::ArrowRight) => {
-                        self.sub = Sub::Power((i + 1).min(3));
+                        self.sub = Sub::Power((i + 1).min(4));
                         self.power_armed = false;
                     }
                     Some(Named::ArrowLeft) => {
@@ -1269,6 +1522,11 @@ impl Shell {
                     }
                     Some(Named::Escape) | Some(Named::ArrowUp) => self.sub = Sub::None,
                     Some(Named::Enter) => {
+                        if i == 0 {
+                            self.close_menu();
+                            return lock();
+                        }
+                        let i = i - 1;
                         if i == 3 {
                             self.sub = Sub::None;
                         } else if self.power_armed {
@@ -1307,12 +1565,16 @@ impl Shell {
             Some(Named::ArrowLeft) => self.card = self.card.saturating_sub(1),
             Some(Named::Escape) => self.close_menu(),
             Some(Named::Enter) | Some(Named::ArrowDown) => return self.press_card(cards[self.card]),
-            Some(Named::F10) => self.sub = Sub::Power(0),
+            Some(Named::F10) => self.sub = Sub::Power(1),
             _ => {}
         }
         match ch.as_str() {
             "h" => return self.press_card(Card::Home),
             "c" => return self.press_card(Card::Center),
+            "l" => {
+                self.close_menu();
+                return lock();
+            }
             _ => {}
         }
         Task::none()
@@ -1338,6 +1600,11 @@ impl Shell {
                 }
             }
             Card::Update => return self.update_action(),
+            Card::Notes => {
+                if !self.notes.is_empty() {
+                    self.sub = Sub::Notes(0);
+                }
+            }
             Card::Sound => self.sub = Sub::Sound,
             Card::Home => {
                 self.close_menu();
@@ -1352,7 +1619,7 @@ impl Shell {
                 return t;
             }
             Card::Power => {
-                self.sub = Sub::Power(0);
+                self.sub = Sub::Power(1);
                 self.power_armed = false;
             }
         }
@@ -1425,10 +1692,10 @@ impl Shell {
             }
             Sub::Power(sel) => {
                 let mut r = widget::Row::new().spacing(18);
-                let labels = ["Log out", "Restart", "Shut down", "Cancel"];
+                let labels = ["Lock", "Log out", "Restart", "Shut down", "Cancel"];
                 for (i, l) in labels.iter().enumerate() {
                     let on = i == sel;
-                    let armed = on && self.power_armed;
+                    let armed = on && self.power_armed && (1..=3).contains(&i);
                     let label = if armed { format!("Press Enter to {}", l.to_lowercase()) } else { l.to_string() };
                     let bg = if armed { RED } else if on { YELLOW } else { PANEL_2 };
                     let b = fill(text(label, SANS_BOLD, 21.0, alpha(if on { BLACK } else { TEXT }, f)), alpha(bg, f)).padding([18, 28]);
@@ -1436,14 +1703,35 @@ impl Shell {
                 }
                 r.into()
             }
+            Sub::Notes(sel) => {
+                let mut r = widget::Row::new().spacing(18);
+                for (i, n) in self.notes.iter().enumerate().take(6) {
+                    let on = i == sel;
+                    let fg = if on { BLACK } else { TEXT };
+                    let tile = fill(
+                        widget::Column::new()
+                            .push(text(n.app.to_uppercase(), MONO, 12.0, alpha(if on { BLACK } else { TEXT_2 }, f)))
+                            .push(text(clip(&n.summary, 28), SANS_BOLD, 17.0, alpha(fg, f)))
+                            .push(text(clip(&n.body, 60), SANS, 14.0, alpha(fg, f)))
+                            .spacing(6),
+                        alpha(if on { YELLOW } else { PANEL_2 }, f),
+                    )
+                    .padding(16)
+                    .width(Length::Fixed(260.0))
+                    .height(Length::Fixed(130.0));
+                    r = r.push(bracket(tile, if on { f } else { 0.0 }, 8.0));
+                }
+                r.into()
+            }
             _ => space(1.0, 1.0),
         };
 
         let h: &[(&str, &str, bool)] = match self.sub {
-            Sub::None => &[("← →", "Move", false), ("ENTER", "Choose", true), ("H", "Home", false), ("C", "Center", false), ("F10", "Power", false), ("SUPER", "Close", false)],
+            Sub::None => &[("← →", "Move", false), ("ENTER", "Choose", true), ("H", "Home", false), ("C", "Center", false), ("L", "Lock", false), ("F10", "Power", false), ("SUPER", "Close", false)],
             Sub::Apps(_) => &[("← →", "App", false), ("ENTER", "Show", true), ("S", "Show beside", false), ("X", "Close app", false), ("ESC", "Back", false)],
             Sub::Power(_) => &[("← →", "Choose", false), ("ENTER", "Twice to confirm", true), ("ESC", "Back", false)],
             Sub::Sound => &[("← →", "Volume", true), ("ENTER", "Done", false)],
+            Sub::Notes(_) => &[("← →", "Move", false), ("X", "Dismiss", true), ("ESC", "Back", false)],
         };
 
         let mut sheet_col = widget::Column::new().push(head).push(space(1.0, 30.0)).push(row).push(space(1.0, 22.0)).push(sub);
@@ -1500,23 +1788,28 @@ impl Shell {
                 let n = self.layout.apps().len();
                 ("OPEN APPS", if n == 0 { "None".into() } else { format!("{n} open") }, text("SWITCH · CLOSE", MONO, 13.0, alpha(TEXT_2, f)))
             }
+            Card::Notes => {
+                let n = self.notes.len();
+                let last = self.notes.first().map(|n| clip(&n.summary, 20)).unwrap_or_else(|| "NOTHING NEW".into());
+                ("NOTIFICATIONS", if n == 0 { "None".into() } else { format!("{n} new") }, text(last.to_uppercase(), MONO, 12.0, alpha(TEXT_2, f)))
+            }
             Card::Update => ("UPDATE", "New version".into(), text(self.update.text().to_uppercase(), MONO, 12.0, alpha(TEXT_2, f))),
             Card::Sound => {
                 let v = if self.sound.muted { "Off".to_string() } else { format!("{:.0}", self.sound.volume * 100.0) };
-                ("SOUND", v, slider(self.sound.volume, 196.0, self.sub == Sub::Sound, f))
+                ("SOUND", v, slider(self.sound.volume, 136.0, self.sub == Sub::Sound, f))
             }
             Card::Home => ("HOME", "Home".into(), text("H", MONO, 13.0, alpha(TEXT_2, f))),
             Card::Center => ("CENTER", "Settings".into(), text("C", MONO, 13.0, alpha(TEXT_2, f))),
-            Card::Power => ("POWER", "Off · restart".into(), text("F10", MONO, 13.0, alpha(TEXT_2, f))),
+            Card::Power => ("POWER", "Lock · off".into(), text("L · F10", MONO, 13.0, alpha(TEXT_2, f))),
         };
         let strong = focused;
         let fg = if strong { BLACK } else { TEXT };
         let lab = if strong { BLACK } else { TEXT_2 };
-        let width = if c == Card::Layout { 360.0 } else { 240.0 };
+        let width = if c == Card::Layout { 290.0 } else { 180.0 };
         let body = widget::Column::new()
             .push(text(label, MONO, 14.0, alpha(lab, f)))
             .push(vfill())
-            .push(text(value, SANS_BOLD, 25.0, alpha(fg, f)))
+            .push(text(value, SANS_BOLD, 23.0, alpha(fg, f)))
             .push(space(1.0, 12.0))
             .push(extra)
             .padding(22)
@@ -1535,6 +1828,83 @@ impl<'a> ApplyWidth<'a> for Element<'a, Message> {
     fn apply_width(self, w: f32) -> Element<'a, Message> {
         widget::container(self).width(Length::Fixed(w)).into()
     }
+}
+
+impl Shell {
+    // ================================================================ notifications
+
+    fn show_note(&mut self, n: Note) -> Task<Message> {
+        self.notes.retain(|x| x.id != n.id);
+        self.notes.insert(0, n);
+        self.notes.truncate(20);
+        match self.note_surface {
+            Some((id, _)) => {
+                self.note_surface = Some((id, Instant::now()));
+                Task::none()
+            }
+            None => {
+                let id = window::Id::unique();
+                self.note_surface = Some((id, Instant::now()));
+                get_layer_surface(SctkLayerSurfaceSettings {
+                    id,
+                    layer: Layer::Overlay,
+                    keyboard_interactivity: KeyboardInteractivity::None,
+                    anchor: Anchor::BOTTOM | Anchor::RIGHT,
+                    output: IcedOutput::Active,
+                    namespace: "chlorum-note".into(),
+                    margin: IcedMargin { top: 0, right: 28, bottom: 96, left: 0 },
+                    size: Some((Some(480), Some(132))),
+                    exclusive_zone: 0,
+                    size_limits: iced::Limits::NONE.min_width(1.0).min_height(1.0).max_width(480.0).max_height(132.0),
+                    ..Default::default()
+                })
+            }
+        }
+    }
+
+    fn note_view(&self) -> Element<'_, Message> {
+        let Some(n) = self.notes.first() else { return space(1.0, 1.0) };
+        let icon: Element<'_, Message> = if n.icon.is_empty() {
+            widget::icon::from_name("com.chlorum.Logo").size(56).into()
+        } else if n.icon.starts_with('/') {
+            widget::icon::icon(widget::icon::from_path(n.icon.clone().into())).size(56).into()
+        } else {
+            widget::icon::from_name(n.icon.clone()).size(56).into()
+        };
+        let body = widget::Row::new()
+            .push(icon)
+            .push(
+                widget::Column::new()
+                    .push(text(n.app.to_uppercase(), MONO, 12.0, TEXT_2))
+                    .push(text(clip(&n.summary, 40), SANS_BOLD, 19.0, TEXT))
+                    .push(text(clip(&n.body, 90), SANS, 15.0, TEXT_2))
+                    .spacing(4),
+            )
+            .spacing(18)
+            .align_y(Alignment::Center);
+        widget::Column::new()
+            .push(fill(space(1.0, 3.0), YELLOW).width(Length::Fill))
+            .push(fill(body, Color::from_rgba(0.05, 0.05, 0.05, 0.96)).padding([16, 20]).width(Length::Fill).height(Length::Fill))
+            .into()
+    }
+
+}
+
+/// The lock screen is its own small program, started by niri: it keeps the
+/// screen locked even if the shell restarts.
+fn lock() -> Task<Message> {
+    if std::env::var_os("NIRI_SOCKET").is_none() {
+        if let Ok(me) = std::env::current_exe() {
+            let _ = std::process::Command::new(me).arg("lock").spawn();
+        }
+        return Task::none();
+    }
+    Task::perform(niri::run(vec![Action::SpawnSh { command: "chlorum lock".into() }]), |_| cosmic::Action::App(Message::Tick))
+}
+
+fn clip(s: &str, n: usize) -> String {
+    let s = s.replace('\n', " ");
+    if s.chars().count() <= n { s } else { s.chars().take(n - 1).collect::<String>() + "…" }
 }
 
 fn ease_out(t: f32) -> f32 {

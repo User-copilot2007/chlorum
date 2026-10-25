@@ -92,6 +92,14 @@ in
           return polkit.Result.YES;
         }
       });
+      // The person at the computer may join Wi-Fi networks from Center
+      // (Chlorum has no password pop-ups for this).
+      polkit.addRule(function(action, subject) {
+        if (action.id.indexOf("org.freedesktop.NetworkManager.") == 0 &&
+            subject.isInGroup("chlorum-owner") && subject.active && subject.local) {
+          return polkit.Result.YES;
+        }
+      });
     '';
 
     # Old versions are removed so updates never fill the disk.

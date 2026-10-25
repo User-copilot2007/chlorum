@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 
 pub const STAGE: &str = "stage";
 pub const SHELF: &str = "shelf";
+pub const HOME: &str = "home";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Stage {
@@ -362,8 +363,14 @@ impl Layout {
         let changed = self.last_planned != Some(self.stage()) || moved;
         let dialog_has_keys = self.windows.values().any(|w| w.is_focused && w.is_floating);
         if let Some(f) = self.focused() {
-            let focused_now = self.windows.get(&f).is_some_and(|w| w.is_focused);
-            if changed && (moved || !focused_now) && !(dialog_has_keys && !moved) {
+            if changed && !(dialog_has_keys && !moved) {
+                // Focusing the left app first puts niri's view at the start,
+                // so both apps are fully on screen; then the one with the keys.
+                if let Stage::Two { left, .. } = self.stage() {
+                    if left != f {
+                        out.push(Action::FocusWindow { id: left });
+                    }
+                }
                 out.push(Action::FocusWindow { id: f });
             }
         }

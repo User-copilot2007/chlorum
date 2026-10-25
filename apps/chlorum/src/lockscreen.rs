@@ -1,0 +1,251 @@
+//! `chlorum lock` — the lock screen. A small program of its own (like any
+//! screen locker): it locks every screen through the session-lock protocol,
+//! asks for the profile password, and only then unlocks and quits. If it
+//! crashed, the screen would stay locked, never open.
+
+use crate::atom::Atom;
+use crate::ui::*;
+use chrono::{Local, Timelike};
+use cosmic::app::{Core, Settings, Task};
+use cosmic::cctk::sctk::reexports::client::protocol::wl_output::WlOutput;
+use cosmic::iced::event::wayland::{OutputEvent, SessionLockEvent};
+use cosmic::iced::platform_specific::shell::commands::session_lock;
+use cosmic::iced::{self, Alignment, Length, Subscription, event, keyboard, window};
+use cosmic::widget::text_input;
+use cosmic::{Application, Element, widget};
+use std::time::{Duration, Instant};
+
+pub fn run() -> cosmic::iced::Result {
+    // one lock screen at a time
+    let flag = crate::apps::runtime_dir().join("locked");
+    if let Ok(pid) = std::fs::read_to_string(&flag) {
+        let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid.trim())).unwrap_or_default();
+        if comm.trim() == "chlorum" {
+            return Ok(());
+        }
+    }
+    let _ = std::fs::create_dir_all(crate::apps::runtime_dir());
+    let _ = std::fs::write(&flag, std::process::id().to_string());
+    let settings = Settings::default().no_main_window(true).default_font(SANS).default_icon_theme("Papirus-Dark");
+    let r = cosmic::app::run::<Lock>(settings, ());
+    let _ = std::fs::remove_file(flag);
+    r
+}
+
+#[derive(Clone, Debug)]
+pub enum Message {
+    Tick,
+    Frame,
+    Output(WlOutput),
+    Go,
+    Lock(SessionLockEvent),
+    Input(String),
+    Submit,
+    Key(keyboard::Key),
+    Checked(Result<(), String>),
+    Quit,
+}
+
+pub struct Lock {
+    core: Core,
+    outputs: Vec<WlOutput>,
+    asked: bool,
+    surfaces: Vec<window::Id>,
+    password: String,
+    busy: bool,
+    error: Option<String>,
+    user: String,
+    name: String,
+    input: widget::Id,
+    started: Instant,
+}
+
+impl Application for Lock {
+    type Executor = cosmic::executor::Default;
+    type Flags = ();
+    type Message = Message;
+    const APP_ID: &'static str = "com.chlorum.Lock";
+
+    fn core(&self) -> &Core {
+        &self.core
+    }
+    fn core_mut(&mut self) -> &mut Core {
+        &mut self.core
+    }
+
+    fn init(core: Core, _: ()) -> (Self, Task<Message>) {
+        let l = Lock {
+            core,
+            outputs: vec![],
+            asked: false,
+            surfaces: vec![],
+            password: String::new(),
+            busy: false,
+            error: None,
+            user: std::env::var("USER").unwrap_or_default(),
+            name: crate::system::display_name(),
+            input: widget::Id::unique(),
+            started: Instant::now(),
+        };
+        // screens are announced right after start; lock once they are known
+        let go = Task::perform(tokio::time::sleep(Duration::from_millis(300)), |_| cosmic::Action::App(Message::Go));
+        (l, go)
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let mut s = vec![
+            iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick),
+            event::listen_with(|e, _, _| match e {
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => Some(Message::Key(key)),
+                iced::Event::PlatformSpecific(iced::event::PlatformSpecific::Wayland(w)) => match w {
+                    iced::event::wayland::Event::Output(OutputEvent::Created(_), o) => Some(Message::Output(o)),
+                    iced::event::wayland::Event::SessionLock(ev) => Some(Message::Lock(ev)),
+                    _ => None,
+                },
+                _ => None,
+            }),
+        ];
+        if self.busy {
+            s.push(iced::time::every(Duration::from_millis(16)).map(|_| Message::Frame));
+        }
+        Subscription::batch(s)
+    }
+
+    fn update(&mut self, m: Message) -> Task<Message> {
+        match m {
+            Message::Tick | Message::Frame => {}
+            Message::Output(o) => {
+                if !self.outputs.contains(&o) {
+                    self.outputs.push(o.clone());
+                    // a screen plugged in while locked gets the lock screen too
+                    if !self.surfaces.is_empty() {
+                        let id = window::Id::unique();
+                        self.surfaces.push(id);
+                        return session_lock::get_lock_surface(id, o);
+                    }
+                }
+            }
+            Message::Go => {
+                if self.outputs.is_empty() {
+                    if self.started.elapsed() > Duration::from_secs(3) {
+                        eprintln!("chlorum lock: no screens");
+                        return Task::done(cosmic::Action::App(Message::Quit));
+                    }
+                    return Task::perform(tokio::time::sleep(Duration::from_millis(200)), |_| cosmic::Action::App(Message::Go));
+                }
+                if !self.asked {
+                    self.asked = true;
+                    return session_lock::lock();
+                }
+            }
+            Message::Lock(SessionLockEvent::Locked) => {
+                if self.surfaces.is_empty() {
+                    let mut t = Vec::new();
+                    for o in self.outputs.clone() {
+                        let id = window::Id::unique();
+                        self.surfaces.push(id);
+                        t.push(session_lock::get_lock_surface(id, o));
+                    }
+                    t.push(text_input::focus(self.input.clone()));
+                    return Task::batch(t);
+                }
+            }
+            Message::Lock(SessionLockEvent::Focused(..)) => return text_input::focus(self.input.clone()),
+            Message::Lock(SessionLockEvent::Finished) | Message::Lock(SessionLockEvent::NotSupported) => {
+                eprintln!("chlorum lock: the compositor refused to lock");
+                return Task::done(cosmic::Action::App(Message::Quit));
+            }
+            Message::Lock(SessionLockEvent::Unlocked) => return Task::done(cosmic::Action::App(Message::Quit)),
+            Message::Lock(_) => {}
+            Message::Input(v) => {
+                if !self.busy {
+                    self.password = v;
+                    self.error = None;
+                }
+            }
+            Message::Key(k) => {
+                if !self.busy && matches!(k.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                    self.password.clear();
+                }
+            }
+            Message::Submit => {
+                if self.busy || self.password.is_empty() {
+                    return Task::none();
+                }
+                self.busy = true;
+                self.started = Instant::now();
+                let (u, p) = (self.user.clone(), self.password.clone());
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || crate::lock::authenticate(&u, &p))
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    |r| cosmic::Action::App(Message::Checked(r)),
+                );
+            }
+            Message::Checked(Ok(())) => {
+                self.busy = false;
+                let mut t: Vec<Task<Message>> = self.surfaces.drain(..).map(session_lock::destroy_lock_surface).collect();
+                t.push(session_lock::unlock());
+                t.push(Task::perform(tokio::time::sleep(Duration::from_millis(400)), |_| cosmic::Action::App(Message::Quit)));
+                return Task::batch(t);
+            }
+            Message::Checked(Err(e)) => {
+                self.busy = false;
+                self.password.clear();
+                self.error = Some(e);
+                return text_input::focus(self.input.clone());
+            }
+            Message::Quit => {
+                let _ = std::fs::remove_file(crate::apps::runtime_dir().join("locked"));
+                std::process::exit(0);
+            }
+        }
+        Task::none()
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        widget::Space::new().into()
+    }
+
+    fn view_window(&self, id: window::Id) -> Element<'_, Message> {
+        let main = self.surfaces.first() == Some(&id);
+        let now = Local::now();
+        let mut col = widget::Column::new()
+            .align_x(Alignment::Center)
+            .spacing(18)
+            .push(vfill())
+            .push(widget::icon::from_name("com.chlorum.Logo").size(300))
+            .push(
+                widget::Row::new()
+                    .push(text(format!("{:02}:{:02}", now.hour(), now.minute()), MONO_BOLD, 88.0, TEXT))
+                    .push(text(format!(":{:02}", now.second()), MONO_BOLD, 88.0, YELLOW)),
+            )
+            .push(text(now.format("%A  ·  %-d %B").to_string().to_uppercase(), MONO, 21.0, TEXT_2));
+        if main {
+            col = col.push(space(1.0, 30.0)).push(text(self.name.clone(), SANS_BOLD, 26.0, TEXT));
+            if self.busy {
+                col = col.push(Atom::view(90.0, self.started));
+            } else {
+                let input = text_input::text_input("Password", self.password.as_str())
+                    .id(self.input.clone())
+                    .password()
+                    .style(field_style())
+                    .size(30)
+                    .padding([20, 24])
+                    .width(Length::Fixed(560.0))
+                    .on_input(Message::Input)
+                    .on_submit(|_| Message::Submit);
+                col = col.push(bracket(input, 1.0, 10.0));
+            }
+            if let Some(e) = &self.error {
+                col = col.push(text(e.clone(), SANS_BOLD, 21.0, RED));
+            }
+            col = col.push(vfill()).push(hints(&[("ENTER", "Unlock", true), ("ESC", "Clear", false)], 1.0));
+        } else {
+            col = col.push(vfill());
+        }
+        fill(col.padding([48, 72]).width(Length::Fill), BLACK).width(Length::Fill).height(Length::Fill).into()
+    }
+}

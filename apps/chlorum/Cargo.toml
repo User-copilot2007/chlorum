@@ -1,6 +1,6 @@
 [package]
 name = "chlorum"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Chlorum shell: Home, system menu, app layouts, login screen and Library"
@@ -10,6 +10,14 @@ tokio = { version = "1", features = ["process", "net", "io-util", "time", "fs"] 
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 niri-ipc = "=26.4.0"
 serde_json = "1"
+# live wallpaper: GLSL on the background layer
+smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
+wayland-client = "0.31"
+wayland-egl = "0.32"
+khronos-egl = { version = "6", features = ["static"] }
+glow = "0.16"
+# notifications from apps
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"
