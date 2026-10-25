@@ -8,7 +8,8 @@
       directories = [
         "/var/log"                                # system logs
         "/var/lib/nixos"                          # stable user and group IDs
-        "/var/lib/systemd"                        # timers, random seed, user records
+        "/var/lib/systemd"                        # timers, random seed, profile records
+        "/var/lib/chlorum"                        # first-run state, computer name
         "/etc/NetworkManager/system-connections"  # saved Wi-Fi and VPN
       ];
       files = [

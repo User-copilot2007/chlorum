@@ -8,6 +8,7 @@
   chlorum.disk.enable = true;
   chlorum.persist.enable = true;
   chlorum.update.enable = true;
+  chlorum.profiles.enable = true;
 
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = false;
@@ -15,10 +16,6 @@
 
   hardware.enableRedistributableFirmware = true;
   networking.networkmanager.enable = true;
-
-  # Temporary admin login until profiles. The installer writes only the hash.
-  users.mutableUsers = false;
-  users.users.root.hashedPasswordFile = "/persist/etc/chlorum/root.hash";
 
   system.stateVersion = "26.05";
 }

@@ -49,8 +49,8 @@
               name = "chlorum-install";
               runtimeInputs = [
                 disko.packages.x86_64-linux.disko
-                pkgs.mkpasswd
                 pkgs.util-linux
+                pkgs.gawk
                 pkgs.gptfdisk
                 pkgs.lvm2
                 pkgs.cryptsetup

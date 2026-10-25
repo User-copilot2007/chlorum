@@ -6,7 +6,7 @@ let
     name = "chlorum-update";
     runtimeInputs = [ config.systemd.package pkgs.coreutils ];
     text = ''
-      if [ "$(id -u)" -ne 0 ]; then exec sudo "$0" "$@"; fi
+      if [ "$(id -u)" -ne 0 ]; then exec run0 "$0" "$@"; fi
       echo "Checking for a new Chlorum version..."
       journalctl -u nixos-upgrade.service -f -n 0 -o cat &
       log=$!
@@ -50,5 +50,15 @@ in
       allowReboot = false;
     };
     environment.systemPackages = [ chlorum-update ];
+
+    # Old versions are removed so updates never fill the disk.
+    # The last 14 days stay available in the boot menu.
+    nix.gc = {
+      automatic = true;
+      dates = "weekly";
+      options = "--delete-older-than 14d";
+    };
+    nix.optimise.automatic = true;
+    boot.loader.systemd-boot.configurationLimit = lib.mkDefault 10;
   };
 }

@@ -1,11 +1,10 @@
 FLAKE=/etc/chlorum
+ROOT=/mnt/disko-install-root
 
 # Needs root. Restart through sudo when started as a normal user.
 if [ "$(id -u)" -ne 0 ]; then
   exec sudo "$0" "$@"
 fi
-
-ROOT=/mnt/disko-install-root
 
 # Unmount and close whatever an earlier, interrupted run left behind.
 cleanup_target() {
@@ -14,7 +13,7 @@ cleanup_target() {
   rmdir "$ROOT" 2>/dev/null || true
 }
 cleanup_target
-rm -f /tmp/chlorum-disk-password /tmp/chlorum-root.hash
+rm -f /tmp/chlorum-disk-password
 
 # The drive this live system runs from. Never offered, never touched.
 # The ISO file system can sit on a partition or on the whole drive.
@@ -61,45 +60,40 @@ if [ "${#offered[@]}" -eq 0 ]; then
   echo "No disk to install on. Plug in the target drive and run chlorum-install again."
   exit 1
 fi
-echo "Disks you can install on:"
-for n in "${offered[@]}"; do
-  lsblk -dno NAME,SIZE,MODEL,TRAN "/dev/$n"
-done
-echo
-read -rp "Disk to install on (for example sdb or nvme1n1): " name
-ok=no
-for n in "${offered[@]}"; do
-  [ "$n" = "$name" ] && ok=yes
-done
-if [ "$ok" != yes ]; then
-  echo "\"$name\" is not in the list above. Nothing was changed."
-  exit 1
+
+if [ "${#offered[@]}" -eq 1 ]; then
+  name="${offered[0]}"
+else
+  echo "Disks you can install on:"
+  for n in "${offered[@]}"; do
+    lsblk -dno NAME,SIZE,MODEL,TRAN "/dev/$n"
+  done
+  echo
+  read -rp "Disk to install on (for example sdb or nvme1n1): " name
+  ok=no
+  for n in "${offered[@]}"; do
+    [ "$n" = "$name" ] && ok=yes
+  done
+  if [ "$ok" != yes ]; then
+    echo "\"$name\" is not in the list above. Nothing was changed."
+    exit 1
+  fi
 fi
 disk="/dev/$name"
 
 echo
-echo "EVERYTHING ON $disk ($(lsblk -dno SIZE,MODEL "$disk")) WILL BE ERASED."
-read -rp "Type the disk name again to confirm: " again
-if [ "$again" != "$name" ]; then
-  echo "Cancelled."
+echo "Install Chlorum on $name ($(lsblk -dno SIZE,MODEL "$disk" | xargs))?"
+echo "EVERYTHING ON IT WILL BE ERASED."
+read -rp "Type yes to install: " answer
+if [ "$answer" != yes ]; then
+  echo "Cancelled. Nothing was changed."
   exit 1
 fi
 
 umask 077
 
-echo
-echo "You will need both keys and their PINs, and paper for the recovery code."
-echo
-echo "Admin password (temporary console login until profiles exist)"
-while true; do
-  read -rsp "Admin password: " a1; echo
-  read -rsp "Repeat: " a2; echo
-  if [ -n "$a1" ] && [ "$a1" = "$a2" ]; then break; fi
-  echo "Passwords do not match or are empty."
-done
-printf '%s' "$a1" | mkpasswd -m yescrypt -s > /tmp/chlorum-root.hash
-
-# One-time random passphrase: only used to set the disk up, then wiped.
+# One-time random passphrase: only used to set the disk up, then wiped
+# before this installer ends. It is never written to the installed disk.
 head -c 48 /dev/urandom | base64 -w0 > /tmp/chlorum-disk-password
 
 echo
@@ -116,10 +110,7 @@ udevadm settle
 echo
 echo "Installing. This downloads the system and takes a while."
 rc=0
-disko-install \
-  --flake "$FLAKE#chlorum" \
-  --disk main "$disk" \
-  --extra-files /tmp/chlorum-root.hash /persist/etc/chlorum/root.hash || rc=$?
+disko-install --flake "$FLAKE#chlorum" --disk main "$disk" || rc=$?
 
 # disko-install can report an error while cleaning up after a finished
 # install. Trust what is on the disk, not only its exit code.
@@ -134,47 +125,66 @@ if [ "$rc" -ne 0 ]; then
     dmsetup ls || true
     findmnt -R /mnt || true
     cleanup_target
-    shred -u /tmp/chlorum-disk-password /tmp/chlorum-root.hash 2>/dev/null || true
+    shred -u /tmp/chlorum-disk-password 2>/dev/null || true
     exit 1
   fi
 fi
 cleanup_target
 udevadm settle
 
-part=/dev/disk/by-partlabel/disk-main-system
+# Find the encrypted partition on the chosen disk itself, not by label:
+# another drive may hold an older Chlorum with the same label.
+PART=$(lsblk -lnpo NAME,PARTLABEL "$disk" | awk '$2 == "disk-main-system" { print $1 }')
+if [ -z "$PART" ]; then
+  echo "INSTALL FAILED: the encrypted partition was not found on $disk."
+  shred -u /tmp/chlorum-disk-password 2>/dev/null || true
+  exit 1
+fi
 
-enroll_key() {
+# The PC's security chip opens the disk by itself, but only while the
+# Secure Boot settings stay the same (PCR 7). If that fails, the disk asks
+# for the recovery code instead.
+tpm=no
+if systemd-analyze has-tpm2 >/dev/null 2>&1; then
   echo
-  echo "Insert your $1 key and press Enter. Then enter its PIN and touch it."
-  read -r _
-  systemd-cryptenroll "$part" \
-    --unlock-key-file=/tmp/chlorum-disk-password \
-    --fido2-device=auto \
-    --fido2-with-client-pin=yes
-}
+  echo "Linking the disk to this PC's security chip (TPM)."
+  if systemd-cryptenroll "$PART" \
+       --unlock-key-file=/tmp/chlorum-disk-password \
+       --tpm2-device=auto \
+       --tpm2-pcrs=7; then
+    tpm=yes
+  else
+    echo "Could not use the security chip. The disk will ask for the recovery code."
+  fi
+else
+  echo
+  echo "This PC has no usable security chip (TPM)."
+fi
 
-enroll_key "FIRST"
-echo "Remove the first key."
-enroll_key "SECOND"
-echo "Remove the second key."
-
+# Always a recovery code, made and shown before the setup passphrase is
+# wiped, so there is never a moment when the disk has only one way in.
 echo
-echo "RECOVERY CODE. Write it on paper now and keep it away from this PC."
+echo "RECOVERY CODE for this disk. Write it on paper now and keep it away from this PC."
 echo "Never photograph it or send it to anyone."
-systemd-cryptenroll "$part" \
+if [ "$tpm" = yes ]; then
+  echo "You need it only if the security chip ever refuses, for example after a firmware update."
+else
+  echo "The disk asks for it at every start until you turn the TPM on in"
+  echo "firmware settings and run: chlorum-keys tpm"
+fi
+systemd-cryptenroll "$PART" \
   --unlock-key-file=/tmp/chlorum-disk-password \
   --recovery-key
-
 echo
 read -rp "Press Enter after you have written the code down. " _
 
 echo
 echo "Removing the one-time setup passphrase."
-systemd-cryptenroll "$part" \
+systemd-cryptenroll "$PART" \
   --unlock-key-file=/tmp/chlorum-disk-password \
   --wipe-slot=password
+shred -u /tmp/chlorum-disk-password
 
-shred -u /tmp/chlorum-disk-password /tmp/chlorum-root.hash
 echo
-echo "Done. The disk now opens with either key or the recovery code."
-echo "Remove the USB stick and reboot."
+echo "Done. Remove the USB stick and reboot."
+echo "On first start Chlorum sets up your profile."
