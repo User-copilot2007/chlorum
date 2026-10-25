@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chlorum</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- Main menu: clock, time zone, app ribbon -->
+<section id="menu" class="screen" hidden>
+  <div class="top">
+    <div class="brand"><img src="logo.svg" alt="">CHLORUM</div>
+    <div class="top-right">
+      <span id="menu-user"></span>
+      <button class="icon-btn" data-power="logout"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 4h4v16h-4M10 8l-4 4 4 4M6 12h11"/></svg>Log out</button>
+      <button class="icon-btn" data-power="reboot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5"/></svg>Restart</button>
+      <button class="icon-btn" data-power="poweroff"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v9M6.3 6.3a8 8 0 1 0 11.4 0"/></svg>Shut down</button>
+    </div>
+  </div>
+
+  <div class="clock">
+    <div class="time" id="time">--:--<span class="sec">:--</span></div>
+    <div class="date"><span id="date"></span> · <span class="zone" id="zone"></span></div>
+  </div>
+
+  <div class="ribbon-wrap">
+    <div class="ribbon-label">APPS</div>
+    <div class="ribbon" id="ribbon"></div>
+    <div class="ribbon-space"></div>
+    <div class="status" id="menu-status"></div>
+    <div class="hints"><span><b>← →</b> Move</span><span><b>↑</b> Power</span><span><b>ENTER</b> Open</span><span><b>SUPER</b> Back to apps</span></div>
+  </div>
+</section>
+
+<!-- Login -->
+<section id="login" class="screen" hidden>
+  <div class="top">
+    <div class="brand"><img src="logo.svg" alt="">CHLORUM</div>
+    <div class="top-right">
+      <button class="icon-btn" data-power="reboot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 12a8 8 0 1 1-2.3-5.6M20 4v5h-5"/></svg>Restart</button>
+      <button class="icon-btn" data-power="poweroff"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v9M6.3 6.3a8 8 0 1 0 11.4 0"/></svg>Shut down</button>
+    </div>
+  </div>
+  <div class="center">
+    <div class="clock">
+      <div class="time" id="login-time" style="font-size: clamp(48px, 7vw, 104px)">--:--</div>
+      <div class="date" id="login-date"></div>
+    </div>
+    <div class="field">
+      <label for="login-user">PROFILE</label>
+      <input id="login-user" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="login-pass">PASSWORD</label>
+      <input id="login-pass" type="password" autocomplete="off">
+    </div>
+    <div class="status" id="login-status"></div>
+    <div class="hints"><span><b>ENTER</b> Log in</span><span><b>TAB</b> Next field</span></div>
+  </div>
+</section>
+
+<!-- First run -->
+<section id="setup" class="screen" hidden>
+  <div class="top">
+    <div class="brand"><img src="logo.svg" alt="">CHLORUM</div>
+    <div class="steps" id="steps"><span></span><span></span><span></span></div>
+  </div>
+  <div class="center" id="setup-body"></div>
+</section>
+
+<script src="app.js"></script>
+</body>
+</html>

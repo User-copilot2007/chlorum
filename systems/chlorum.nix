@@ -9,6 +9,7 @@
   chlorum.persist.enable = true;
   chlorum.update.enable = true;
   chlorum.profiles.enable = true;
+  chlorum.desktop.enable = true;
 
   boot.loader.systemd-boot.enable = true;
   boot.loader.efi.canTouchEfiVariables = false;

@@ -90,8 +90,8 @@ in
       '';
     };
 
-    # First run: on tty1, before the login prompt, until it has finished
-    systemd.services.chlorum-setup = {
+    # Console first run, only without the desktop (the desktop has its own)
+    systemd.services.chlorum-setup = lib.mkIf (!config.chlorum.desktop.enable) {
       description = "Chlorum first-run setup";
       wantedBy = [ "multi-user.target" ];
       wants = [ "systemd-homed.service" "NetworkManager.service" ];
