@@ -3,9 +3,13 @@
   options.chlorum.persist.enable = lib.mkEnableOption "Chlorum clean root";
 
   config = lib.mkIf config.chlorum.persist.enable {
-    # dbus-broker is known to fail to start on systems whose root is wiped
-    # on every boot (nixpkgs issue 302771). The classic D-Bus daemon works.
-    services.dbus.implementation = "dbus";
+    # /nix and /home must be open for traversal: every service that drops
+    # root (D-Bus first of all) and every profile needs to reach them.
+    # 0.1.0 created them as 0700; this repairs such installs on every boot.
+    systemd.tmpfiles.rules = [
+      "z /nix 0755 root root -"
+      "z /home 0755 root root -"
+    ];
 
     environment.persistence."/persist" = {
       hideMounts = true;

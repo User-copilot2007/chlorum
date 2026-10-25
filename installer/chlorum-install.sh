@@ -90,11 +90,11 @@ if [ "$answer" != yes ]; then
   exit 1
 fi
 
-umask 077
-
 # One-time random passphrase: only used to set the disk up, then wiped
 # before this installer ends. It is never written to the installed disk.
-head -c 48 /dev/urandom | base64 -w0 > /tmp/chlorum-disk-password
+# The strict umask applies to this file only: a global one made disko
+# create /nix as 0700, which broke D-Bus and every non-root service.
+(umask 077; head -c 48 /dev/urandom | base64 -w0 > /tmp/chlorum-disk-password)
 
 echo
 echo "Cleaning $disk"
