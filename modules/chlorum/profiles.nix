@@ -49,6 +49,9 @@ in
     security.sudo.enable = false;
     security.polkit.enable = true;
     security.polkit.adminIdentities = [ "unix-group:chlorum-owner" ];
+    # run0 waits for the password over D-Bus, which gives up after 25 s by
+    # default: too short to type a five-word password. Allow 2 minutes.
+    environment.variables.SYSTEMD_BUS_TIMEOUT = "120";
 
     # Time zone follows the network location
     services.automatic-timezoned.enable = true;

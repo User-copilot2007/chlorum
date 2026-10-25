@@ -6,9 +6,10 @@ let
     name = "chlorum-update";
     runtimeInputs = [ config.systemd.package pkgs.coreutils ];
     text = ''
-      if [ "$(id -u)" -ne 0 ]; then exec run0 "$0" "$@"; fi
-      echo "Checking for a new Chlorum version..."
-      journalctl -u nixos-upgrade.service -f -n 0 -o cat &
+      # No password needed: an update only applies what Chlorum publishes,
+      # like a phone update. The owner may start it (polkit rule below).
+      echo "Checking for a new Chlorum version. This can take a while..."
+      journalctl -u nixos-upgrade.service -f -n 0 -o cat 2>/dev/null &
       log=$!
       trap 'kill "$log" 2>/dev/null' EXIT
       if systemctl start nixos-upgrade.service; then
@@ -17,7 +18,7 @@ let
       else
         echo
         echo "Update failed. Your current version keeps working."
-        echo "Details: journalctl -u nixos-upgrade"
+        echo "Details: run0 journalctl -u nixos-upgrade"
         exit 1
       fi
     '';
@@ -50,6 +51,18 @@ in
       allowReboot = false;
     };
     environment.systemPackages = [ chlorum-update ];
+
+    # The owner starts updates without a password, but nothing else.
+    security.polkit.extraConfig = ''
+      polkit.addRule(function(action, subject) {
+        if (action.id == "org.freedesktop.systemd1.manage-units" &&
+            action.lookup("unit") == "nixos-upgrade.service" &&
+            (action.lookup("verb") == "start" || action.lookup("verb") == "restart") &&
+            subject.isInGroup("chlorum-owner")) {
+          return polkit.Result.YES;
+        }
+      });
+    '';
 
     # Old versions are removed so updates never fill the disk.
     # The last 14 days stay available in the boot menu.
