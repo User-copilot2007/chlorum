@@ -4322,6 +4322,9 @@ static void term_start(void) {
     const char *lang = getenv("LANG");
     if (!lang || !strstr(lang, "UTF-8")) setenv("LANG", "C.UTF-8", 1);
     if (chdir(root) != 0) { if (chdir(getenv("HOME") ? getenv("HOME") : "/") != 0) {} }
+    /* Chlorum Workshop: in a project, the terminal opens inside its box,
+       with the project's own tools */
+    if (access("workshop.toml", R_OK) == 0) execlp("work", "work", "enter", (char *)NULL);
     const char *sh = getenv("SHELL");
     if (!sh || !*sh) sh = "/bin/sh";
     execlp(sh, sh, (char *)NULL);

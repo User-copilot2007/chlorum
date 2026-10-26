@@ -21,6 +21,8 @@ let
     # unit tests (layouts, Wi-Fi lists, names) need nothing graphical
     doCheck = true;
     postInstall = ''
+      # Workshop is the same program under the name `work`
+      ln -s chlorum $out/bin/work
       install -Dm644 ${../../assets/logo/chlorum-logo.svg} \
         $out/share/icons/hicolor/scalable/apps/com.chlorum.Logo.svg
       install -Dm644 /dev/stdin $out/share/applications/chlorum-library.desktop <<EOF

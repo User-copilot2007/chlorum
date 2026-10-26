@@ -10,6 +10,7 @@
 //   chlorum pointer      move the mouse pointer with the keyboard (Super+M)
 //   chlorum mouse [what] the numpad mouse (service; niri sends it the keys)
 //   chlorum idle         turns the screen off and locks when nobody is there
+//   chlorum work …       Workshop: sealed programming projects (also `work`)
 //   chlorum wallpaper    the live wallpaper
 //   chlorum lock         the lock screen
 //   chlorum setupd       first-start helper (root, until the first profile exists)
@@ -33,6 +34,7 @@ mod shell;
 mod system;
 mod ui;
 mod wallpaper;
+mod workshop;
 
 fn main() {
     // With vsync, the GPU driver may wait for the compositor before handing
@@ -46,6 +48,14 @@ fn main() {
         unsafe { std::env::set_var("ICED_PRESENT_MODE", "no_vsync") };
     }
     let args: Vec<String> = std::env::args().collect();
+    // `work …` is Workshop, the same program under another name
+    if args.first().and_then(|a| std::path::Path::new(a).file_name()).is_some_and(|n| n == "work") {
+        if let Err(e) = workshop::cli(&args[1..]) {
+            eprintln!("work: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let what = args.get(1).map(String::as_str).unwrap_or("shell");
     let result = match what {
         "shell" => shell::run().map_err(|e| e.to_string()),
@@ -56,6 +66,7 @@ fn main() {
         "pointer" => pointer::run(),
         "mouse" => pointer::mouse_cli(&args[2..]),
         "idle" => idle::run(),
+        "work" => workshop::cli(&args[2..]),
         "run" => sandbox::run_cli(&args[2..]),
         "wallpaper" => {
             wallpaper::run();

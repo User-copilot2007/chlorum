@@ -121,6 +121,8 @@ enum Kind {
     Music,
     Document,
     Code,
+    /// a Workshop project: a folder of code with its own tools
+    Project,
     Archive,
     Other,
 }
@@ -146,6 +148,7 @@ impl Kind {
             Kind::Music => "Music",
             Kind::Document => "Documents",
             Kind::Code => "Code",
+            Kind::Project => "Projects",
             Kind::Archive => "Archives",
             Kind::Other => "Other",
         }
@@ -157,6 +160,7 @@ impl Kind {
             Kind::Music => "AUD",
             Kind::Document => "DOC",
             Kind::Code => "CODE",
+            Kind::Project => "PROJECT",
             Kind::Archive => "ZIP",
             Kind::Other => "FILE",
         }
@@ -206,6 +210,8 @@ enum Focus {
     SaveName,
     /// typing the password of an encrypted drive
     DrivePassword,
+    /// naming a new Workshop project; the number is the language
+    NewProject(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -220,6 +226,8 @@ pub enum Message {
     DriveOpened(String, Result<PathBuf, String>),
     DrivePassword(String),
     DriveSubmit,
+    ProjectName(String),
+    ProjectSubmit,
     Ejected(String, Result<(), String>),
 }
 
@@ -247,6 +255,7 @@ pub struct Library {
     drive_items: Vec<Item>,
     drive_pw: String,
     drive_busy: bool,
+    project_name: String,
 }
 
 fn home() -> PathBuf {
@@ -288,6 +297,8 @@ impl Application for Library {
                 let _ = std::fs::create_dir_all(lib.join(c));
             }
         }
+        // Workshop's projects always have their place
+        let _ = std::fs::create_dir_all(lib.join("Projects"));
         let mut l = Library {
             core,
             items: vec![],
@@ -312,6 +323,7 @@ impl Application for Library {
             drive_items: vec![],
             drive_pw: String::new(),
             drive_busy: false,
+            project_name: String::new(),
         };
         l.scan();
         l.view = if l.picking() { 0 } else if l.inbox().is_empty() { 1 } else { 0 };
@@ -331,7 +343,7 @@ impl Application for Library {
     fn update(&mut self, m: Message) -> Task<Message> {
         match m {
             Message::Rescan => {
-                if !matches!(self.focus, Focus::NewName | Focus::SaveName | Focus::DrivePassword) {
+                if !matches!(self.focus, Focus::NewName | Focus::SaveName | Focus::DrivePassword | Focus::NewProject(_)) {
                     self.scan();
                 }
                 return Task::perform(crate::drives::list(), |d| cosmic::Action::App(Message::Drives(d)));
@@ -343,6 +355,8 @@ impl Application for Library {
                 }
             }
             Message::DrivePassword(s) => self.drive_pw = s,
+            Message::ProjectName(s) => self.project_name = s,
+            Message::ProjectSubmit => return self.make_project(),
             Message::DriveSubmit => return self.open_drive(),
             Message::DriveOpened(name, r) => {
                 self.drive_busy = false;
@@ -484,7 +498,9 @@ impl Application for Library {
             .width(Length::Fill);
 
         let mut row = widget::Row::new().push(side).push(space(56.0, 1.0)).push(main).height(Length::Fill);
-        if let Some(panel) = self.drive_panel(&view) {
+        if let Some(panel) = self.project_panel() {
+            row = row.push(space(30.0, 1.0)).push(panel);
+        } else if let Some(panel) = self.drive_panel(&view) {
             row = row.push(space(30.0, 1.0)).push(panel);
         } else if let Some(panel) = self.save_panel(&view) {
             row = row.push(space(30.0, 1.0)).push(panel);
@@ -495,6 +511,10 @@ impl Application for Library {
         let on_drive = matches!(view, View::Drive(_));
         let mut h: Vec<(&str, &str, bool)> = match (&self.mode, self.focus) {
             (_, Focus::DrivePassword) => vec![("ENTER", "Unlock", true), ("ESC", "Back", false)],
+            (_, Focus::NewProject(_)) => vec![("↑ ↓", "Language", false), ("ENTER", "Create", true), ("ESC", "Back", false)],
+            (Mode::Browse, Focus::Side | Focus::Grid) if matches!(&view, View::Collection(c) if c == "Projects") => {
+                vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open in Typewriter", true), ("N", "New project", false), ("DEL", "Delete", false)]
+            }
             (Mode::Browse, Focus::Side) if on_drive => vec![("↑ ↓", "View", false), ("→", "Open", true), ("E", "Take out", false)],
             (Mode::Browse, Focus::Grid) if on_drive => {
                 vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("C", "Copy into Library", false), ("E", "Take out", false)]
@@ -781,8 +801,23 @@ impl Library {
                 return t;
             }
         }
+        if let Focus::NewProject(lang) = self.focus {
+            let n = crate::workshop::Lang::ALL.len();
+            match named {
+                Some(Named::Escape) => self.focus = Focus::Side,
+                Some(Named::ArrowDown) => self.focus = Focus::NewProject((lang + 1).min(n - 1)),
+                Some(Named::ArrowUp) => self.focus = Focus::NewProject(lang.saturating_sub(1)),
+                _ => {}
+            }
+            return Task::none();
+        }
+        if ch == "n" && !self.picking() && matches!(&view, View::Collection(c) if c == "Projects") && matches!(self.focus, Focus::Side | Focus::Grid) {
+            self.focus = Focus::NewProject(0);
+            self.project_name.clear();
+            return text_input::focus(self.input_id.clone());
+        }
         match self.focus {
-            Focus::SaveName | Focus::DrivePassword => {}
+            Focus::SaveName | Focus::DrivePassword | Focus::NewProject(_) => {}
             Focus::NewName => {
                 if named == Some(Named::Escape) {
                     self.focus = Focus::Ask(0);
@@ -889,6 +924,53 @@ impl Library {
             }
         }
         Task::none()
+    }
+
+    fn make_project(&mut self) -> Task<Message> {
+        use crate::workshop::{Lang, create, tidy_name};
+        let Focus::NewProject(i) = self.focus else { return Task::none() };
+        let name = tidy_name(&self.project_name);
+        if name.is_empty() {
+            return Task::none();
+        }
+        match create(&name, Lang::ALL[i]) {
+            Ok(dir) => {
+                self.note = Some(format!("{name} is ready. It opens in Typewriter; its terminal has the project's tools."));
+                self.focus = Focus::Side;
+                self.scan();
+                open(&dir);
+            }
+            Err(e) => self.note = Some(e),
+        }
+        Task::none()
+    }
+
+    fn project_panel(&self) -> Option<Element<'_, Message>> {
+        let Focus::NewProject(sel) = self.focus else { return None };
+        let mut col = widget::Column::new()
+            .spacing(12)
+            .width(Length::Fixed(440.0))
+            .push(text("NEW PROJECT", MONO, 14.0, YELLOW))
+            .push(text("Its name", SANS_BOLD, 22.0, TEXT))
+            .push(
+                text_input::text_input("my-project", self.project_name.as_str())
+                    .id(self.input_id.clone())
+                    .on_input(Message::ProjectName)
+                    .on_submit(|_| Message::ProjectSubmit)
+                    .style(field_style())
+                    .size(21)
+                    .padding([14, 18]),
+            )
+            .push(space(1.0, 6.0))
+            .push(text("Language  ↑ ↓", SANS_BOLD, 22.0, TEXT));
+        for (i, l) in crate::workshop::Lang::ALL.iter().enumerate() {
+            let on = i == sel;
+            col = col.push(
+                fill(text(l.label(), SANS_BOLD, 19.0, if on { BLACK } else { TEXT }), if on { YELLOW } else { PANEL_2 }).padding([12, 18]).width(Length::Fill),
+            );
+        }
+        col = col.push(text("Its tools stay inside the project; nothing is installed on the system.", SANS, 16.0, TEXT_2));
+        Some(fill(col.padding(30), PANEL).into())
     }
 
     fn drive(&self, id: &str) -> Option<crate::drives::Drive> {
@@ -1237,7 +1319,10 @@ fn walk(dir: &Path, depth: usize, f: &mut dyn FnMut(&Path)) {
         if e.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
-        if p.is_dir() {
+        if p.is_dir() && crate::workshop::is_project(&p) {
+            // a project is one thing in Library, opened in Typewriter
+            f(&p);
+        } else if p.is_dir() {
             walk(&p, depth + 1, f);
         } else if p.is_file() {
             f(&p);
@@ -1249,7 +1334,7 @@ fn item(p: &Path, collection: Option<String>) -> Item {
     Item {
         path: p.to_path_buf(),
         name: p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-        kind: Kind::of(p),
+        kind: if p.is_dir() { Kind::Project } else { Kind::of(p) },
         collection,
         modified: std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH),
     }
@@ -1317,7 +1402,8 @@ fn url_path(p: &Path) -> String {
 }
 
 fn open(path: &Path) {
-    let _ = std::process::Command::new("xdg-open")
+    let program = if path.is_dir() { "typewriter" } else { "xdg-open" };
+    let _ = std::process::Command::new(program)
         .arg(path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
