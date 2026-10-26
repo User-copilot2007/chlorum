@@ -49,6 +49,51 @@ let
     meta.mainProgram = "chlorum";
   };
 
+  # ---------------------------------------------------------------- writing
+
+  # Typewriter: an A4 page in the TT2020 typeface, tabs, a file tree, a
+  # terminal and PDF export. One C file (apps/typewriter).
+  tt2020 = pkgs.fetchFromGitHub {
+    owner = "ctrlcctrlv";
+    repo = "TT2020";
+    rev = "0cf038022b1d541381744a8969a58d55110a0a23";
+    hash = "sha256-xls97WVyPYwPJ14z6rgxZwkNIZI3gnuwLi1XvLKjiko=";
+  };
+  typewriter = pkgs.stdenv.mkDerivation {
+    pname = "chlorum-typewriter";
+    inherit version;
+    src = ../../apps/typewriter;
+    nativeBuildInputs = [ pkgs.pkg-config pkgs.makeWrapper ];
+    buildInputs = [ pkgs.SDL2 pkgs.freetype pkgs.harfbuzz pkgs.fontconfig pkgs.zlib ];
+    buildPhase = ''
+      $CC -O2 typewriter.c -o typewriter \
+        $(pkg-config --cflags --libs sdl2 freetype2 harfbuzz fontconfig) -lz -lm -lutil
+    '';
+    installPhase = ''
+      install -Dm755 typewriter $out/libexec/typewriter
+      for s in B D E; do
+        install -Dm644 ${tt2020}/dist/TT2020Style$s-Regular.ttf $out/share/mashynka/fonts/TT2020Style$s-Regular.ttf
+      done
+      install -Dm644 ${tt2020}/LICENSE $out/share/doc/tt2020/LICENSE
+      # with nothing to open it starts in Library
+      makeWrapper $out/libexec/typewriter $out/bin/typewriter \
+        --set-default SDL_VIDEODRIVER wayland \
+        --set SDL_VIDEO_WAYLAND_WMCLASS chlorum-typewriter \
+        --run 'if [ $# -eq 0 ]; then mkdir -p "$HOME/Library"; set -- "$HOME/Library"; fi'
+      install -Dm644 /dev/stdin $out/share/applications/chlorum-typewriter.desktop <<EOF
+      [Desktop Entry]
+      Type=Application
+      Name=Typewriter
+      Comment=Write on a typewriter page
+      Icon=accessories-text-editor
+      Exec=$out/bin/typewriter %F
+      StartupWMClass=chlorum-typewriter
+      MimeType=text/plain;text/markdown;
+      Categories=Office;WordProcessor;TextEditor;
+      EOF
+    '';
+  };
+
   # ---------------------------------------------------------------- browser
 
   # Chlorum Keys: arrows move between buttons and links on every web page,
@@ -409,6 +454,7 @@ in
       chlorum
       session
       browser
+      typewriter
       cosmicDefaults
       pkgs.cosmic-term
       pkgs.cosmic-edit
@@ -434,6 +480,8 @@ in
       "x-scheme-handler/http" = "librewolf.desktop";
       "x-scheme-handler/https" = "librewolf.desktop";
       "inode/directory" = "chlorum-library.desktop";
+      "text/plain" = "chlorum-typewriter.desktop";
+      "text/markdown" = "chlorum-typewriter.desktop";
     };
     fonts.packages = [ pkgs.ibm-plex pkgs.noto-fonts pkgs.noto-fonts-color-emoji ];
     fonts.fontconfig.defaultFonts = {

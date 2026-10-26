@@ -33,7 +33,7 @@ impl App {
 }
 
 /// Apps on Home when the owner has not chosen their own list.
-pub const DEFAULT_PINNED: &[&str] = &["librewolf", "chlorum-library", "com.system76.CosmicTerm", "com.system76.CosmicEdit"];
+pub const DEFAULT_PINNED: &[&str] = &["librewolf", "chlorum-library", "chlorum-typewriter", "com.system76.CosmicTerm"];
 /// Apps opened side by side when a session starts, unless the owner chose others.
 pub const DEFAULT_STARTUP: &[&str] = &["librewolf", "com.system76.CosmicTerm"];
 
