@@ -20,13 +20,18 @@ use cosmic::iced::futures::SinkExt;
 use cosmic::iced::platform_specific::runtime::wayland::layer_surface::{IcedMargin, IcedOutput, SctkLayerSurfaceSettings};
 use cosmic::widget::text_input;
 use cosmic::iced::platform_specific::shell::commands::layer_surface::{
-    Anchor, KeyboardInteractivity, Layer, destroy_layer_surface, get_layer_surface,
+    Anchor, KeyboardInteractivity, Layer, get_layer_surface, set_keyboard_interactivity, set_layer, set_size,
 };
 use cosmic::iced::{self, Alignment, Color, Length, Subscription, event, keyboard, window};
 use cosmic::{Application, Element, widget};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
+
+/// What the shell does, for `journalctl --user -u chlorum-shell`.
+macro_rules! say {
+    ($($t:tt)*) => { eprintln!("chlorum: {}", format!($($t)*)) };
+}
 
 /// When the shell last handled anything (ms since START).
 static BEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -197,6 +202,7 @@ pub enum Message {
     StartupOver,
     Command(String),
     SuperFire(u64),
+    Nudge(window::Id, Option<u32>, Option<u32>),
     Sound(Sound),
     Network(String),
     Update(Update),
@@ -214,6 +220,16 @@ pub struct Shell {
     pinned: Vec<String>,
     started: bool,
 
+    /// The one full-screen surface Home and the menu are drawn on. It is made
+    /// once and never destroyed: on NVIDIA, making and destroying
+    /// full-screen surfaces is what froze the shell. Hidden, it waits below
+    /// the apps, transparent and without the keyboard.
+    surface: window::Id,
+    surface_up: bool,
+    /// The small surface notifications appear on, made once too.
+    note_id: window::Id,
+
+    /// Home is showing (on `surface`)
     home: Option<window::Id>,
     home_show: f32,
     home_closing: bool,
@@ -225,6 +241,7 @@ pub struct Shell {
     section: usize,
     row: Option<usize>,
 
+    /// The menu is showing (on `surface`)
     menu: Option<window::Id>,
     menu_show: f32,
     menu_closing: bool,
@@ -284,6 +301,9 @@ impl Application for Shell {
             pinned: apps::id_list("home-apps", apps::DEFAULT_PINNED),
             started: false,
             home: None,
+            surface: window::Id::unique(),
+            surface_up: false,
+            note_id: window::Id::unique(),
             home_show: 0.0,
             home_closing: false,
             page: Page::Main,
@@ -324,7 +344,12 @@ impl Application for Shell {
             ids: [widget::Id::unique()],
         };
         system::pause_wallpaper(false);
+        let made = Task::batch([
+            open_surface(layer(shell.surface, Layer::Background, KeyboardInteractivity::None, "chlorum-shell")),
+            open_surface(note_layer(shell.note_id)),
+        ]);
         let t = Task::batch([
+            made,
             shell.open_home(),
             Task::perform(system::sound(), |s| cosmic::Action::App(Message::Sound(s))),
             Task::perform(system::network(), |s| cosmic::Action::App(Message::Network(s))),
@@ -370,15 +395,22 @@ impl Application for Shell {
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Message> {
-        if self.note_surface.is_some_and(|(n, _)| n == id) {
-            return self.note_view();
+        if id == self.note_id {
+            return if self.note_surface.is_some() { self.note_view() } else { widget::Space::new().into() };
         }
-        if Some(id) == self.menu {
-            self.menu_view()
-        } else if Some(id) == self.home {
-            self.home_view()
-        } else {
-            widget::Space::new().into()
+        if id != self.surface {
+            return widget::Space::new().into();
+        }
+        match (self.home.is_some(), self.menu.is_some()) {
+            (true, true) => cosmic::iced::widget::Stack::new()
+                .push(self.home_view())
+                .push(self.menu_view())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+            (true, false) => self.home_view(),
+            (false, true) => self.menu_view(),
+            (false, false) => widget::Space::new().into(),
         }
     }
 }
@@ -399,10 +431,10 @@ impl Shell {
                 if self.toast.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(3)) {
                     self.toast = None;
                 }
-                if let Some((id, at)) = self.note_surface {
+                if let Some((_, at)) = self.note_surface {
                     if at.elapsed() > Duration::from_secs(5) {
                         self.note_surface = None;
-                        return destroy_layer_surface(id);
+                        return set_layer(self.note_id, Layer::Background);
                     }
                 }
                 // sound and network change outside the shell too: look every few seconds
@@ -433,7 +465,13 @@ impl Shell {
                 }
             }
             Message::Command(c) => return self.command(c.trim()),
+            Message::Nudge(id, w, h) => {
+                return set_size(id, w, h);
+            }
             Message::SuperFire(seq) => {
+                if seq != self.super_seq {
+                    say!("super {seq} cancelled by a later key ({})", self.super_seq);
+                }
                 if seq == self.super_seq {
                     return self.toggle_menu();
                 }
@@ -519,11 +557,41 @@ fn commands() -> impl cosmic::iced::futures::Stream<Item = Message> {
     })
 }
 
-fn layer(id: window::Id, layer: Layer, namespace: &str) -> SctkLayerSurfaceSettings {
+/// The notification surface: bottom right, never takes the keyboard. Made
+/// hidden (below the apps).
+fn note_layer(id: window::Id) -> SctkLayerSurfaceSettings {
+    SctkLayerSurfaceSettings {
+        id,
+        layer: Layer::Background,
+        keyboard_interactivity: KeyboardInteractivity::None,
+        anchor: Anchor::BOTTOM | Anchor::RIGHT,
+        output: IcedOutput::Active,
+        namespace: "chlorum-note".into(),
+        margin: IcedMargin { top: 0, right: 28, bottom: 96, left: 0 },
+        size: Some((Some(480), Some(132))),
+        exclusive_zone: 0,
+        size_limits: iced::Limits::NONE.min_width(1.0).min_height(1.0).max_width(480.0).max_height(132.0),
+        ..Default::default()
+    }
+}
+
+/// A new surface, plus two nudges: re-sending the size makes the toolkit
+/// configure and draw it again, in case its first redraw was lost. On a
+/// healthy surface it changes nothing.
+fn open_surface(settings: SctkLayerSurfaceSettings) -> Task<Message> {
+    let id = settings.id;
+    let (w, h) = settings.size.unwrap_or((None, None));
+    let nudge = |ms| {
+        Task::perform(tokio::time::sleep(Duration::from_millis(ms)), move |_| cosmic::Action::App(Message::Nudge(id, w, h)))
+    };
+    Task::batch([get_layer_surface(settings), nudge(400), nudge(1200)])
+}
+
+fn layer(id: window::Id, layer: Layer, keyboard: KeyboardInteractivity, namespace: &str) -> SctkLayerSurfaceSettings {
     SctkLayerSurfaceSettings {
         id,
         layer,
-        keyboard_interactivity: KeyboardInteractivity::Exclusive,
+        keyboard_interactivity: keyboard,
         anchor: Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT,
         output: IcedOutput::Active,
         namespace: namespace.into(),
@@ -557,10 +625,10 @@ impl Shell {
         if self.home.is_some() {
             return away;
         }
-        let id = window::Id::unique();
-        self.home = Some(id);
+        say!("home: show");
+        self.home = Some(self.surface);
         self.home_show = 0.0;
-        Task::batch([away, get_layer_surface(layer(id, Layer::Overlay, "chlorum-home"))])
+        Task::batch([away, self.raise()])
     }
 
     fn close_home(&mut self) {
@@ -584,10 +652,10 @@ impl Shell {
         if self.menu.is_some() {
             return Task::none();
         }
-        let id = window::Id::unique();
-        self.menu = Some(id);
+        say!("menu: show");
+        self.menu = Some(self.surface);
         self.menu_show = 0.0;
-        get_layer_surface(layer(id, Layer::Overlay, "chlorum-menu"))
+        self.raise()
     }
 
     fn close_menu(&mut self) {
@@ -617,7 +685,8 @@ impl Shell {
             if self.home_closing {
                 self.home_show = (self.home_show - dt / 0.16).max(0.0);
                 if self.home_show <= 0.0 {
-                    tasks.push(destroy_layer_surface(self.home.take().unwrap()));
+                    say!("home: hidden");
+                    self.home = None;
                     self.home_closing = false;
                     self.update_pause();
                 }
@@ -629,13 +698,15 @@ impl Shell {
             if self.menu_closing {
                 self.menu_show = (self.menu_show - dt / 0.14).max(0.0);
                 if self.menu_show <= 0.0 {
-                    tasks.push(destroy_layer_surface(self.menu.take().unwrap()));
+                    say!("menu: hidden");
+                    self.menu = None;
                     self.menu_closing = false;
                 }
             } else {
                 self.menu_show = (self.menu_show + dt / 0.2).min(1.0);
             }
         }
+        tasks.push(self.lower_if_idle());
         let keys: Vec<String> = self.grow.keys().cloned().collect();
         for k in keys {
             let t = self.grow_target(&k);
@@ -644,6 +715,36 @@ impl Shell {
             }
         }
         Task::batch(tasks)
+    }
+
+    /// Bring the shell surface above the apps and give it the keyboard.
+    fn raise(&mut self) -> Task<Message> {
+        if self.surface_up {
+            return Task::none();
+        }
+        self.surface_up = true;
+        let id = self.surface;
+        Task::batch([
+            set_layer(id, Layer::Overlay),
+            set_keyboard_interactivity(id, KeyboardInteractivity::Exclusive),
+            // a fresh configure, so it draws at once even if it missed frames
+            // while it was hidden
+            set_size(id, None, None),
+        ])
+    }
+
+    /// Nothing to show: send the (now transparent) surface below the apps
+    /// and give the keyboard back.
+    fn lower_if_idle(&mut self) -> Task<Message> {
+        if !self.surface_up || self.home.is_some() || self.menu.is_some() {
+            return Task::none();
+        }
+        self.surface_up = false;
+        let id = self.surface;
+        Task::batch([
+            set_keyboard_interactivity(id, KeyboardInteractivity::None),
+            set_layer(id, Layer::Background),
+        ])
     }
 
     fn update_pause(&self) {
@@ -670,6 +771,7 @@ impl Shell {
             }
             Event::WindowOpenedOrChanged { window } => new_window = self.layout.window_changed(window),
             Event::WindowClosed { id } => {
+                say!("window {id} closed");
                 self.layout.window_closed(id);
                 if self.layout.on_stage().is_empty() {
                     let t = self.open_home();
@@ -759,6 +861,7 @@ impl Shell {
         if c != "super" {
             self.super_seq += 1;
         }
+        say!("command {c} (menu {:?} closing {}, home {:?} closing {})", self.menu, self.menu_closing, self.home, self.home_closing);
         match c {
             "super" => {
                 self.super_seq += 1;
@@ -1881,29 +1984,9 @@ impl Shell {
         self.notes.retain(|x| x.id != n.id);
         self.notes.insert(0, n);
         self.notes.truncate(20);
-        match self.note_surface {
-            Some((id, _)) => {
-                self.note_surface = Some((id, Instant::now()));
-                Task::none()
-            }
-            None => {
-                let id = window::Id::unique();
-                self.note_surface = Some((id, Instant::now()));
-                get_layer_surface(SctkLayerSurfaceSettings {
-                    id,
-                    layer: Layer::Overlay,
-                    keyboard_interactivity: KeyboardInteractivity::None,
-                    anchor: Anchor::BOTTOM | Anchor::RIGHT,
-                    output: IcedOutput::Active,
-                    namespace: "chlorum-note".into(),
-                    margin: IcedMargin { top: 0, right: 28, bottom: 96, left: 0 },
-                    size: Some((Some(480), Some(132))),
-                    exclusive_zone: 0,
-                    size_limits: iced::Limits::NONE.min_width(1.0).min_height(1.0).max_width(480.0).max_height(132.0),
-                    ..Default::default()
-                })
-            }
-        }
+        let shown = self.note_surface.is_some();
+        self.note_surface = Some((self.note_id, Instant::now()));
+        if shown { Task::none() } else { Task::batch([set_layer(self.note_id, Layer::Overlay), set_size(self.note_id, Some(480), Some(132))]) }
     }
 
     fn note_view(&self) -> Element<'_, Message> {
