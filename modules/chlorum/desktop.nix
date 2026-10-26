@@ -156,7 +156,8 @@ let
     export XDG_DATA_DIRS=/run/current-system/sw/share
     export XCURSOR_THEME=Adwaita
     export PATH=${lib.makeBinPath [ chlorum config.systemd.package pkgs.getent pkgs.coreutils pkgs.wireplumber ]}:$PATH
-    exec ${config.programs.niri.package}/bin/niri -c "$dir/greeter.kdl"
+    # niri's own messages go to the journal, not onto the login screen
+    exec ${config.systemd.package}/bin/systemd-cat -t chlorum-greeter -- ${config.programs.niri.package}/bin/niri -c "$dir/greeter.kdl"
   '';
 
   # ---------------------------------------------------------------- boot

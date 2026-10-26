@@ -28,7 +28,36 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+/// When the shell last handled anything (ms since START).
+static BEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn beat() {
+    let ms = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    BEAT.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The shell redraws its clock four times a second. If nothing has been
+/// handled for 8 seconds, it is stuck (a driver wait, a bug): leave, and
+/// systemd starts a fresh one a second later, with the apps still open.
+fn watchdog() {
+    START.get_or_init(Instant::now);
+    std::thread::spawn(|| {
+        std::thread::sleep(Duration::from_secs(20));
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let now = START.get().unwrap().elapsed().as_millis() as u64;
+            let last = BEAT.load(std::sync::atomic::Ordering::Relaxed);
+            if last > 0 && now.saturating_sub(last) > 8000 {
+                eprintln!("chlorum: shell stopped responding for {} s; restarting", (now - last) / 1000);
+                std::process::exit(3);
+            }
+        }
+    });
+}
+
 pub fn run() -> cosmic::iced::Result {
+    watchdog();
     let settings = Settings::default()
         .no_main_window(true)
         .default_font(SANS)
@@ -324,6 +353,7 @@ impl Application for Shell {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        beat();
         let t = self.handle(message);
         self.sync_grow();
         if std::mem::take(&mut self.back_to_stage) {
@@ -358,6 +388,14 @@ impl Shell {
         match message {
             Message::Frame => return self.step(),
             Message::Tick => {
+                // frames late or missing: finish the move anyway, never leave
+                // the menu or Home half-open
+                if self.animating() && self.last_frame.elapsed() > Duration::from_millis(200) {
+                    self.last_frame = Instant::now() - Duration::from_secs(1);
+                    let t = self.step();
+                    let t2 = self.step();
+                    return Task::batch([t, t2]);
+                }
                 if self.toast.as_ref().is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(3)) {
                     self.toast = None;
                 }
@@ -570,7 +608,9 @@ impl Shell {
     }
 
     fn step(&mut self) -> Task<Message> {
-        let dt = self.last_frame.elapsed().as_secs_f32().min(0.05);
+        // a frame later than this is a stall, not a step: jump ahead
+        let dt = self.last_frame.elapsed().as_secs_f32();
+        let dt = if dt > 0.1 { 1.0 } else { dt };
         self.last_frame = Instant::now();
         let mut tasks = Vec::new();
         if self.home.is_some() {
@@ -658,7 +698,11 @@ impl Shell {
     }
 
     fn startup(&mut self) -> Task<Message> {
-        if !self.layout.windows.is_empty() {
+        // the startup apps open once per session, not after every restart
+        let mark = apps::runtime_dir().join("started");
+        let again = mark.exists();
+        let _ = std::fs::write(&mark, b"");
+        if again || !self.layout.windows.is_empty() {
             // the shell restarted inside a running session
             if !self.layout.on_stage().is_empty() {
                 self.close_home();

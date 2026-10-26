@@ -24,6 +24,16 @@ mod ui;
 mod wallpaper;
 
 fn main() {
+    // With vsync, the GPU driver may wait for the compositor before handing
+    // out the next frame. niri stops asking a surface for frames while it is
+    // covered, and on NVIDIA that wait never ends: one covered surface froze
+    // the whole shell (keys, clock, half-open menu). Without vsync the frame
+    // is ready at once; niri still shows it on the next refresh, so nothing
+    // tears. Someone who wants it back can set ICED_PRESENT_MODE.
+    if std::env::var_os("ICED_PRESENT_MODE").is_none() {
+        // SAFETY: nothing else runs yet; no thread can read the environment.
+        unsafe { std::env::set_var("ICED_PRESENT_MODE", "no_vsync") };
+    }
     let args: Vec<String> = std::env::args().collect();
     let what = args.get(1).map(String::as_str).unwrap_or("shell");
     let result = match what {
