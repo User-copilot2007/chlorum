@@ -8,6 +8,8 @@ uniform vec2 res;      // pixels
 uniform float bright;  // 0..1
 uniform float amount;  // 1..10
 uniform vec3 col;      // accent colour
+// Note: smoothstep(a, b, x) needs a < b. With a >= b GLSL gives no promise,
+// and NVIDIA draws nothing: write 1.0 - smoothstep(b, a, x) instead.
 float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float noise(vec2 p){
   vec2 i = floor(p), f = fract(p);

@@ -175,6 +175,8 @@ struct Item {
 
 #[derive(Clone, Debug, PartialEq)]
 enum View {
+    /// a flash drive or other removable disk (its UDisks id)
+    Drive(String),
     Inbox,
     Recent,
     Collection(String),
@@ -188,6 +190,7 @@ impl View {
             View::Recent => "Recent".into(),
             View::Collection(c) => c.clone(),
             View::Kind(k) => k.label().into(),
+            View::Drive(_) => "Drive".into(),
         }
     }
 }
@@ -201,6 +204,8 @@ enum Focus {
     Confirm,
     /// picker: typing the name to save under
     SaveName,
+    /// typing the password of an encrypted drive
+    DrivePassword,
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +216,11 @@ pub enum Message {
     NewSubmit,
     SaveName(String),
     SaveSubmit,
+    Drives(Vec<crate::drives::Drive>),
+    DriveOpened(String, Result<PathBuf, String>),
+    DrivePassword(String),
+    DriveSubmit,
+    Ejected(String, Result<(), String>),
 }
 
 pub struct Library {
@@ -232,6 +242,11 @@ pub struct Library {
     save_name: String,
     /// picker: Enter once more replaces a file of the same name
     replace_armed: bool,
+    drives: Vec<crate::drives::Drive>,
+    /// the files on the drive being looked at
+    drive_items: Vec<Item>,
+    drive_pw: String,
+    drive_busy: bool,
 }
 
 fn home() -> PathBuf {
@@ -293,10 +308,14 @@ impl Application for Library {
             mode,
             marked: vec![],
             replace_armed: false,
+            drives: vec![],
+            drive_items: vec![],
+            drive_pw: String::new(),
+            drive_busy: false,
         };
         l.scan();
         l.view = if l.picking() { 0 } else if l.inbox().is_empty() { 1 } else { 0 };
-        (l, Task::none())
+        (l, Task::perform(crate::drives::list(), |d| cosmic::Action::App(Message::Drives(d))))
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -312,9 +331,44 @@ impl Application for Library {
     fn update(&mut self, m: Message) -> Task<Message> {
         match m {
             Message::Rescan => {
-                if !matches!(self.focus, Focus::NewName | Focus::SaveName) {
+                if !matches!(self.focus, Focus::NewName | Focus::SaveName | Focus::DrivePassword) {
                     self.scan();
                 }
+                return Task::perform(crate::drives::list(), |d| cosmic::Action::App(Message::Drives(d)));
+            }
+            Message::Drives(d) => {
+                if d != self.drives {
+                    self.drives = d;
+                    self.scan();
+                }
+            }
+            Message::DrivePassword(s) => self.drive_pw = s,
+            Message::DriveSubmit => return self.open_drive(),
+            Message::DriveOpened(name, r) => {
+                self.drive_busy = false;
+                self.drive_pw.clear();
+                match r {
+                    Ok(_) => {
+                        self.note = Some(format!("{name} is open."));
+                        self.focus = Focus::Side;
+                    }
+                    Err(e) => {
+                        self.note = Some(e);
+                        if self.focus == Focus::DrivePassword {
+                            return text_input::focus(self.input_id.clone());
+                        }
+                    }
+                }
+                return Task::perform(crate::drives::list(), |d| cosmic::Action::App(Message::Drives(d)));
+            }
+            Message::Ejected(name, r) => {
+                self.drive_busy = false;
+                self.note = Some(match r {
+                    Ok(()) => format!("{name} can be taken out now."),
+                    Err(e) => e,
+                });
+                self.focus = Focus::Side;
+                return Task::perform(crate::drives::list(), |d| cosmic::Action::App(Message::Drives(d)));
             }
             Message::SaveName(s) => {
                 self.save_name = s;
@@ -347,6 +401,9 @@ impl Application for Library {
             if matches!(v, View::Kind(Kind::Photo)) {
                 side = side.push(space(1.0, 10.0)).push(text("BY KIND", MONO, 13.0, MUTED)).push(space(1.0, 6.0));
             }
+            if matches!(v, View::Drive(_)) && !matches!(self.views.get(i.wrapping_sub(1)), Some(View::Drive(_))) {
+                side = side.push(space(1.0, 10.0)).push(text("DRIVES", MONO, 13.0, MUTED)).push(space(1.0, 6.0));
+            }
             if matches!(v, View::Collection(_)) && !matches!(self.views.get(i.wrapping_sub(1)), Some(View::Collection(_))) {
                 side = side.push(space(1.0, 10.0)).push(text("COLLECTIONS", MONO, 13.0, MUTED)).push(space(1.0, 6.0));
             }
@@ -359,9 +416,9 @@ impl Application for Library {
             side = side.push(
                 fill(
                     widget::Row::new()
-                        .push(text(v.label(), SANS_BOLD, 21.0, fg))
+                        .push(text(self.view_label(v), SANS_BOLD, 21.0, fg))
                         .push(hfill())
-                        .push(text(count.to_string(), MONO, 15.0, fg))
+                        .push(text(self.view_count(v, count), MONO, 15.0, fg))
                         .align_y(Alignment::Center),
                     bg,
                 )
@@ -421,19 +478,27 @@ impl Application for Library {
             grid = grid.push(text(msg, SANS, 22.0, TEXT_2));
         }
         let main = widget::Column::new()
-            .push(text(view.label(), SANS_BOLD, 44.0, TEXT))
+            .push(text(self.view_label(&view), SANS_BOLD, 44.0, TEXT))
             .push(space(1.0, 26.0))
             .push(widget::scrollable(grid).height(Length::Fill))
             .width(Length::Fill);
 
         let mut row = widget::Row::new().push(side).push(space(56.0, 1.0)).push(main).height(Length::Fill);
-        if let Some(panel) = self.save_panel(&view) {
+        if let Some(panel) = self.drive_panel(&view) {
+            row = row.push(space(30.0, 1.0)).push(panel);
+        } else if let Some(panel) = self.save_panel(&view) {
             row = row.push(space(30.0, 1.0)).push(panel);
         } else if let Some(panel) = self.ask_panel(&items) {
             row = row.push(space(30.0, 1.0)).push(panel);
         }
 
+        let on_drive = matches!(view, View::Drive(_));
         let mut h: Vec<(&str, &str, bool)> = match (&self.mode, self.focus) {
+            (_, Focus::DrivePassword) => vec![("ENTER", "Unlock", true), ("ESC", "Back", false)],
+            (Mode::Browse, Focus::Side) if on_drive => vec![("↑ ↓", "View", false), ("→", "Open", true), ("E", "Take out", false)],
+            (Mode::Browse, Focus::Grid) if on_drive => {
+                vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("C", "Copy into Library", false), ("E", "Take out", false)]
+            }
             (Mode::Open { folders: true, .. }, Focus::Side) => vec![("↑ ↓", "Collection", false), ("ENTER", "Choose this one", true), ("ESC", "Cancel", false)],
             (Mode::Open { .. }, Focus::Side) => vec![("↑ ↓", "View", false), ("→", "Files", true), ("ESC", "Cancel", false)],
             (Mode::Open { multiple: true, .. }, Focus::Grid) => vec![("← ↑ ↓ →", "Move", false), ("SPACE", "Mark", false), ("ENTER", "Open", true), ("ESC", "Back", false)],
@@ -520,10 +585,31 @@ impl Library {
         if matches!(self.mode, Mode::Browse | Mode::Open { folders: false, .. }) {
             views.extend(Kind::VIEWS.iter().map(|k| View::Kind(*k)));
         }
+        if matches!(self.mode, Mode::Browse | Mode::Open { folders: false, .. }) {
+            views.extend(self.drives.iter().map(|d| View::Drive(d.id.clone())));
+        }
         if views.is_empty() {
             views.push(View::Collection(DEFAULT_COLLECTIONS[0].into()));
         }
         self.views = views;
+        // the files on the drive being looked at
+        self.drive_items.clear();
+        let current = old_view.clone().or_else(|| self.views.get(self.view).cloned());
+        if let Some(View::Drive(id)) = &current {
+            if let Some(d) = self.drives.iter().find(|d| &d.id == id) {
+                if let crate::drives::State::Open(root) = &d.state {
+                    let tag = d.name.clone();
+                    let mut n = 0;
+                    walk(root, 0, &mut |p| {
+                        if n < 3000 {
+                            self.drive_items.push(item(p, Some(tag.clone())));
+                            n += 1;
+                        }
+                    });
+                    self.drive_items.sort_by(|a, b| b.modified.cmp(&a.modified));
+                }
+            }
+        }
         if let Some(v) = old_view {
             self.view = self.views.iter().position(|x| *x == v).unwrap_or(0);
         }
@@ -538,6 +624,17 @@ impl Library {
     }
 
     fn items_in(&self, v: &View) -> Vec<Item> {
+        if let View::Drive(id) = v {
+            let looking = matches!(self.views.get(self.view), Some(View::Drive(x)) if x == id);
+            if !looking {
+                return vec![];
+            }
+            let exts: &[String] = match &self.mode {
+                Mode::Open { exts, .. } => exts,
+                _ => &[],
+            };
+            return self.drive_items.iter().filter(|i| exts.is_empty() || exts.contains(&ext_of(&i.path))).cloned().collect();
+        }
         if matches!(self.mode, Mode::Save { .. } | Mode::Open { folders: true, .. }) {
             // choosing a place, not a file: show what is already there
             return self.items.iter().filter(|i| matches!(v, View::Collection(c) if i.collection.as_deref() == Some(c))).take(40).cloned().collect();
@@ -550,6 +647,7 @@ impl Library {
             .iter()
             .filter(|i| exts.is_empty() || exts.contains(&ext_of(&i.path)))
             .filter(|i| match v {
+                View::Drive(_) => false,
                 View::Inbox => i.collection.is_none(),
                 View::Recent => true,
                 View::Collection(c) => i.collection.as_deref() == Some(c),
@@ -673,13 +771,18 @@ impl Library {
         self.note = None;
         let view = self.views.get(self.view).cloned().unwrap_or(View::Recent);
         let n = self.items_in(&view).len();
+        if let View::Drive(id) = &view {
+            if let Some(t) = self.drive_key(id.clone(), named, &ch, n) {
+                return t;
+            }
+        }
         if self.picking() {
             if let Some(t) = self.pick_key(named, &ch, &view, n) {
                 return t;
             }
         }
         match self.focus {
-            Focus::SaveName => {}
+            Focus::SaveName | Focus::DrivePassword => {}
             Focus::NewName => {
                 if named == Some(Named::Escape) {
                     self.focus = Focus::Ask(0);
@@ -786,6 +889,153 @@ impl Library {
             }
         }
         Task::none()
+    }
+
+    fn drive(&self, id: &str) -> Option<crate::drives::Drive> {
+        self.drives.iter().find(|d| d.id == id).cloned()
+    }
+
+    fn view_label(&self, v: &View) -> String {
+        match v {
+            View::Drive(id) => self.drive(id).map(|d| d.name).unwrap_or_else(|| "Drive".into()),
+            other => other.label(),
+        }
+    }
+
+    fn view_count(&self, v: &View, n: usize) -> String {
+        use crate::drives::State;
+        match v {
+            View::Drive(id) => match self.drive(id).map(|d| d.state) {
+                Some(State::Locked) => "LOCKED".into(),
+                Some(State::Closed) => "USB".into(),
+                Some(State::Open(_)) if n > 0 => n.to_string(),
+                _ => "OPEN".into(),
+            },
+            _ => n.to_string(),
+        }
+    }
+
+    /// Keys on a drive. None: the usual meaning.
+    fn drive_key(&mut self, id: String, named: Option<keyboard::key::Named>, ch: &str, n: usize) -> Option<Task<Message>> {
+        use crate::drives::State;
+        use keyboard::key::Named;
+        let d = self.drive(&id)?;
+        if self.drive_busy {
+            return Some(Task::none());
+        }
+        if self.focus == Focus::DrivePassword {
+            if named == Some(Named::Escape) {
+                self.focus = Focus::Side;
+                self.drive_pw.clear();
+            }
+            return Some(Task::none());
+        }
+        if ch == "e" && !self.picking() {
+            self.drive_busy = true;
+            self.note = Some(format!("Closing {}…", d.name));
+            let name = d.name.clone();
+            return Some(Task::perform(crate::drives::eject(d), move |r| cosmic::Action::App(Message::Ejected(name.clone(), r))));
+        }
+        match self.focus {
+            Focus::Side if matches!(named, Some(Named::ArrowRight) | Some(Named::Enter)) => match d.state {
+                State::Locked => {
+                    self.focus = Focus::DrivePassword;
+                    self.drive_pw.clear();
+                    Some(text_input::focus(self.input_id.clone()))
+                }
+                State::Closed => Some(self.open_drive()),
+                State::Open(_) => {
+                    if n > 0 {
+                        self.focus = Focus::Grid;
+                        self.sel = 0;
+                    }
+                    Some(Task::none())
+                }
+            },
+            Focus::Grid if !self.picking() => {
+                if ch == "c" {
+                    if let Some(it) = self.current_item() {
+                        // a copy into Downloads: Library then asks where it belongs
+                        let dl = home().join("Downloads");
+                        let _ = std::fs::create_dir_all(&dl);
+                        let mut target = dl.join(&it.name);
+                        let mut k = 2;
+                        while target.exists() {
+                            target = dl.join(format!("{k}-{}", it.name));
+                            k += 1;
+                        }
+                        self.note = Some(match std::fs::copy(&it.path, &target) {
+                            Ok(_) => format!("{} copied: it waits in \"Needs an answer\".", it.name),
+                            Err(e) => format!("Could not copy: {e}"),
+                        });
+                    }
+                    return Some(Task::none());
+                }
+                match named {
+                    Some(Named::Enter) => {
+                        if let Some(it) = self.current_item() {
+                            open(&it.path);
+                        }
+                        Some(Task::none())
+                    }
+                    // nothing on a drive is deleted or moved from here
+                    Some(Named::Delete) => Some(Task::none()),
+                    _ if ch == "m" => Some(Task::none()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn open_drive(&mut self) -> Task<Message> {
+        let Some(View::Drive(id)) = self.views.get(self.view).cloned() else { return Task::none() };
+        let Some(d) = self.drive(&id) else { return Task::none() };
+        let pw = if d.state == crate::drives::State::Locked {
+            if self.drive_pw.is_empty() {
+                return Task::none();
+            }
+            Some(self.drive_pw.clone())
+        } else {
+            None
+        };
+        self.drive_busy = true;
+        self.note = Some(format!("Opening {}…", d.name));
+        let name = d.name.clone();
+        Task::perform(crate::drives::open(d, pw), move |r| cosmic::Action::App(Message::DriveOpened(name.clone(), r)))
+    }
+
+    fn drive_panel(&self, view: &View) -> Option<Element<'_, Message>> {
+        use crate::drives::{State, size_label};
+        let View::Drive(id) = view else { return None };
+        let d = self.drive(id)?;
+        let mut col = widget::Column::new()
+            .spacing(12)
+            .width(Length::Fixed(420.0))
+            .push(text("DRIVE", MONO, 14.0, YELLOW))
+            .push(text(short(&d.name, 30), SANS_BOLD, 28.0, TEXT))
+            .push(text(format!("{} · {}{}", size_label(d.size), d.kind, if d.encrypted { " · ENCRYPTED" } else { "" }), MONO, 14.0, TEXT_2))
+            .push(space(1.0, 8.0));
+        match d.state {
+            State::Locked if self.focus == Focus::DrivePassword => {
+                col = col.push(text("Its password", SANS_BOLD, 20.0, TEXT)).push(
+                    text_input::text_input("Password", self.drive_pw.as_str())
+                        .id(self.input_id.clone())
+                        .password()
+                        .on_input(Message::DrivePassword)
+                        .on_submit(|_| Message::DriveSubmit)
+                        .style(field_style())
+                        .size(21)
+                        .padding([14, 18]),
+                );
+            }
+            State::Locked => col = col.push(text("Locked. Press → to type its password.", SANS, 19.0, TEXT_2)),
+            State::Closed => col = col.push(text("Press → to open it.", SANS, 19.0, TEXT_2)),
+            State::Open(_) => {
+                col = col.push(text("Open. C copies a file into Library; E closes the drive so it can be taken out.", SANS, 18.0, TEXT_2));
+            }
+        }
+        Some(fill(col.padding(30), PANEL).into())
     }
 
     fn picking(&self) -> bool {

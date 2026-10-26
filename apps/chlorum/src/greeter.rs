@@ -1,7 +1,8 @@
 //! `chlorum greeter` — the first start and the login screen, inside niri
 //! under greetd.
 //!
-//! First start: keyboard → internet → profile, then straight into Chlorum.
+//! First start: internet → profile, then straight into Chlorum. The
+//! keyboard is English (US) QWERTY; another layout can be added in Center.
 //! Afterwards: profiles in a row, the password under them, and under that
 //! "Show" and "Power". Arrows move where they point; nothing needs a mouse.
 
@@ -46,7 +47,6 @@ struct Net {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Retry {
-    Keyboard,
     Network,
     Profile,
     Create,
@@ -55,7 +55,6 @@ enum Retry {
 #[derive(Clone, Debug, PartialEq)]
 enum Screen {
     Login,
-    Keyboard,
     Checking,
     Networks,
     WifiPassword,
@@ -109,7 +108,6 @@ pub struct Greeter {
     power: Option<usize>,
     armed: bool,
     // first start
-    layout_sel: usize,
     nets: Vec<Net>,
     net_sel: usize,
     wifi_ssid: String,
@@ -161,7 +159,6 @@ impl Application for Greeter {
     fn init(mut core: Core, _: ()) -> (Self, Task<Message>) {
         core.window.show_headerbar = false;
         core.window.content_container = false;
-        let current = std::fs::read_to_string(format!("{}/xkb-layout", setupd::STATE)).unwrap_or_default();
         let mut g = Greeter {
             core,
             screen: Screen::Login,
@@ -173,7 +170,6 @@ impl Application for Greeter {
             error: None,
             power: None,
             armed: false,
-            layout_sel: setupd::LAYOUTS.iter().position(|l| l.0 == current.trim()).unwrap_or(0),
             nets: vec![],
             net_sel: 0,
             wifi_ssid: String::new(),
@@ -197,7 +193,7 @@ impl Application for Greeter {
             ));
             tasks.push(g.focus(Field::Login));
         } else {
-            g.screen = Screen::Keyboard;
+            tasks.push(g.start(Retry::Network));
         }
         if let Some(id) = g.core.main_window_id() {
             tasks.push(iced::window::set_mode(id, iced::window::Mode::Fullscreen));
@@ -335,7 +331,7 @@ impl Greeter {
                 Zone::Field => vec![("↑", "Profile", false), ("↓", "Show password", false), ("ENTER", "Unlock", true)],
                 Zone::Buttons(_) => vec![("← →", "Move", false), ("↑", "Password", false), ("ENTER", "Press", true)],
             },
-            Screen::Keyboard | Screen::Networks => vec![("↑ ↓", "Choose", false), ("ENTER", "Next", true)],
+            Screen::Networks => vec![("↑ ↓", "Choose", false), ("ENTER", "Next", true), ("ESC", "Check again", false)],
             Screen::WifiPassword => vec![("ENTER", "Connect", true), ("ESC", "Back", false)],
             Screen::Proposal => vec![("← →", "Choose", false), ("ENTER", "Press", true)],
             Screen::Own => vec![("↑ ↓", "Field", false), ("ENTER", "Next / Create", true), ("ESC", "Back", false)],
@@ -439,28 +435,20 @@ impl Greeter {
 
     fn setup_view(&self) -> Element<'_, Message> {
         let (step, eyebrow) = match self.screen {
-            Screen::Keyboard => (1, "KEYBOARD"),
-            Screen::Checking | Screen::Networks | Screen::WifiPassword | Screen::Connecting => (2, "INTERNET"),
-            _ => (3, "YOUR PROFILE"),
+            Screen::Checking | Screen::Networks | Screen::WifiPassword | Screen::Connecting => (1, "INTERNET"),
+            _ => (2, "YOUR PROFILE"),
         };
         let mut steps = widget::Row::new().spacing(10);
-        for i in 1..=3 {
+        for i in 1..=2 {
             steps = steps.push(fill(space(70.0, 6.0), if i <= step { YELLOW } else { LINE }));
         }
         let mut col = widget::Column::new()
             .spacing(18)
             .push(steps)
-            .push(text(format!("STEP {step} OF 3 · {eyebrow}"), MONO, 16.0, YELLOW));
+            .push(text(format!("STEP {step} OF 2 · {eyebrow}"), MONO, 16.0, YELLOW));
         let title = |s: String| text(s, SANS_BOLD, 46.0, TEXT);
         let lead = |s: &str| text(s.to_string(), SANS, 22.0, TEXT_2);
         match &self.screen {
-            Screen::Keyboard => {
-                col = col.push(title("Which keyboard do you have?".into())).push(lead(
-                    "Pick the layout printed on your keys, so what you type matches what you see.",
-                ));
-                let rows = setupd::LAYOUTS.iter().map(|l| (l.2.to_string(), l.0.to_uppercase())).collect();
-                col = col.push(list(rows, self.layout_sel));
-            }
             Screen::Checking => col = col.push(title("Internet".into())).push(busy_row("Checking the connection…", self.started)),
             Screen::Networks => {
                 col = col
@@ -607,10 +595,6 @@ impl Greeter {
         self.error = None;
         self.started = Instant::now();
         match step {
-            Retry::Keyboard => {
-                self.screen = Screen::Keyboard;
-                Task::none()
-            }
             Retry::Network => {
                 self.screen = Screen::Checking;
                 ask("network", json!({}))
@@ -643,7 +627,6 @@ impl Greeter {
                 }
                 _ => {
                     let retry = match op {
-                        "set_layout" => Retry::Keyboard,
                         "network" => Retry::Network,
                         "proposal" => Retry::Profile,
                         _ => Retry::Create,
@@ -654,13 +637,6 @@ impl Greeter {
             };
         }
         match op {
-            "set_layout" => {
-                // the new layout works at once: niri reloads its config
-                if let Ok(path) = std::env::var("CHLORUM_NIRI_CONFIG") {
-                    crate::system::set_niri_layout(Path::new(&path), setupd::LAYOUTS[self.layout_sel].0);
-                }
-                self.start(Retry::Network)
-            }
             "network" => {
                 if v["online"].as_bool() == Some(true) {
                     return self.start(Retry::Profile);
@@ -751,20 +727,11 @@ impl Greeter {
         let n = |len: usize| len.max(1) - 1;
         match self.screen.clone() {
             Screen::Login => return self.login_key(key, named, status),
-            Screen::Keyboard => match named {
-                Some(Named::ArrowDown) => self.layout_sel = (self.layout_sel + 1).min(n(setupd::LAYOUTS.len())),
-                Some(Named::ArrowUp) => self.layout_sel = self.layout_sel.saturating_sub(1),
-                Some(Named::Enter) => {
-                    self.screen = Screen::Checking;
-                    self.started = Instant::now();
-                    return ask("set_layout", json!({"id": setupd::LAYOUTS[self.layout_sel].0}));
-                }
-                _ => {}
-            },
             Screen::Networks => match named {
                 Some(Named::ArrowDown) => self.net_sel = (self.net_sel + 1).min(n(self.nets.len())),
                 Some(Named::ArrowUp) => self.net_sel = self.net_sel.saturating_sub(1),
-                Some(Named::Escape) => self.screen = Screen::Keyboard,
+                // a cable plugged in, or Wi-Fi that was still starting: look again
+                Some(Named::Escape) | Some(Named::F5) => return self.start(Retry::Network),
                 Some(Named::Enter) => {
                     let net = self.nets[self.net_sel].clone();
                     match net.ssid {

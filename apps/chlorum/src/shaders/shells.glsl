@@ -17,7 +17,7 @@ void main(){
     float c = cos(-tilt), sn = sin(-tilt);
     vec2 q = vec2(p.x * c - p.y * sn, p.x * sn + p.y * c);
     float k = length(q / vec2(1.7, 0.55));
-    c3 += vec3(0.16) * smoothstep(0.004, 0.0, abs(k - radii[s]) * 0.55);
+    c3 += vec3(0.16) * (1.0 - smoothstep(0.0, 0.004, abs(k - radii[s]) * 0.55));
     for (int i = 0; i < 8; i++) {
       float fi = float(i);
       if (fi >= counts[s]) break;
@@ -25,13 +25,13 @@ void main(){
       vec2 e = ell(ang, radii[s], tilt);
       float d = length(p - e);
       if (s == 2 && i == 0) {
-        c3 += col * 0.6 * smoothstep(0.003, 0.0, abs(d - 0.011)) * (0.5 + 0.5 * sin(t * 3.0));
+        c3 += col * 0.6 * (1.0 - smoothstep(0.0, 0.003, abs(d - 0.011))) * (0.5 + 0.5 * sin(t * 3.0));
       } else {
-        c3 += col * smoothstep(0.011, 0.007, d) + col * 0.25 * exp(-d * 60.0);
+        c3 += col * (1.0 - smoothstep(0.007, 0.011, d)) + col * 0.25 * exp(-d * 60.0);
       }
     }
   }
   float dn = length(p);
-  c3 += col * smoothstep(0.045, 0.041, dn) + col * 0.15 * exp(-dn * 12.0);
+  c3 += col * (1.0 - smoothstep(0.041, 0.045, dn)) + col * 0.15 * exp(-dn * 12.0);
   gl_FragColor = vec4(c3 * bright, 1.0);
 }

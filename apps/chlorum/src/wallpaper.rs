@@ -31,10 +31,18 @@ use smithay_client_toolkit::{
     },
 };
 use wayland_client::{
+    delegate_noop,
     globals::registry_queue_init,
     protocol::{wl_output, wl_surface},
     Connection, Proxy, QueueHandle,
 };
+use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
+
+/// The wallpaper is soft: drawn at half the screen's size and scaled up by
+/// niri, it looks the same and costs a quarter of the work.
+const RENDER_SCALE: f64 = 0.5;
+/// Frames per second: smooth enough for slow motion, half the work of 60.
+const FPS: f64 = 30.0;
 
 const COMMON: &str = include_str!("shaders/common.glsl");
 const VERTEX: &str = "attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }";
@@ -202,6 +210,10 @@ struct Screen {
     egl_window: Option<wayland_egl::WlEglSurface>,
     egl_surface: Option<egl::Surface>,
     waiting: bool, // a frame callback is pending
+    viewport: Option<WpViewport>,
+    /// the size actually drawn (smaller than the screen when scaled)
+    drawn: (u32, u32),
+    last_draw: Option<Instant>,
 }
 
 struct App {
@@ -216,6 +228,8 @@ struct App {
     paused: bool,
     clock: f32,
     last: Instant,
+    viewporter: Option<WpViewporter>,
+    handle: smithay_client_toolkit::reexports::calloop::LoopHandle<'static, App>,
 }
 
 impl App {
@@ -242,7 +256,8 @@ impl App {
         g.egl.make_current(g.display, Some(surface), Some(surface), Some(g.context)).ok();
         // frames are paced by the compositor's frame callbacks; never block here
         g.egl.swap_interval(g.display, 0).ok();
-        let (w, h) = screen.size;
+        let (w, h) = screen.drawn;
+        screen.last_draw = Some(now);
         unsafe {
             let gl = &g.gl;
             gl.viewport(0, 0, w as i32, h as i32);
@@ -293,14 +308,34 @@ impl CompositorHandler for App {
     fn scale_factor_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: i32) {}
     fn transform_changed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: wl_output::Transform) {}
     fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _: u32) {
-        if let Some(id) = self.id_of(surface) {
-            if let Some(s) = self.screens.get_mut(&id) {
+        let Some(id) = self.id_of(surface) else { return };
+        let since = self.screens.get(&id).and_then(|s| s.last_draw).map(|t| t.elapsed().as_secs_f64()).unwrap_or(1.0);
+        if let Some(s) = self.screens.get_mut(&id) {
+            s.waiting = false;
+        }
+        if self.paused {
+            return;
+        }
+        let gap = 1.0 / FPS;
+        if since >= gap * 0.9 {
+            self.draw(id, qh);
+            return;
+        }
+        // too soon for the next frame: draw it a little later
+        if let Some(s) = self.screens.get_mut(&id) {
+            s.waiting = true;
+        }
+        let qh = qh.clone();
+        let wait = Duration::from_secs_f64(gap - since);
+        let _ = self.handle.insert_source(Timer::from_duration(wait), move |_, _, app| {
+            if let Some(s) = app.screens.get_mut(&id) {
                 s.waiting = false;
             }
-            if !self.paused {
-                self.draw(id, qh);
+            if !app.paused {
+                app.draw(id, &qh);
             }
-        }
+            TimeoutAction::Drop
+        });
     }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
@@ -322,10 +357,11 @@ impl OutputHandler for App {
         layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
         layer.set_exclusive_zone(-1);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        let viewport = self.viewporter.as_ref().map(|v| v.get_viewport(layer.wl_surface(), qh, ()));
         layer.commit();
         self.screens.insert(
             output.id().protocol_id(),
-            Screen { layer, size: (0, 0), egl_window: None, egl_surface: None, waiting: false },
+            Screen { layer, size: (0, 0), egl_window: None, egl_surface: None, waiting: false, viewport, drawn: (0, 0), last_draw: None },
         );
     }
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
@@ -356,10 +392,19 @@ impl LayerShellHandler for App {
         let screen = self.screens.get_mut(&id).unwrap();
         if screen.size != (w, h) || screen.egl_window.is_none() {
             screen.size = (w, h);
+            // drawn smaller, shown full size
+            let (dw, dh) = match &screen.viewport {
+                Some(vp) => {
+                    vp.set_destination(w as i32, h as i32);
+                    (((w as f64) * RENDER_SCALE).round().max(1.0) as u32, ((h as f64) * RENDER_SCALE).round().max(1.0) as u32)
+                }
+                None => (w, h),
+            };
+            screen.drawn = (dw, dh);
             if let Some(win) = &screen.egl_window {
-                win.resize(w as i32, h as i32, 0, 0);
+                win.resize(dw as i32, dh as i32, 0, 0);
             } else {
-                let win = wayland_egl::WlEglSurface::new(layer.wl_surface().id(), w as i32, h as i32)
+                let win = wayland_egl::WlEglSurface::new(layer.wl_surface().id(), dw as i32, dh as i32)
                     .expect("wl_egl_window");
                 let es = unsafe {
                     g.egl.create_window_surface(g.display, g.config, win.ptr() as egl::NativeWindowType, None)
@@ -386,6 +431,8 @@ delegate_compositor!(App);
 delegate_output!(App);
 delegate_layer!(App);
 delegate_registry!(App);
+delegate_noop!(App: ignore WpViewporter);
+delegate_noop!(App: ignore WpViewport);
 
 pub fn run() {
     let conn = Connection::connect_to_env().expect("not in a Wayland session");
@@ -406,6 +453,8 @@ pub fn run() {
         paused: false,
         clock: 0.0,
         last: Instant::now(),
+        viewporter: globals.bind(&qh, 1..=1, ()).ok(),
+        handle: event_loop.handle(),
     };
     app.reload();
 

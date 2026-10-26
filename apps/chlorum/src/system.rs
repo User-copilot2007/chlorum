@@ -348,10 +348,12 @@ pub fn keyboard() -> String {
 /// words, so a non-Latin layout (Ukrainian) comes second: what you type at
 /// the login and lock screens is always Latin, Alt+Shift switches.
 pub fn xkb_layouts(id: &str) -> String {
+    // US QWERTY always comes first: passwords are made and typed on it, so
+    // the login and lock screens read them the same way. The other layout is
+    // one Alt+Shift away.
     match id {
         "us" | "" => "us".into(),
-        "ua" => "us,ua".into(),
-        other => format!("{other},us"),
+        other => format!("us,{other}"),
     }
 }
 
@@ -397,7 +399,7 @@ mod tests {
     #[test]
     fn layouts() {
         assert_eq!(xkb_layouts("ua"), "us,ua");
-        assert_eq!(xkb_layouts("de"), "de,us");
+        assert_eq!(xkb_layouts("de"), "us,de");
         assert_eq!(xkb_layouts("us"), "us");
     }
 }

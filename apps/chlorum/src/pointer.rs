@@ -365,8 +365,150 @@ pub fn run() -> Result<(), String> {
     r
 }
 
+// ==================================================================== numpad
+
+/// The numpad is the mouse, always: niri sends each numpad key here
+/// (`chlorum mouse go left`, `chlorum mouse click` …), and this service moves
+/// the pointer. Holding a key glides it, faster the longer it is held.
+///
+///   8 4 6 2      move          7 9 1 3   move on the diagonal
+///   5            click         /         right click
+///   *            middle click  0         hold the button (drag), again to drop
+///   −  +         scroll up / down
+fn mouse_socket() -> std::path::PathBuf {
+    crate::apps::runtime_dir().join("mouse.sock")
+}
+
+/// How the glide speeds up: pixels per second after holding for `t` s.
+fn glide_speed(t: f64) -> f64 {
+    (220.0 + 1100.0 * t).min(2200.0)
+}
+
+/// Parts of a direction word: "upleft" → up and left.
+fn dirs(word: &str) -> Vec<&'static str> {
+    let mut v = Vec::new();
+    for d in ["up", "down", "left", "right"] {
+        if word.contains(d) {
+            v.push(d);
+        }
+    }
+    v
+}
+
+struct Held {
+    /// direction → (pressed since, key still held until)
+    keys: std::collections::HashMap<&'static str, (Instant, Instant)>,
+}
+
+/// `chlorum mouse` runs the service; `chlorum mouse <words…>` tells it.
+pub fn mouse_cli(args: &[String]) -> Result<(), String> {
+    use std::io::Write;
+    if !args.is_empty() {
+        let mut s = std::os::unix::net::UnixStream::connect(mouse_socket()).map_err(|e| e.to_string())?;
+        return s.write_all(format!("{}\n", args.join(" ")).as_bytes()).map_err(|e| e.to_string());
+    }
+    let tx = pointer_thread()?;
+    // a drag cut short by a restart must not leave the button held
+    let _ = tx.send(Do::Button(BTN_LEFT, false));
+    let held = std::sync::Arc::new(std::sync::Mutex::new(Held { keys: Default::default() }));
+    let dragging = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // the glide: while a key repeats, the pointer moves every few ms
+    {
+        let held = held.clone();
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut last = Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(8));
+                let dt = last.elapsed().as_secs_f64().min(0.05);
+                last = Instant::now();
+                let now = Instant::now();
+                let (mut dx, mut dy) = (0.0, 0.0);
+                if let Ok(mut h) = held.lock() {
+                    h.keys.retain(|_, (_, until)| *until > now);
+                    for (d, (since, _)) in &h.keys {
+                        // a tap already moved a little; the glide starts
+                        // when the key starts repeating (300 ms)
+                        let t = since.elapsed().as_secs_f64();
+                        if t < 0.3 {
+                            continue;
+                        }
+                        let (x, y) = step(d, glide_speed(t - 0.3) * dt);
+                        dx += x;
+                        dy += y;
+                    }
+                }
+                if dx != 0.0 || dy != 0.0 {
+                    let _ = tx.send(Do::Move(dx, dy));
+                }
+            }
+        });
+    }
+
+    let path = mouse_socket();
+    let _ = std::fs::create_dir_all(crate::apps::runtime_dir());
+    let _ = std::fs::remove_file(&path);
+    let listener = std::os::unix::net::UnixListener::bind(&path).map_err(|e| e.to_string())?;
+    eprintln!("chlorum: numpad mouse ready");
+    for stream in listener.incoming().flatten() {
+        let mut line = String::new();
+        let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(stream), &mut line);
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let click = |b: u32| {
+            let _ = tx.send(Do::Button(b, true));
+            let _ = tx.send(Do::Button(b, false));
+        };
+        match words.as_slice() {
+            ["go", word] => {
+                let now = Instant::now();
+                if let Ok(mut h) = held.lock() {
+                    for d in dirs(word) {
+                        // the first repeat comes 300 ms after the press, then
+                        // one every 25 ms: wait that long before deciding the
+                        // key was let go
+                        let entry = h.keys.entry(d).or_insert((now, now));
+                        let fresh = entry.1 <= now;
+                        if fresh {
+                            *entry = (now, now);
+                            let (x, y) = step(d, 8.0);
+                            let _ = tx.send(Do::Move(x, y));
+                        }
+                        let first = now.duration_since(entry.0) < Duration::from_millis(250);
+                        entry.1 = now + Duration::from_millis(if first { 380 } else { 140 });
+                    }
+                }
+            }
+            ["click"] => click(BTN_LEFT),
+            ["right"] => click(BTN_RIGHT),
+            ["middle"] => click(BTN_MIDDLE),
+            ["drag"] => {
+                let down = !dragging.load(std::sync::atomic::Ordering::Relaxed);
+                dragging.store(down, std::sync::atomic::Ordering::Relaxed);
+                let _ = tx.send(Do::Button(BTN_LEFT, down));
+            }
+            ["scroll", "up"] => {
+                let _ = tx.send(Do::Scroll(-45.0));
+            }
+            ["scroll", "down"] => {
+                let _ = tx.send(Do::Scroll(45.0));
+            }
+            _ => eprintln!("chlorum: mouse: unknown {line:?}"),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn numpad_words() {
+        assert_eq!(super::dirs("upleft"), vec!["up", "left"]);
+        assert_eq!(super::dirs("down"), vec!["down"]);
+        assert!(super::glide_speed(0.0) < super::glide_speed(1.0));
+        assert_eq!(super::glide_speed(100.0), 2200.0);
+    }
+
     #[test]
     fn steps() {
         assert_eq!(super::step("left", 5.0), (-5.0, 0.0));

@@ -4,7 +4,10 @@
 //              (when there is none on screen, the page scrolls as usual)
 //   Enter      press it
 //   F          put a letter on every button and link; type it to press
-//   Esc        leave letter mode
+//   Esc        leave letter mode, or leave the text box the page put you in
+//   ?          show these keys
+//
+// Each can be turned off on the add-on's settings page.
 //
 // Pages that use these keys themselves (games, video players, editors)
 // keep them: Chlorum Keys only acts when the page did not.
@@ -14,6 +17,12 @@
   window.__chlorumKeys = true;
 
   const LETTERS = "fjdkslaghrueiwoqtypvnmcxzb";
+  // the owner's choices (settings page); these are the defaults
+  const opt = { arrows: true, letters: true, letterKey: "f", escape: true, help: true };
+  try {
+    browser.storage.local.get(opt).then((v) => Object.assign(opt, v), () => {});
+    browser.storage.onChanged.addListener((ch) => { for (const k in ch) opt[k] = ch[k].newValue; });
+  } catch (_) { /* outside the add-on (tests): defaults */ }
   const CLICKABLE = [
     "a[href]", "button", "input:not([type=hidden])", "select", "textarea", "summary",
     "label[for]", "[role=button]", "[role=link]", "[role=tab]", "[role=menuitem]",
@@ -71,6 +80,9 @@
   // ------------------------------------------------------------ letters
 
   let hint = null; // { host, items: [{code, el, tag}], typed }
+  // a text box the arrows moved into: until something is typed there, the
+  // arrows (and letters) still move on
+  let passing = null;
 
   function codes(n) {
     if (n <= LETTERS.length) return LETTERS.slice(0, n).split("");
@@ -195,13 +207,25 @@
 
   // Everything else only when the page itself did nothing with the key.
   window.addEventListener("keydown", (e) => {
-    if (hint || e.defaultPrevented || e.ctrlKey || e.altKey || e.metaKey) return;
+    if (hint || help || e.defaultPrevented || e.ctrlKey || e.altKey || e.metaKey) return;
     const el = document.activeElement;
-    const dir = { ArrowRight: "right", ArrowLeft: "left", ArrowDown: "down", ArrowUp: "up" }[e.key];
-    if (typing(el) && !(dir && canLeave(el, dir))) return;
-    if ((e.key === "f" || e.key === "F") && !e.shiftKey && window === window.top) {
+    const dir = opt.arrows ? { ArrowRight: "right", ArrowLeft: "left", ArrowDown: "down", ArrowUp: "up" }[e.key] : undefined;
+    // pages often put you in a search box: Esc lets you out
+    if (e.key === "Escape" && opt.escape && typing(el)) {
+      el.blur();
+      return;
+    }
+    if (passing && passing !== el) passing = null;
+    if (passing && !dir && e.key !== (opt.letterKey || "f") && e.key !== "?") passing = null;
+    if (typing(el) && !passing && !(dir && canLeave(el, dir))) return;
+    if (opt.letters && e.key.toLowerCase() === (opt.letterKey || "f") && !e.shiftKey && window === window.top) {
       e.preventDefault();
       showHints();
+      return;
+    }
+    if (e.key === "?" && opt.help && window === window.top) {
+      e.preventDefault();
+      toggleHelp();
       return;
     }
     if (dir && !e.shiftKey) {
@@ -209,6 +233,7 @@
       if (next) {
         e.preventDefault();
         next.focus({ preventScroll: true });
+        passing = typing(next) ? next : null;
         next.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
       }
       return;
@@ -220,6 +245,41 @@
       el.click();
     }
   }, false);
+
+  // ------------------------------------------------------------ help
+
+  let help = null;
+  function toggleHelp() {
+    if (help) { help.remove(); help = null; return; }
+    help = document.createElement("chlorum-keys-help");
+    help.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483647;";
+    const root = help.attachShadow({ mode: "closed" });
+    const k = (opt.letterKey || "f").toUpperCase();
+    root.innerHTML = `<style>
+      .w{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center}
+      .b{background:#0b0b0b;color:#f5f5f5;border-top:4px solid #FFD60A;padding:28px 36px;min-width:480px;
+         font:16px/1.5 "IBM Plex Sans",system-ui,sans-serif}
+      h1{font:600 24px/1 "IBM Plex Sans",system-ui,sans-serif;margin:0 0 18px}
+      td{padding:6px 18px 6px 0;vertical-align:top}
+      kbd{font:600 13px "IBM Plex Mono",ui-monospace,monospace;border:1.5px solid #FFD60A;color:#FFD60A;padding:2px 7px}
+      .off{opacity:.35}
+      p{color:#9a9a9a;font-size:14px;margin:18px 0 0}</style>
+      <div class="w"><div class="b"><h1>Keys on web pages</h1><table>
+      <tr class="${opt.arrows ? "" : "off"}"><td><kbd>← ↑ ↓ →</kbd></td><td>Move to the next button or link</td></tr>
+      <tr><td><kbd>Enter</kbd></td><td>Press it</td></tr>
+      <tr class="${opt.letters ? "" : "off"}"><td><kbd>${k}</kbd></td><td>A letter on every button and link: type it to press</td></tr>
+      <tr class="${opt.escape ? "" : "off"}"><td><kbd>Esc</kbd></td><td>Leave a text box, so the arrows move again</td></tr>
+      <tr><td><kbd>Ctrl L</kbd></td><td>Address bar · <kbd>Ctrl T</kbd> new tab · <kbd>Ctrl W</kbd> close tab</td></tr>
+      <tr><td><kbd>Alt ←</kbd></td><td>Back · <kbd>Alt →</kbd> forward · <kbd>Ctrl Tab</kbd> next tab</td></tr>
+      </table><p>Any key closes this. Turn keys on or off: Chlorum Keys in the toolbar.</p></div></div>`;
+    document.documentElement.appendChild(help);
+  }
+  window.addEventListener("keydown", (e) => {
+    if (!help) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    toggleHelp();
+  }, true);
 
   window.addEventListener("scroll", hideHints, { passive: true });
   window.addEventListener("resize", hideHints, { passive: true });

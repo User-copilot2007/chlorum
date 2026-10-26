@@ -10,7 +10,7 @@ void main(){
     if (fi >= amount + 2.0) break;
     float center = sin(t * (0.10 + 0.03 * fi) + fi * 1.7) * 0.55;
     float width = 0.025 + 0.03 * fract(fi * 0.618);
-    v += smoothstep(width, 0.0, abs(a - center)) * (0.5 + 0.5 * noise(vec2(dist * 6.0 - t * 0.4, fi)));
+    v += (1.0 - smoothstep(0.0, width, abs(a - center))) * (0.5 + 0.5 * noise(vec2(dist * 6.0 - t * 0.4, fi)));
   }
   float fall = exp(-dist * 1.1);
   vec3 c3 = col * v * fall * 0.5 + col * 0.04 * fall;

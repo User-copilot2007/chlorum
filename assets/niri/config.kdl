@@ -50,7 +50,8 @@ workspace "stage"
 workspace "shelf"
 
 prefer-no-csd
-screenshot-path "~/Downloads/Screenshot %Y-%m-%d %H-%M-%S.png"
+// straight into Library's Screenshots collection
+screenshot-path "~/Library/Screenshots/Screenshot %Y-%m-%d %H-%M-%S.png"
 
 hotkey-overlay {
     skip-at-startup
@@ -118,8 +119,26 @@ binds {
     Super+Return repeat=false { spawn "chlorum" "msg" "template"; }
     Super+H repeat=false { spawn "chlorum" "msg" "home"; }
     Super+L repeat=false allow-when-locked=true { spawn "chlorum" "lock"; }
-    // move the mouse pointer with the keyboard; again to stop
+    // move the mouse pointer with the arrows (laptops); again to stop
     Super+M repeat=false { spawn "chlorum" "pointer"; }
+
+    // The numpad is the mouse (Num Lock does not matter): 8 4 6 2 and the
+    // corners move it (hold to glide), 5 clicks, / right click, * middle,
+    // 0 holds the button for dragging, - and + scroll.
+    KP_Up { spawn "chlorum" "mouse" "go" "up"; }
+    KP_Down { spawn "chlorum" "mouse" "go" "down"; }
+    KP_Left { spawn "chlorum" "mouse" "go" "left"; }
+    KP_Right { spawn "chlorum" "mouse" "go" "right"; }
+    KP_Home { spawn "chlorum" "mouse" "go" "upleft"; }
+    KP_Prior { spawn "chlorum" "mouse" "go" "upright"; }
+    KP_End { spawn "chlorum" "mouse" "go" "downleft"; }
+    KP_Next { spawn "chlorum" "mouse" "go" "downright"; }
+    KP_Begin repeat=false { spawn "chlorum" "mouse" "click"; }
+    KP_Divide repeat=false { spawn "chlorum" "mouse" "right"; }
+    KP_Multiply repeat=false { spawn "chlorum" "mouse" "middle"; }
+    KP_Insert repeat=false { spawn "chlorum" "mouse" "drag"; }
+    KP_Subtract { spawn "chlorum" "mouse" "scroll" "up"; }
+    KP_Add { spawn "chlorum" "mouse" "scroll" "down"; }
 
     // Media keys
     XF86AudioRaiseVolume allow-when-locked=true { spawn "wpctl" "set-volume" "-l" "1" "@DEFAULT_AUDIO_SINK@" "5%+"; }
@@ -132,7 +151,8 @@ binds {
     Ctrl+Alt+T repeat=false { spawn "cosmic-term"; }
     Ctrl+Alt+Delete repeat=false { quit; }
 
-    // Screenshots land in Downloads, where Library asks where they belong.
+    // screenshots: the screen, a part you choose, or the app in front
     Print { screenshot-screen; }
+    Shift+Print { screenshot; }
     Alt+Print { screenshot-window; }
 }

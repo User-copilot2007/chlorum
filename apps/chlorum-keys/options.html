@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Chlorum Keys</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #0b0b0b; color: #f5f5f5; font: 16px/1.5 "IBM Plex Sans", system-ui, sans-serif; min-width: 420px; }
+  main { padding: 26px 30px; max-width: 640px; }
+  h1 { font-weight: 600; font-size: 24px; margin: 0 0 4px; }
+  .lead { color: #9a9a9a; margin: 0 0 20px; }
+  label.row { display: flex; align-items: center; gap: 14px; padding: 12px 16px; background: #161616; margin: 6px 0; cursor: pointer; }
+  label.row:focus-within { outline: 3px solid #FFD60A; outline-offset: 2px; }
+  label.row span { flex: 1; }
+  small { display: block; color: #9a9a9a; }
+  input[type=checkbox] { width: 20px; height: 20px; accent-color: #FFD60A; }
+  input[type=text] { width: 2.4em; text-align: center; font: 600 16px "IBM Plex Mono", monospace; background: #000; color: #FFD60A; border: 2px solid #FFD60A; padding: 4px; text-transform: uppercase; }
+  kbd { font: 600 13px "IBM Plex Mono", monospace; border: 1.5px solid #FFD60A; color: #FFD60A; padding: 1px 6px; }
+  .saved { color: #FFD60A; height: 1.5em; margin-top: 10px; font: 14px "IBM Plex Mono", monospace; }
+</style></head>
+<body><main>
+  <h1>Chlorum Keys</h1>
+  <p class="lead">Use web pages without a mouse. Tab and Shift+Tab move between settings, Space switches one.</p>
+  <label class="row"><input type="checkbox" id="arrows"><span>Arrows move between buttons and links<small>When a page uses the arrows itself (games, players, maps), it keeps them.</small></span></label>
+  <label class="row"><input type="checkbox" id="letters"><span>Letters on buttons and links<small>Press the key on the right, then type the letter shown.</small></span><input type="text" id="letterKey" maxlength="1" aria-label="Key for letters"></label>
+  <label class="row"><input type="checkbox" id="escape"><span><kbd>Esc</kbd> leaves a text box<small>So the arrows work again after a page puts you in a search box.</small></span></label>
+  <label class="row"><input type="checkbox" id="help"><span><kbd>?</kbd> shows the keys<small>A short list on top of the page; any key closes it.</small></span></label>
+  <div class="saved" id="saved" role="status"></div>
+</main>
+<script src="options.js"></script>
+</body></html>

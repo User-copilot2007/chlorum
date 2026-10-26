@@ -152,20 +152,22 @@ enum Section {
     Network,
     Sound,
     Keyboard,
+    Screen,
     Apps,
     Updates,
     About,
 }
 
 impl Section {
-    const ALL: [Section; 7] =
-        [Section::Wallpaper, Section::Network, Section::Sound, Section::Keyboard, Section::Apps, Section::Updates, Section::About];
+    const ALL: [Section; 8] =
+        [Section::Wallpaper, Section::Network, Section::Sound, Section::Keyboard, Section::Screen, Section::Apps, Section::Updates, Section::About];
     fn label(self) -> &'static str {
         match self {
             Section::Wallpaper => "Wallpaper",
             Section::Network => "Network",
             Section::Sound => "Sound",
             Section::Keyboard => "Keyboard",
+            Section::Screen => "Screen",
             Section::Apps => "Apps",
             Section::Updates => "Updates",
             Section::About => "About",
@@ -222,6 +224,10 @@ pub struct Shell {
     /// Center → Apps: what each app may use, and the app being looked at
     denied: crate::sandbox::Denied,
     perm_app: Option<String>,
+    /// Center → Screen: when the screen turns off and locks by itself
+    idle: crate::idle::Times,
+    /// notifications wait in the menu without popping up
+    dnd: bool,
     pinned: Vec<String>,
     started: bool,
 
@@ -305,6 +311,8 @@ impl Application for Shell {
             installed: apps::installed(),
             denied: crate::sandbox::load(),
             perm_app: None,
+            idle: crate::idle::load(),
+            dnd: dnd_path().exists(),
             pinned: apps::id_list("home-apps", apps::DEFAULT_PINNED),
             started: false,
             home: None,
@@ -370,6 +378,15 @@ impl Application for Shell {
             Subscription::run(commands),
             Subscription::run(notify::events).map(Message::Note),
             Subscription::run(notify::sleeps).map(|_| Message::Command("lock".into())),
+            Subscription::run(crate::drives::plugged).map(|name| {
+                Message::Note(notify::Event::Show(Note {
+                    id: 0x4472_0000 | (name.len() as u32 & 0xffff),
+                    app: "Drives".into(),
+                    icon: "drive-removable-media".into(),
+                    summary: format!("{name} is plugged in"),
+                    body: "Open it in Library, under Drives.".into(),
+                }))
+            }),
             iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick),
             event::listen_with(|e, _status, id| match e {
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) => {
@@ -592,6 +609,10 @@ fn open_surface(settings: SctkLayerSurfaceSettings) -> Task<Message> {
         Task::perform(tokio::time::sleep(Duration::from_millis(ms)), move |_| cosmic::Action::App(Message::Nudge(id, w, h)))
     };
     Task::batch([get_layer_surface(settings), nudge(400), nudge(1200)])
+}
+
+fn dnd_path() -> std::path::PathBuf {
+    apps::config_dir().join("chlorum/do-not-disturb")
 }
 
 fn layer(id: window::Id, layer: Layer, keyboard: KeyboardInteractivity, namespace: &str) -> SctkLayerSurfaceSettings {
@@ -1227,6 +1248,22 @@ impl Shell {
                     }
                 }
             }
+            Section::Screen => {
+                if dir != 0 {
+                    let mut t = self.idle;
+                    if row == 0 {
+                        t.screen_off = crate::idle::next(crate::idle::SCREEN_OFF, t.screen_off, dir);
+                    } else {
+                        t.lock = crate::idle::next(crate::idle::LOCK, t.lock, dir);
+                    }
+                    if t != self.idle {
+                        self.idle = t;
+                        if let Err(e) = crate::idle::save(t) {
+                            self.toast(&format!("Could not save: {e}"));
+                        }
+                    }
+                }
+            }
             Section::Apps => {
                 let list = self.app_list();
                 match self.perm_app.clone() {
@@ -1279,6 +1316,7 @@ impl Shell {
             Section::Network => 1 + self.wifi.len(),
             Section::Sound => if self.sound.present { 2 } else { 0 },
             Section::Keyboard => crate::setupd::LAYOUTS.len(),
+            Section::Screen => 2,
             Section::Apps => if self.perm_app.is_some() { crate::sandbox::Perm::ALL.len() } else { self.app_list().len() },
             Section::Updates => 1,
             Section::About => 0,
@@ -1332,6 +1370,9 @@ impl Shell {
         }
         if matches!(self.update, Update::Available | Update::Installed) {
             chips = chips.push(chip("UPDATE READY".into(), true));
+        }
+        if self.dnd {
+            chips = chips.push(chip("DO NOT DISTURB".into(), true));
         }
         chips = chips.push(chip(self.user.to_uppercase(), false));
         widget::Row::new()
@@ -1473,6 +1514,7 @@ impl Shell {
             Section::Network => self.network_view(f),
             Section::Sound => self.sound_view(f),
             Section::Keyboard => self.keyboard_view(f),
+            Section::Screen => self.screen_view(f),
             Section::Apps => self.apps_view(f),
             Section::Updates => self.updates_view(f),
             Section::About => self.about_view(f),
@@ -1594,6 +1636,27 @@ impl Shell {
             col = col.push(text(n.clone(), SANS_BOLD, 20.0, alpha(YELLOW, f)));
         }
         widget::scrollable(col).height(Length::Fill).into()
+    }
+
+    fn screen_view(&self, f: f32) -> Element<'_, Message> {
+        use crate::idle::{LOCK, SCREEN_OFF, label};
+        let choice = |list: &'static [u32], now: u32, on: bool| -> Element<'_, Message> {
+            let mut r = widget::Row::new().spacing(10);
+            for v in list {
+                let sel = *v == now;
+                r = r.push(
+                    fill(text(label(*v), SANS_BOLD, 16.0, alpha(if sel { BLACK } else if on { TEXT } else { TEXT_2 }, f)), alpha(if sel { YELLOW } else { PANEL_2 }, f))
+                        .padding([12, 14]),
+                );
+            }
+            r.into()
+        };
+        widget::Column::new()
+            .push(text("When nobody uses the computer. A video or a call keeps it awake.", SANS, 20.0, alpha(TEXT_2, f)))
+            .push(self.row_box(0, "Turn the screen off after", label(self.idle.screen_off), choice(SCREEN_OFF, self.idle.screen_off, self.row == Some(0)), f))
+            .push(self.row_box(1, "Lock after", label(self.idle.lock), choice(LOCK, self.idle.lock, self.row == Some(1)), f))
+            .spacing(26)
+            .into()
     }
 
     fn apps_view(&self, f: f32) -> Element<'_, Message> {
@@ -1848,6 +1911,7 @@ impl Shell {
             _ => {}
         }
         match ch.as_str() {
+            "d" => self.toggle_dnd(),
             "h" => return self.press_card(Card::Home),
             "c" => return self.press_card(Card::Center),
             "l" => {
@@ -2006,7 +2070,7 @@ impl Shell {
         };
 
         let h: &[(&str, &str, bool)] = match self.sub {
-            Sub::None => &[("← →", "Move", false), ("ENTER", "Choose", true), ("H", "Home", false), ("C", "Center", false), ("L", "Lock", false), ("F10", "Power", false), ("SUPER", "Close", false)],
+            Sub::None => &[("← →", "Move", false), ("ENTER", "Choose", true), ("H", "Home", false), ("C", "Center", false), ("L", "Lock", false), ("D", "Quiet", false), ("F10", "Power", false), ("SUPER", "Close", false)],
             Sub::Apps(_) => &[("← →", "App", false), ("ENTER", "Show", true), ("S", "Show beside", false), ("X", "Close app", false), ("ESC", "Back", false)],
             Sub::Power(_) => &[("← →", "Choose", false), ("ENTER", "Twice to confirm", true), ("ESC", "Back", false)],
             Sub::Sound => &[("← →", "Volume", true), ("ENTER", "Done", false)],
@@ -2069,8 +2133,12 @@ impl Shell {
             }
             Card::Notes => {
                 let n = self.notes.len();
-                let last = self.notes.first().map(|n| clip(&n.summary, 20)).unwrap_or_else(|| "NOTHING NEW".into());
-                ("NOTIFICATIONS", if n == 0 { "None".into() } else { format!("{n} new") }, text(last.to_uppercase(), MONO, 12.0, alpha(TEXT_2, f)))
+                let last = if self.dnd {
+                    "DO NOT DISTURB · D".to_string()
+                } else {
+                    self.notes.first().map(|n| clip(&n.summary, 20).to_uppercase()).unwrap_or_else(|| "NOTHING NEW · D QUIET".into())
+                };
+                ("NOTIFICATIONS", if n == 0 { "None".into() } else { format!("{n} new") }, text(last, MONO, 12.0, alpha(if self.dnd { YELLOW } else { TEXT_2 }, f)))
             }
             Card::Update => ("UPDATE", "New version".into(), text(self.update.text().to_uppercase(), MONO, 12.0, alpha(TEXT_2, f))),
             Card::Sound => {
@@ -2112,10 +2180,28 @@ impl<'a> ApplyWidth<'a> for Element<'a, Message> {
 impl Shell {
     // ================================================================ notifications
 
+    fn toggle_dnd(&mut self) {
+        self.dnd = !self.dnd;
+        let p = dnd_path();
+        let r = if self.dnd {
+            p.parent().map(std::fs::create_dir_all).transpose().and_then(|_| std::fs::write(&p, b""))
+        } else {
+            std::fs::remove_file(&p).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+        };
+        match r {
+            Ok(()) => self.toast(if self.dnd { "Do not disturb: notifications wait here, quietly." } else { "Notifications pop up again." }),
+            Err(e) => self.toast(&format!("Could not save: {e}")),
+        }
+    }
+
     fn show_note(&mut self, n: Note) -> Task<Message> {
         self.notes.retain(|x| x.id != n.id);
         self.notes.insert(0, n);
         self.notes.truncate(20);
+        if self.dnd {
+            // kept in the menu, no pop-up
+            return Task::none();
+        }
         let shown = self.note_surface.is_some();
         self.note_surface = Some((self.note_id, Instant::now()));
         if shown { Task::none() } else { Task::batch([set_layer(self.note_id, Layer::Overlay), set_size(self.note_id, Some(480), Some(132))]) }

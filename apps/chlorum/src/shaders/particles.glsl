@@ -13,7 +13,7 @@ void main(){
     if (h > 0.55) {
       vec2 c = vec2(0.2 + 0.6 * hash(cell + 3.1), 0.2 + 0.6 * hash(cell + 7.7));
       float r = 0.05 + 0.06 * (2.0 - fl) / 2.0;
-      float m = smoothstep(r, r * 0.4, length(f - c));
+      float m = (1.0 - smoothstep(r * 0.4, r, length(f - c)));
       float tw = 0.6 + 0.4 * sin(t * 2.0 + h * 40.0);
       c3 += col * m * tw * (0.35 + 0.3 * (2.0 - fl));
     }

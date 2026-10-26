@@ -56,7 +56,7 @@ let
   keysXpi = pkgs.runCommand "chlorum-keys-${version}" { nativeBuildInputs = [ pkgs.zip ]; } ''
     mkdir -p $out
     cd ${../../apps/chlorum-keys}
-    zip -X -r $out/keys@chlorum.xpi manifest.json keys.js keys.css
+    zip -X -r $out/keys@chlorum.xpi manifest.json keys.js keys.css options.html options.js icon.svg
   '';
 
   # LibreWolf is Firefox with privacy settings, built from the same code on
@@ -119,8 +119,7 @@ let
     layout=$(cat "$HOME/.config/chlorum/keyboard" 2>/dev/null || cat /var/lib/chlorum/xkb-layout 2>/dev/null || echo us)
     case "$layout" in
       us|"") layout=us ;;
-      ua) layout="us,ua" ;;   # passwords are Latin: Ukrainian second
-      *) layout="$layout,us" ;;
+      *) layout="us,$layout" ;;   # US first: passwords are typed on it
     esac
     sed "s/@LAYOUT@/$layout/" ${../../assets/niri/config.kdl} > "$dir/niri.kdl"
     export NIRI_CONFIG="$dir/niri.kdl"
@@ -162,8 +161,7 @@ let
     layout=$(cat /var/lib/chlorum/xkb-layout 2>/dev/null || echo us)
     case "$layout" in
       us|"") layout=us ;;
-      ua) layout="us,ua" ;;   # passwords are Latin: Ukrainian second
-      *) layout="$layout,us" ;;
+      *) layout="us,$layout" ;;   # US first: passwords are typed on it
     esac
     sed "s/@LAYOUT@/$layout/" ${../../assets/niri/greeter.kdl} > "$dir/greeter.kdl"
     export CHLORUM_NIRI_CONFIG="$dir/greeter.kdl"
@@ -276,6 +274,64 @@ in
     xdg.portal.config.niri."org.freedesktop.impl.portal.FileChooser" = lib.mkForce "chlorum";
     services.dbus.packages = [ chlorum ];
 
+    # ---- Flash drives and other removable disks ------------------------------
+    # Library opens them through UDisks: FAT, exFAT, NTFS, ext4, Btrfs, XFS,
+    # F2FS, discs; encrypted ones with LUKS or BitLocker. They mount under
+    # /run/media/<user>, which apps without "personal files" do not see.
+    services.udisks2 = {
+      enable = true;
+      settings."mount_options.conf".defaults = {
+        # the kernel's own NTFS driver: faster than the FUSE one
+        ntfs_drivers = "ntfs3,ntfs";
+      };
+    };
+    boot.supportedFilesystems = [ "vfat" "exfat" "ntfs" "btrfs" "xfs" "f2fs" ];
+
+    # the numpad is the mouse; niri sends it the keys
+    systemd.user.services.chlorum-mouse = {
+      description = "Chlorum numpad mouse";
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      unitConfig = {
+        ConditionEnvironment = "NIRI_SOCKET";
+        StartLimitIntervalSec = 120;
+        StartLimitBurst = 30;
+      };
+      enableDefaultPath = false;
+      serviceConfig = {
+        ExecStart = "${chlorum}/bin/chlorum mouse";
+        # again after a crash or a settings change (exit 75), but not in a
+        # loop when something is missing
+        Restart = "on-failure";
+        RestartForceExitStatus = "75";
+        RestartSec = 2;
+      };
+    };
+
+    # screen off and lock when nobody is there (times in Center → Screen;
+    # it starts over by itself when they change)
+    systemd.user.services.chlorum-idle = {
+      description = "Chlorum: screen off and lock when idle";
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      unitConfig = {
+        ConditionEnvironment = "NIRI_SOCKET";
+        StartLimitIntervalSec = 120;
+        StartLimitBurst = 30;
+      };
+      enableDefaultPath = false;
+      serviceConfig = {
+        ExecStart = "${chlorum}/bin/chlorum idle";
+        # again after a crash or a settings change (exit 75), but not in a
+        # loop when something is missing
+        Restart = "on-failure";
+        RestartForceExitStatus = "75";
+        RestartSec = 2;
+      };
+    };
+
     systemd.user.services.chlorum-wallpaper = {
       description = "Chlorum live wallpaper";
       wantedBy = [ "graphical-session.target" ];
@@ -362,6 +418,11 @@ in
       # apps whose access the owner limited run in a bubblewrap sandbox
       pkgs.bubblewrap
       pkgs.xdg-dbus-proxy
+      # tools for the file systems on flash drives
+      pkgs.exfatprogs
+      pkgs.ntfs3g
+      pkgs.dosfstools
+      pkgs.cryptsetup
       pkgs.xdg-utils
       pkgs.wl-clipboard
       pkgs.brightnessctl

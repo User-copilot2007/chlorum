@@ -8,13 +8,17 @@
 //   chlorum portal       serves that window to apps (xdg-desktop-portal)
 //   chlorum run <id> <c> starts an app with only what it may use
 //   chlorum pointer      move the mouse pointer with the keyboard (Super+M)
+//   chlorum mouse [what] the numpad mouse (service; niri sends it the keys)
+//   chlorum idle         turns the screen off and locks when nobody is there
 //   chlorum wallpaper    the live wallpaper
 //   chlorum lock         the lock screen
 //   chlorum setupd       first-start helper (root, until the first profile exists)
 
 mod apps;
 mod atom;
+mod drives;
 mod greeter;
+mod idle;
 mod layout;
 mod library;
 mod lock;
@@ -50,6 +54,8 @@ fn main() {
         "pick" => library::pick_cli(&args[2..]),
         "portal" => portal::run(),
         "pointer" => pointer::run(),
+        "mouse" => pointer::mouse_cli(&args[2..]),
+        "idle" => idle::run(),
         "run" => sandbox::run_cli(&args[2..]),
         "wallpaper" => {
             wallpaper::run();
