@@ -4,6 +4,10 @@
 //   chlorum msg <what>   tell the running shell about a key (sent by niri)
 //   chlorum greeter      the login screen
 //   chlorum library      Library, the file collections
+//   chlorum pick …       Library as the open/save window apps use
+//   chlorum portal       serves that window to apps (xdg-desktop-portal)
+//   chlorum run <id> <c> starts an app with only what it may use
+//   chlorum pointer      move the mouse pointer with the keyboard (Super+M)
 //   chlorum wallpaper    the live wallpaper
 //   chlorum lock         the lock screen
 //   chlorum setupd       first-start helper (root, until the first profile exists)
@@ -17,6 +21,9 @@ mod lock;
 mod lockscreen;
 mod niri;
 mod notify;
+mod pointer;
+mod portal;
+mod sandbox;
 mod setupd;
 mod shell;
 mod system;
@@ -40,6 +47,10 @@ fn main() {
         "shell" => shell::run().map_err(|e| e.to_string()),
         "greeter" => greeter::run().map_err(|e| e.to_string()),
         "library" => library::run().map_err(|e| e.to_string()),
+        "pick" => library::pick_cli(&args[2..]),
+        "portal" => portal::run(),
+        "pointer" => pointer::run(),
+        "run" => sandbox::run_cli(&args[2..]),
         "wallpaper" => {
             wallpaper::run();
             Ok(())

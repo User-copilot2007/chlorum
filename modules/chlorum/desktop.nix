@@ -33,6 +33,18 @@ let
       StartupWMClass=chlorum-library
       Categories=Utility;FileManager;
       EOF
+      # the open/save window every app gets (xdg-desktop-portal backend)
+      install -Dm644 /dev/stdin $out/share/xdg-desktop-portal/portals/chlorum.portal <<EOF
+      [portal]
+      DBusName=org.freedesktop.impl.portal.desktop.chlorum
+      Interfaces=org.freedesktop.impl.portal.FileChooser
+      EOF
+      install -Dm644 /dev/stdin $out/share/dbus-1/services/org.freedesktop.impl.portal.desktop.chlorum.service <<EOF
+      [D-BUS Service]
+      Name=org.freedesktop.impl.portal.desktop.chlorum
+      Exec=$out/bin/chlorum portal
+      SystemdService=chlorum-portal.service
+      EOF
     '';
     meta.mainProgram = "chlorum";
   };
@@ -66,6 +78,8 @@ let
     extraPrefs = ''
       // Chlorum Keys is Chlorum's own add-on, installed from the system
       lockPref("xpinstall.signatures.required", false);
+      // open and save files through Chlorum's Library window
+      defaultPref("widget.use-xdg-desktop-portal.file-picker", 1);
       // Chlorum: stay signed in, real time zone and dark pages, normal sites
       defaultPref("privacy.resistFingerprinting", false);
       defaultPref("privacy.resistFingerprinting.letterboxing", false);
@@ -246,6 +260,22 @@ in
         RestartSec = 1;
       };
     };
+    # Library as the open/save window of every app, through the portal
+    systemd.user.services.chlorum-portal = {
+      description = "Chlorum file chooser (Library) for apps";
+      partOf = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      enableDefaultPath = false;
+      serviceConfig = {
+        Type = "dbus";
+        BusName = "org.freedesktop.impl.portal.desktop.chlorum";
+        ExecStart = "${chlorum}/bin/chlorum portal";
+      };
+    };
+    xdg.portal.extraPortals = [ chlorum ];
+    xdg.portal.config.niri."org.freedesktop.impl.portal.FileChooser" = lib.mkForce "chlorum";
+    services.dbus.packages = [ chlorum ];
+
     systemd.user.services.chlorum-wallpaper = {
       description = "Chlorum live wallpaper";
       wantedBy = [ "graphical-session.target" ];
@@ -329,6 +359,9 @@ in
       pkgs.papirus-icon-theme
       pkgs.adwaita-icon-theme
       pkgs.xwayland-satellite
+      # apps whose access the owner limited run in a bubblewrap sandbox
+      pkgs.bubblewrap
+      pkgs.xdg-dbus-proxy
       pkgs.xdg-utils
       pkgs.wl-clipboard
       pkgs.brightnessctl

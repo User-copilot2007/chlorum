@@ -20,7 +20,95 @@ pub fn run() -> cosmic::iced::Result {
         .client_decorations(false)
         .default_icon_theme("Papirus-Dark")
         .size(iced::Size::new(1600.0, 1000.0));
-    cosmic::app::run::<Library>(settings, ())
+    cosmic::app::run::<Library>(settings, Mode::Browse)
+}
+
+/// What Library is open for.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Mode {
+    /// the person's own Library
+    #[default]
+    Browse,
+    /// an app asks for files to open
+    Open { multiple: bool, folders: bool, exts: Vec<String>, title: String },
+    /// an app asks where to save
+    Save { name: String, title: String },
+}
+
+/// What was chosen in a picker; read after the window closes.
+static PICKED: std::sync::Mutex<Option<Vec<PathBuf>>> = std::sync::Mutex::new(None);
+
+/// Library as the window apps use to open and save files: the person picks
+/// from collections, never from folders. Returns the chosen files, or None
+/// when the person backs out.
+pub fn pick(mode: Mode) -> Option<Vec<PathBuf>> {
+    let settings = Settings::default()
+        .default_font(SANS)
+        .client_decorations(false)
+        .default_icon_theme("Papirus-Dark")
+        .size(iced::Size::new(1500.0, 900.0));
+    let _ = cosmic::app::run::<Picker>(settings, mode);
+    PICKED.lock().ok().and_then(|mut p| p.take())
+}
+
+/// `chlorum pick open [--multiple] [--folders] [--ext pdf]… [--title T]`
+/// `chlorum pick save [--name N] [--title T]`: prints one path per line;
+/// exits 1 when nothing was chosen.
+pub fn pick_cli(args: &[String]) -> Result<(), String> {
+    let mut it = args.iter();
+    let what = it.next().map(String::as_str).unwrap_or("open");
+    let (mut multiple, mut folders, mut exts, mut title, mut name) = (false, false, vec![], String::new(), String::new());
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--multiple" => multiple = true,
+            "--folders" => folders = true,
+            "--ext" => exts.extend(it.next().map(|e| e.trim_start_matches('.').to_lowercase())),
+            "--title" => title = it.next().cloned().unwrap_or_default(),
+            "--name" => name = it.next().cloned().unwrap_or_default(),
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    let mode = if what == "save" { Mode::Save { name, title } } else { Mode::Open { multiple, folders, exts, title } };
+    match pick(mode) {
+        Some(paths) if !paths.is_empty() => {
+            for p in paths {
+                println!("{}", p.display());
+            }
+            Ok(())
+        }
+        _ => std::process::exit(1),
+    }
+}
+
+/// The picker is Library under its own name, so niri can float it above
+/// the app that asked.
+pub struct Picker(Library);
+
+impl Application for Picker {
+    type Executor = cosmic::executor::Default;
+    type Flags = Mode;
+    type Message = Message;
+    const APP_ID: &'static str = "chlorum-picker";
+
+    fn core(&self) -> &Core {
+        &self.0.core
+    }
+    fn core_mut(&mut self) -> &mut Core {
+        &mut self.0.core
+    }
+    fn init(core: Core, mode: Mode) -> (Self, Task<Message>) {
+        let (l, t) = Library::init(core, mode);
+        (Picker(l), t)
+    }
+    fn subscription(&self) -> Subscription<Message> {
+        self.0.subscription()
+    }
+    fn update(&mut self, m: Message) -> Task<Message> {
+        self.0.update(m)
+    }
+    fn view(&self) -> Element<'_, Message> {
+        self.0.view()
+    }
 }
 
 const COLS: usize = 4;
@@ -111,6 +199,8 @@ enum Focus {
     Ask(usize),
     NewName,
     Confirm,
+    /// picker: typing the name to save under
+    SaveName,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +209,8 @@ pub enum Message {
     Key(keyboard::Key, event::Status),
     NewName(String),
     NewSubmit,
+    SaveName(String),
+    SaveSubmit,
 }
 
 pub struct Library {
@@ -134,6 +226,12 @@ pub struct Library {
     new_name: String,
     input_id: widget::Id,
     note: Option<String>,
+    mode: Mode,
+    /// picker: files marked so far (several at once)
+    marked: Vec<PathBuf>,
+    save_name: String,
+    /// picker: Enter once more replaces a file of the same name
+    replace_armed: bool,
 }
 
 fn home() -> PathBuf {
@@ -142,8 +240,12 @@ fn home() -> PathBuf {
 fn library_dir() -> PathBuf {
     home().join("Library")
 }
+/// New files wait here for an answer: downloads, and what apps without
+/// personal files saved into their drop boxes.
 fn inbox_dirs() -> Vec<PathBuf> {
-    vec![home().join("Downloads"), home().join("Desktop")]
+    let mut v = vec![home().join("Downloads"), home().join("Desktop")];
+    v.extend(crate::sandbox::drop_boxes());
+    v
 }
 fn rules_path() -> PathBuf {
     crate::apps::config_dir().join("chlorum/library-rules")
@@ -151,7 +253,7 @@ fn rules_path() -> PathBuf {
 
 impl Application for Library {
     type Executor = cosmic::executor::Default;
-    type Flags = ();
+    type Flags = Mode;
     type Message = Message;
     const APP_ID: &'static str = "chlorum-library";
 
@@ -162,7 +264,7 @@ impl Application for Library {
         &mut self.core
     }
 
-    fn init(mut core: Core, _: ()) -> (Self, Task<Message>) {
+    fn init(mut core: Core, mode: Mode) -> (Self, Task<Message>) {
         core.window.show_headerbar = false;
         core.window.content_container = false;
         let lib = library_dir();
@@ -184,9 +286,16 @@ impl Application for Library {
             new_name: String::new(),
             input_id: widget::Id::unique(),
             note: None,
+            save_name: match &mode {
+                Mode::Save { name, .. } => name.clone(),
+                _ => String::new(),
+            },
+            mode,
+            marked: vec![],
+            replace_armed: false,
         };
         l.scan();
-        l.view = if l.inbox().is_empty() { 1 } else { 0 };
+        l.view = if l.picking() { 0 } else if l.inbox().is_empty() { 1 } else { 0 };
         (l, Task::none())
     }
 
@@ -203,10 +312,15 @@ impl Application for Library {
     fn update(&mut self, m: Message) -> Task<Message> {
         match m {
             Message::Rescan => {
-                if self.focus != Focus::NewName {
+                if !matches!(self.focus, Focus::NewName | Focus::SaveName) {
                     self.scan();
                 }
             }
+            Message::SaveName(s) => {
+                self.save_name = s;
+                self.replace_armed = false;
+            }
+            Message::SaveSubmit => return self.save_here(),
             Message::NewName(s) => self.new_name = s,
             Message::NewSubmit => return self.create_and_file(),
             Message::Key(k, status) => return self.key(k, status),
@@ -219,10 +333,15 @@ impl Application for Library {
         side = side.push(
             widget::Row::new()
                 .push(widget::icon::from_name("com.chlorum.Logo").size(56))
-                .push(text("Library", SANS_BOLD, 34.0, TEXT))
+                .push(text(self.heading(), SANS_BOLD, 34.0, TEXT))
                 .spacing(16)
                 .align_y(Alignment::Center),
         );
+        if let Mode::Open { title, .. } | Mode::Save { title, .. } = &self.mode {
+            if !title.is_empty() {
+                side = side.push(space(1.0, 8.0)).push(text(short(title, 30), SANS, 18.0, TEXT_2));
+            }
+        }
         side = side.push(space(1.0, 26.0));
         for (i, v) in self.views.iter().enumerate() {
             if matches!(v, View::Kind(Kind::Photo)) {
@@ -259,6 +378,7 @@ impl Application for Library {
             for (c, it) in chunk.iter().enumerate() {
                 let i = r * COLS + c;
                 let on = i == self.sel && matches!(self.focus, Focus::Grid | Focus::Ask(_) | Focus::NewName | Focus::Confirm);
+                let marked = self.marked.contains(&it.path);
                 let thumb = fill(
                     widget::container(fill(text(it.kind.badge(), MONO_BOLD, 24.0, BLACK), YELLOW).padding([4, 12]))
                         .width(Length::Fill)
@@ -270,7 +390,8 @@ impl Application for Library {
                 .width(Length::Fill)
                 .height(Length::Fixed(130.0));
                 let meta = format!(
-                    "{} · {}",
+                    "{}{} · {}",
+                    if marked { "■ " } else { "" },
                     it.collection.clone().unwrap_or_else(|| "NEW".into()).to_uppercase(),
                     when(it.modified)
                 );
@@ -284,7 +405,7 @@ impl Application for Library {
                                 .spacing(6)
                                 .padding([14, 16]),
                         ),
-                    if on { YELLOW } else { PANEL },
+                    if on { YELLOW } else if marked { PANEL_2 } else { PANEL },
                 )
                 .width(Length::Fixed(250.0));
                 row = row.push(bracket(card, if on && self.focus == Focus::Grid { 1.0 } else { 0.0 }, 8.0));
@@ -292,8 +413,9 @@ impl Application for Library {
             grid = grid.push(row);
         }
         if items.is_empty() {
-            let msg = match view {
-                View::Inbox => "Nothing waiting. New downloads appear here.",
+            let msg = match (&self.mode, &view) {
+                (Mode::Save { .. }, _) => "Choose where it goes, then press → to name it.",
+                (_, View::Inbox) => "Nothing waiting. New downloads appear here.",
                 _ => "Nothing here yet.",
             };
             grid = grid.push(text(msg, SANS, 22.0, TEXT_2));
@@ -305,18 +427,29 @@ impl Application for Library {
             .width(Length::Fill);
 
         let mut row = widget::Row::new().push(side).push(space(56.0, 1.0)).push(main).height(Length::Fill);
-        if let Some(panel) = self.ask_panel(&items) {
+        if let Some(panel) = self.save_panel(&view) {
+            row = row.push(space(30.0, 1.0)).push(panel);
+        } else if let Some(panel) = self.ask_panel(&items) {
             row = row.push(space(30.0, 1.0)).push(panel);
         }
 
-        let mut h: Vec<(&str, &str, bool)> = match self.focus {
-            Focus::Side => vec![("↑ ↓", "View", false), ("→", "Files", true)],
-            Focus::Grid => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("M", "Move to…", false), ("DEL", "Delete", false)],
-            Focus::Ask(_) => vec![("↑ ↓", "Choose", false), ("1–9", "Pick", false), ("ENTER", "File it", true), ("A", "Always", false), ("ESC", "Back", false)],
-            Focus::NewName => vec![("ENTER", "Create", true), ("ESC", "Back", false)],
-            Focus::Confirm => vec![("ENTER", "Delete", true), ("ESC", "Keep", false)],
+        let mut h: Vec<(&str, &str, bool)> = match (&self.mode, self.focus) {
+            (Mode::Open { folders: true, .. }, Focus::Side) => vec![("↑ ↓", "Collection", false), ("ENTER", "Choose this one", true), ("ESC", "Cancel", false)],
+            (Mode::Open { .. }, Focus::Side) => vec![("↑ ↓", "View", false), ("→", "Files", true), ("ESC", "Cancel", false)],
+            (Mode::Open { multiple: true, .. }, Focus::Grid) => vec![("← ↑ ↓ →", "Move", false), ("SPACE", "Mark", false), ("ENTER", "Open", true), ("ESC", "Back", false)],
+            (Mode::Open { .. }, Focus::Grid) => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("ESC", "Back", false)],
+            (Mode::Save { .. }, Focus::Side) => vec![("↑ ↓", "Where", false), ("→", "Name it", true), ("ESC", "Cancel", false)],
+            (Mode::Save { .. }, _) => vec![("ENTER", "Save", true), ("ESC", "Back", false)],
+            (_, Focus::SaveName) => vec![("ENTER", "Save", true), ("ESC", "Back", false)],
+            (_, Focus::Side) => vec![("↑ ↓", "View", false), ("→", "Files", true)],
+            (_, Focus::Grid) => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("M", "Move to…", false), ("DEL", "Delete", false)],
+            (_, Focus::Ask(_)) => vec![("↑ ↓", "Choose", false), ("1–9", "Pick", false), ("ENTER", "File it", true), ("A", "Always", false), ("ESC", "Back", false)],
+            (_, Focus::NewName) => vec![("ENTER", "Create", true), ("ESC", "Back", false)],
+            (_, Focus::Confirm) => vec![("ENTER", "Delete", true), ("ESC", "Keep", false)],
         };
-        h.push(("SUPER", "System menu", false));
+        if !self.picking() {
+            h.push(("SUPER", "System menu", false));
+        }
         let mut body = widget::Column::new().push(row).push(space(1.0, 18.0));
         if let Some(n) = &self.note {
             body = body.push(text(n.clone(), MONO, 16.0, YELLOW)).push(space(1.0, 10.0));
@@ -378,9 +511,18 @@ impl Library {
         let old_view = self.views.get(self.view).cloned();
         self.items = items;
         self.collections = collections.clone();
-        let mut views = vec![View::Inbox, View::Recent];
+        let mut views = match &self.mode {
+            Mode::Browse => vec![View::Inbox, View::Recent],
+            Mode::Open { folders: false, .. } => vec![View::Recent, View::Inbox],
+            _ => vec![],
+        };
         views.extend(collections.into_iter().map(View::Collection));
-        views.extend(Kind::VIEWS.iter().map(|k| View::Kind(*k)));
+        if matches!(self.mode, Mode::Browse | Mode::Open { folders: false, .. }) {
+            views.extend(Kind::VIEWS.iter().map(|k| View::Kind(*k)));
+        }
+        if views.is_empty() {
+            views.push(View::Collection(DEFAULT_COLLECTIONS[0].into()));
+        }
         self.views = views;
         if let Some(v) = old_view {
             self.view = self.views.iter().position(|x| *x == v).unwrap_or(0);
@@ -396,8 +538,17 @@ impl Library {
     }
 
     fn items_in(&self, v: &View) -> Vec<Item> {
+        if matches!(self.mode, Mode::Save { .. } | Mode::Open { folders: true, .. }) {
+            // choosing a place, not a file: show what is already there
+            return self.items.iter().filter(|i| matches!(v, View::Collection(c) if i.collection.as_deref() == Some(c))).take(40).cloned().collect();
+        }
+        let exts: &[String] = match &self.mode {
+            Mode::Open { exts, .. } => exts,
+            _ => &[],
+        };
         self.items
             .iter()
+            .filter(|i| exts.is_empty() || exts.contains(&ext_of(&i.path)))
             .filter(|i| match v {
                 View::Inbox => i.collection.is_none(),
                 View::Recent => true,
@@ -473,6 +624,7 @@ impl Library {
                 .id(self.input_id.clone())
                 .on_input(Message::NewName)
                 .on_submit(|_| Message::NewSubmit)
+                .style(field_style())
                 .size(21)
                 .padding([14, 18])
                 .into()
@@ -521,7 +673,13 @@ impl Library {
         self.note = None;
         let view = self.views.get(self.view).cloned().unwrap_or(View::Recent);
         let n = self.items_in(&view).len();
+        if self.picking() {
+            if let Some(t) = self.pick_key(named, &ch, &view, n) {
+                return t;
+            }
+        }
         match self.focus {
+            Focus::SaveName => {}
             Focus::NewName => {
                 if named == Some(Named::Escape) {
                     self.focus = Focus::Ask(0);
@@ -630,6 +788,145 @@ impl Library {
         Task::none()
     }
 
+    fn picking(&self) -> bool {
+        self.mode != Mode::Browse
+    }
+
+    fn heading(&self) -> &'static str {
+        match self.mode {
+            Mode::Browse => "Library",
+            Mode::Open { folders: true, .. } => "Choose",
+            Mode::Open { .. } => "Open",
+            Mode::Save { .. } => "Save",
+        }
+    }
+
+    /// Keys that mean something else in a picker. None: the usual meaning.
+    fn pick_key(&mut self, named: Option<keyboard::key::Named>, ch: &str, view: &View, n: usize) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        let save = matches!(self.mode, Mode::Save { .. });
+        let folders = matches!(self.mode, Mode::Open { folders: true, .. });
+        let multiple = matches!(self.mode, Mode::Open { multiple: true, .. });
+        match self.focus {
+            Focus::Side => match named {
+                Some(Named::Escape) => Some(finish(None)),
+                Some(Named::ArrowRight) | Some(Named::Enter) => {
+                    if folders {
+                        if let View::Collection(c) = view {
+                            return Some(finish(Some(vec![library_dir().join(c)])));
+                        }
+                        return Some(Task::none());
+                    }
+                    if save {
+                        if matches!(view, View::Collection(_)) {
+                            self.focus = Focus::SaveName;
+                            self.replace_armed = false;
+                            return Some(text_input::focus(self.input_id.clone()));
+                        }
+                        return Some(Task::none());
+                    }
+                    if n > 0 {
+                        self.focus = Focus::Grid;
+                    }
+                    Some(Task::none())
+                }
+                _ => None,
+            },
+            Focus::SaveName => {
+                if named == Some(Named::Escape) {
+                    self.focus = Focus::Side;
+                }
+                Some(Task::none())
+            }
+            Focus::Grid if save || folders => {
+                self.focus = Focus::Side;
+                Some(Task::none())
+            }
+            Focus::Grid => match named {
+                Some(Named::Enter) => {
+                    let mut chosen = std::mem::take(&mut self.marked);
+                    if chosen.is_empty() {
+                        chosen.extend(self.current_item().map(|i| i.path));
+                    }
+                    if chosen.is_empty() {
+                        return Some(Task::none());
+                    }
+                    Some(finish(Some(chosen)))
+                }
+                _ if multiple && ch == " " => {
+                    if let Some(it) = self.current_item() {
+                        if let Some(p) = self.marked.iter().position(|m| *m == it.path) {
+                            self.marked.remove(p);
+                        } else {
+                            self.marked.push(it.path);
+                        }
+                    }
+                    Some(Task::none())
+                }
+                // no moving or deleting from inside another app's window
+                Some(Named::Delete) => Some(Task::none()),
+                _ if ch == "m" => Some(Task::none()),
+                _ => None,
+            },
+            _ => {
+                self.focus = Focus::Side;
+                Some(Task::none())
+            }
+        }
+    }
+
+    fn save_panel(&self, view: &View) -> Option<Element<'_, Message>> {
+        if !matches!(self.mode, Mode::Save { .. }) {
+            return None;
+        }
+        let place = match view {
+            View::Collection(c) => c.clone(),
+            _ => return None,
+        };
+        let naming = self.focus == Focus::SaveName;
+        let mut col = widget::Column::new()
+            .spacing(14)
+            .width(Length::Fixed(440.0))
+            .push(text("SAVE INTO", MONO, 14.0, YELLOW))
+            .push(text(place, SANS_BOLD, 30.0, TEXT))
+            .push(space(1.0, 8.0))
+            .push(text("NAME", MONO, 14.0, TEXT_2));
+        if naming {
+            col = col.push(
+                text_input::text_input("File name", self.save_name.as_str())
+                    .id(self.input_id.clone())
+                    .on_input(Message::SaveName)
+                    .on_submit(|_| Message::SaveSubmit)
+                    .style(field_style())
+                    .size(21)
+                    .padding([14, 18]),
+            );
+        } else {
+            col = col.push(fill(text(if self.save_name.is_empty() { "—".to_string() } else { self.save_name.clone() }, SANS_BOLD, 21.0, TEXT), PANEL_2).padding([14, 18]).width(Length::Fill));
+        }
+        if self.replace_armed {
+            col = col.push(text("A file with this name is already there. ENTER again replaces it.", SANS, 17.0, RED));
+        }
+        Some(fill(col.padding(30), PANEL).into())
+    }
+
+    fn save_here(&mut self) -> Task<Message> {
+        let Some(View::Collection(c)) = self.views.get(self.view).cloned() else { return Task::none() };
+        let name = self.save_name.trim().replace('/', "-");
+        if name.is_empty() || name.starts_with('.') {
+            self.note = Some("Give it a name first.".into());
+            return Task::none();
+        }
+        let dir = library_dir().join(&c);
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(&name);
+        if path.exists() && !self.replace_armed {
+            self.replace_armed = true;
+            return Task::none();
+        }
+        finish(Some(vec![path]))
+    }
+
     fn ask_new_name(&mut self) -> Task<Message> {
         self.focus = Focus::NewName;
         self.new_name.clear();
@@ -670,6 +967,14 @@ impl Library {
         self.focus = if left == 0 { Focus::Side } else if view == View::Inbox { Focus::Ask(0) } else { Focus::Grid };
         Task::none()
     }
+}
+
+/// Close the picker with what was chosen.
+fn finish(chosen: Option<Vec<PathBuf>>) -> Task<Message> {
+    if let Ok(mut p) = PICKED.lock() {
+        *p = chosen;
+    }
+    cosmic::iced::exit()
 }
 
 fn walk(dir: &Path, depth: usize, f: &mut dyn FnMut(&Path)) {

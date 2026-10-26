@@ -152,19 +152,21 @@ enum Section {
     Network,
     Sound,
     Keyboard,
+    Apps,
     Updates,
     About,
 }
 
 impl Section {
-    const ALL: [Section; 6] =
-        [Section::Wallpaper, Section::Network, Section::Sound, Section::Keyboard, Section::Updates, Section::About];
+    const ALL: [Section; 7] =
+        [Section::Wallpaper, Section::Network, Section::Sound, Section::Keyboard, Section::Apps, Section::Updates, Section::About];
     fn label(self) -> &'static str {
         match self {
             Section::Wallpaper => "Wallpaper",
             Section::Network => "Network",
             Section::Sound => "Sound",
             Section::Keyboard => "Keyboard",
+            Section::Apps => "Apps",
             Section::Updates => "Updates",
             Section::About => "About",
         }
@@ -217,6 +219,9 @@ pub struct Shell {
     core: Core,
     layout: Layout,
     installed: HashMap<String, App>,
+    /// Center → Apps: what each app may use, and the app being looked at
+    denied: crate::sandbox::Denied,
+    perm_app: Option<String>,
     pinned: Vec<String>,
     started: bool,
 
@@ -298,6 +303,8 @@ impl Application for Shell {
             core,
             layout: Layout::default(),
             installed: apps::installed(),
+            denied: crate::sandbox::load(),
+            perm_app: None,
             pinned: apps::id_list("home-apps", apps::DEFAULT_PINNED),
             started: false,
             home: None,
@@ -812,7 +819,7 @@ impl Shell {
             return Task::none();
         }
         let ids = apps::id_list("startup", apps::DEFAULT_STARTUP);
-        let list: Vec<String> = ids.iter().filter_map(|id| self.installed.get(id)).take(2).map(|a| a.exec.clone()).collect();
+        let list: Vec<String> = ids.iter().filter_map(|id| self.installed.get(id)).take(2).map(|a| a.launch()).collect();
         self.layout.startup_left = list.len();
         Task::batch([
             // the second app a moment later, so they open in order
@@ -862,6 +869,23 @@ impl Shell {
             self.super_seq += 1;
         }
         say!("command {c} (menu {:?} closing {}, home {:?} closing {})", self.menu, self.menu_closing, self.home, self.home_closing);
+        // testing only: `chlorum msg key:ArrowDown` presses a key in the shell
+        if let Some(k) = c.strip_prefix("key:") {
+            if std::env::var_os("CHLORUM_DEBUG").is_some() {
+                use keyboard::key::Named;
+                let key = match k {
+                    "ArrowDown" => keyboard::Key::Named(Named::ArrowDown),
+                    "ArrowUp" => keyboard::Key::Named(Named::ArrowUp),
+                    "ArrowLeft" => keyboard::Key::Named(Named::ArrowLeft),
+                    "ArrowRight" => keyboard::Key::Named(Named::ArrowRight),
+                    "Enter" => keyboard::Key::Named(Named::Enter),
+                    "Escape" => keyboard::Key::Named(Named::Escape),
+                    other => keyboard::Key::Character(other.into()),
+                };
+                return self.update(Message::Key(self.surface, key, keyboard::Modifiers::empty()));
+            }
+            return Task::none();
+        }
         match c {
             "super" => {
                 self.super_seq += 1;
@@ -988,7 +1012,7 @@ impl Shell {
                 self.layout.beside_next = act == HomeAct::Beside;
                 self.toast(&format!("Opening {}…", a.name));
                 // started by niri, so apps live on even if the shell restarts
-                return Task::perform(niri::run(vec![Action::SpawnSh { command: a.exec.clone() }]), |_| {
+                return Task::perform(niri::run(vec![Action::SpawnSh { command: a.launch() }]), |_| {
                     cosmic::Action::App(Message::Tick)
                 });
             }
@@ -1113,7 +1137,14 @@ impl Shell {
             }
             return Task::none();
         };
-        let flat = matches!(section, Section::Network | Section::Keyboard);
+        let flat = matches!(section, Section::Network | Section::Keyboard) || (section == Section::Apps && self.perm_app.is_none());
+        if section == Section::Apps && named == Some(Named::Escape) {
+            if let Some(app) = self.perm_app.take() {
+                // back to the list, on the same app
+                self.row = Some(self.app_list().iter().position(|a| a.id == app).unwrap_or(0));
+                return Task::none();
+            }
+        }
         match named {
             Some(Named::Escape) => self.row = None,
             Some(Named::ArrowLeft) | Some(Named::ArrowRight) if flat => {}
@@ -1196,9 +1227,50 @@ impl Shell {
                     }
                 }
             }
+            Section::Apps => {
+                let list = self.app_list();
+                match self.perm_app.clone() {
+                    None => {
+                        if dir == 0 {
+                            if let Some(a) = list.get(row) {
+                                self.denied = crate::sandbox::load();
+                                self.perm_app = Some(a.id.clone());
+                                self.row = Some(0);
+                            }
+                        }
+                    }
+                    Some(app) => {
+                        let Some(p) = crate::sandbox::Perm::ALL.get(row).copied() else { return Task::none() };
+                        let now = crate::sandbox::allowed(&self.denied, &app, p);
+                        // ← turns off, → turns on, Enter flips
+                        let want = match dir {
+                            -1 => false,
+                            1 => true,
+                            _ => !now,
+                        };
+                        if want != now {
+                            match crate::sandbox::set(&app, p, want) {
+                                Ok(()) => {
+                                    self.denied = crate::sandbox::load();
+                                    let name = self.installed.get(&app).map(|a| a.name.clone()).unwrap_or(app);
+                                    self.toast(&format!("{} {} for {name}. It applies the next time {name} opens.", p.label(), if want { "on" } else { "off" }));
+                                }
+                                Err(e) => self.toast(&format!("Could not save: {e}")),
+                            }
+                        }
+                    }
+                }
+            }
             Section::About => {}
         }
         Task::none()
+    }
+
+    /// Apps people open, by name.
+    fn app_list(&self) -> Vec<App> {
+        let mut v: Vec<App> = self.installed.values().filter(|a| !a.id.starts_with("chlorum")).cloned().collect();
+        v.sort_by_key(|a| a.name.to_lowercase());
+        v
     }
 
     fn rows(&self, s: Section) -> usize {
@@ -1207,6 +1279,7 @@ impl Shell {
             Section::Network => 1 + self.wifi.len(),
             Section::Sound => if self.sound.present { 2 } else { 0 },
             Section::Keyboard => crate::setupd::LAYOUTS.len(),
+            Section::Apps => if self.perm_app.is_some() { crate::sandbox::Perm::ALL.len() } else { self.app_list().len() },
             Section::Updates => 1,
             Section::About => 0,
         }
@@ -1400,12 +1473,18 @@ impl Shell {
             Section::Network => self.network_view(f),
             Section::Sound => self.sound_view(f),
             Section::Keyboard => self.keyboard_view(f),
+            Section::Apps => self.apps_view(f),
             Section::Updates => self.updates_view(f),
             Section::About => self.about_view(f),
         };
-        let flat = matches!(Section::ALL[self.section], Section::Network | Section::Keyboard);
+        let sec = Section::ALL[self.section];
+        let flat = matches!(sec, Section::Network | Section::Keyboard);
         let h: &[(&str, &str, bool)] = if self.wifi_entry.is_some() {
             &[("ENTER", "Connect", true), ("ESC", "Cancel", false)]
+        } else if sec == Section::Apps && self.row.is_some() && self.perm_app.is_none() {
+            &[("↑ ↓", "App", false), ("ENTER", "What it may use", true), ("ESC", "Sections", false)]
+        } else if sec == Section::Apps && self.row.is_some() {
+            &[("↑ ↓", "Choose", false), ("← →", "Off · On", true), ("ENTER", "Switch", false), ("ESC", "Apps", false)]
         } else if self.row.is_none() {
             &[("↑ ↓", "Section", false), ("→", "Change", true), ("ESC", "Home", false)]
         } else if flat {
@@ -1515,6 +1594,59 @@ impl Shell {
             col = col.push(text(n.clone(), SANS_BOLD, 20.0, alpha(YELLOW, f)));
         }
         widget::scrollable(col).height(Length::Fill).into()
+    }
+
+    fn apps_view(&self, f: f32) -> Element<'_, Message> {
+        use crate::sandbox::{Perm, allowed};
+        let mut col = widget::Column::new().spacing(8);
+        if let Some(app) = &self.perm_app {
+            let name = self.installed.get(app).map(|a| a.name.clone()).unwrap_or_else(|| app.clone());
+            col = col
+                .push(text(name, SANS_BOLD, 34.0, alpha(TEXT, f)))
+                .push(text("What it may use. A change applies the next time it opens.", SANS, 20.0, alpha(TEXT_2, f)))
+                .push(space(1.0, 14.0));
+            for (i, p) in Perm::ALL.iter().enumerate() {
+                let on = allowed(&self.denied, app, *p);
+                let sel = self.row == Some(i);
+                let fg = if sel { BLACK } else { TEXT };
+                let state = fill(text(if on { "ON" } else { "OFF" }, MONO_BOLD, 16.0, alpha(if sel { YELLOW } else if on { BLACK } else { TEXT }, f)), alpha(if sel { BLACK } else if on { YELLOW } else { PANEL_2 }, f))
+                    .padding([6, 14]);
+                let row = fill(
+                    widget::Row::new()
+                        .push(
+                            widget::Column::new()
+                                .push(text(p.label(), SANS_BOLD, 21.0, alpha(fg, f)))
+                                .push(text(if on { "Allowed." } else { p.off_means() }, SANS, 16.0, alpha(if sel { BLACK } else { TEXT_2 }, f)))
+                                .spacing(4),
+                        )
+                        .push(hfill())
+                        .push(state)
+                        .align_y(Alignment::Center),
+                    alpha(if sel { YELLOW } else { PANEL }, f),
+                )
+                .padding([14, 22])
+                .width(Length::Fixed(900.0));
+                col = col.push(row);
+            }
+            return col.into();
+        }
+        col = col
+            .push(text("Choose an app to see what it may use: internet, camera, sound, your files.", SANS, 20.0, alpha(TEXT_2, f)))
+            .push(space(1.0, 10.0));
+        let list = self.app_list();
+        // the chosen app stays in view: show a window of the list around it
+        const SHOWN: usize = 9;
+        let sel = self.row.unwrap_or(0);
+        let start = sel.saturating_sub(SHOWN / 2).min(list.len().saturating_sub(SHOWN));
+        for (i, a) in list.iter().enumerate().skip(start).take(SHOWN) {
+            let off: Vec<&str> = Perm::ALL.iter().filter(|p| !allowed(&self.denied, &a.id, **p)).map(|p| p.key()).collect();
+            let detail = if off.is_empty() { "ALL ALLOWED".to_string() } else { format!("{} OFF", off.join(" · ").to_uppercase()) };
+            col = col.push(self.list_row(i, a.name.clone(), detail, f));
+        }
+        if list.len() > SHOWN {
+            col = col.push(text(format!("{} of {}", sel + 1, list.len()), MONO, 14.0, alpha(TEXT_2, f)));
+        }
+        col.into()
     }
 
     fn keyboard_view(&self, f: f32) -> Element<'_, Message> {

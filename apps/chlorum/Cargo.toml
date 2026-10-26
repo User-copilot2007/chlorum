@@ -1,6 +1,6 @@
 [package]
 name = "chlorum"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Chlorum shell: Home, system menu, app layouts, login screen and Library"
@@ -13,6 +13,9 @@ serde_json = "1"
 # live wallpaper: GLSL on the background layer
 smithay-client-toolkit = { version = "0.20", default-features = false, features = ["calloop"] }
 wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+libc = "0.2"
 wayland-egl = "0.32"
 khronos-egl = { version = "6", features = ["static"] }
 glow = "0.16"

@@ -15,6 +15,12 @@ pub struct App {
 }
 
 impl App {
+    /// The command line that starts this app with only what it may use
+    /// (see sandbox.rs).
+    pub fn launch(&self) -> String {
+        format!("chlorum run {} {}", quote(&self.id), quote(&self.exec))
+    }
+
     /// Does a window with this app id belong to this app?
     pub fn owns(&self, app_id: &str) -> bool {
         let a = app_id.to_ascii_lowercase();
@@ -30,6 +36,11 @@ impl App {
 pub const DEFAULT_PINNED: &[&str] = &["librewolf", "chlorum-library", "com.system76.CosmicTerm", "com.system76.CosmicEdit"];
 /// Apps opened side by side when a session starts, unless the owner chose others.
 pub const DEFAULT_STARTUP: &[&str] = &["librewolf", "com.system76.CosmicTerm"];
+
+/// One shell word, whatever it contains.
+pub fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
 
 pub fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
@@ -127,3 +138,13 @@ fn parse(id: &str, path: &Path) -> Option<App> {
     })
 }
 
+
+#[cfg(test)]
+mod launch_tests {
+    #[test]
+    fn quoting() {
+        assert_eq!(super::quote("it's"), "'it'\\''s'");
+        let out = std::process::Command::new("sh").arg("-c").arg(format!("printf %s {}", super::quote("a 'b' \"c\" $d"))).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "a 'b' \"c\" $d");
+    }
+}
