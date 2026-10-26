@@ -12,6 +12,8 @@ pub struct App {
     pub exec: String,
     /// what the window reports as its app id, when it differs from `id`
     pub wm_class: Option<String>,
+    /// what it says it wants (X-Chlorum-Permissions=network;sound;)
+    pub permissions: Option<String>,
 }
 
 impl App {
@@ -34,6 +36,8 @@ impl App {
 
 /// Apps on Home when the owner has not chosen their own list.
 pub const DEFAULT_PINNED: &[&str] = &["librewolf", "chlorum-library", "chlorum-typewriter", "com.system76.CosmicTerm"];
+/// Apps never shown on Home or in the app list.
+pub const HIDDEN: &[&str] = &["nixos-manual", "com.system76.CosmicEdit", "chlorum-shell"];
 /// Apps opened side by side when a session starts, unless the owner chose others.
 pub const DEFAULT_STARTUP: &[&str] = &["librewolf", "com.system76.CosmicTerm"];
 
@@ -93,7 +97,7 @@ pub fn installed() -> HashMap<String, App> {
 
 fn parse(id: &str, path: &Path) -> Option<App> {
     let text = std::fs::read_to_string(path).ok()?;
-    let (mut name, mut icon, mut exec, mut wm) = (None, None, None, None);
+    let (mut name, mut icon, mut exec, mut wm, mut perms) = (None, None, None, None, None);
     let mut hidden = false;
     let mut in_main = false;
     for line in text.lines() {
@@ -111,6 +115,8 @@ fn parse(id: &str, path: &Path) -> Option<App> {
             icon.get_or_insert(v.to_string());
         } else if let Some(v) = line.strip_prefix("Exec=") {
             exec.get_or_insert(v.to_string());
+        } else if let Some(v) = line.strip_prefix("X-Chlorum-Permissions=") {
+            perms.get_or_insert(v.to_string());
         } else if let Some(v) = line.strip_prefix("StartupWMClass=") {
             wm.get_or_insert(v.to_string());
         } else if line == "NoDisplay=true" || line == "Hidden=true" || line == "Terminal=true" {
@@ -135,6 +141,7 @@ fn parse(id: &str, path: &Path) -> Option<App> {
         icon: icon.unwrap_or_else(|| "application-x-executable".into()),
         exec,
         wm_class: wm,
+        permissions: perms,
     })
 }
 

@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "Chlorum Keys",
-  "version": "0.7.0",
-  "description": "Use every web page without a mouse: arrows move between buttons and links, F shows a letter on each one, Esc leaves a text box, ? shows the keys.",
+  "version": "0.10.0",
+  "description": "Use every web page without a mouse: arrows move between buttons and links, F (or Alt . anywhere) shows a letter on each one, Esc leaves a text box, ? shows the keys.",
   "browser_specific_settings": {
     "gecko": {
       "id": "keys@chlorum",
@@ -21,7 +21,7 @@
         "keys.css"
       ],
       "all_frames": true,
-      "run_at": "document_idle"
+      "run_at": "document_start"
     }
   ],
   "permissions": [

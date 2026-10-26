@@ -244,6 +244,12 @@ let
   '';
 in
 {
+  options.chlorum.package = lib.mkOption {
+    type = lib.types.package;
+    internal = true;
+    description = "The chlorum program (shell, Library, updates…), for other modules.";
+  };
+
   options.chlorum.desktop.enable = lib.mkEnableOption ''
     the Chlorum desktop: niri with the Chlorum shell (Home, system menu, one
     or two apps on screen), live wallpapers, Library, graphical boot, first
@@ -251,6 +257,7 @@ in
   '';
 
   config = lib.mkIf cfg.enable {
+    chlorum.package = chlorum;
     # ---- Boot: big logo and the atom --------------------------------------
     boot.plymouth = {
       enable = true;
@@ -452,6 +459,8 @@ in
     services.logind.settings.Login.KillUserProcesses = true;
 
     # ---- Apps ----------------------------------------------------------------
+    # no "NixOS Manual" app: Chlorum's own help lives in its apps
+    documentation.nixos.enable = false;
     environment.systemPackages = [
       chlorum
       session
@@ -459,7 +468,6 @@ in
       typewriter
       cosmicDefaults
       pkgs.cosmic-term
-      pkgs.cosmic-edit
       pkgs.papirus-icon-theme
       pkgs.adwaita-icon-theme
       pkgs.xwayland-satellite

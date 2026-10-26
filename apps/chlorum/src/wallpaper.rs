@@ -38,11 +38,16 @@ use wayland_client::{
 };
 use wayland_protocols::wp::viewporter::client::{wp_viewport::WpViewport, wp_viewporter::WpViewporter};
 
-/// The wallpaper is soft: drawn at half the screen's size and scaled up by
-/// niri, it looks the same and costs a quarter of the work.
-const RENDER_SCALE: f64 = 0.5;
-/// Frames per second: smooth enough for slow motion, half the work of 60.
-const FPS: f64 = 30.0;
+/// Drawn at the screen's full size: the shaders read their random numbers
+/// from a texture made once at start, so full quality is cheap.
+const RENDER_SCALE: f64 = 1.0;
+/// Frames per second, at most. Frames follow the screen's refresh, so a
+/// 60 Hz screen gets every refresh and a 144 Hz one an even 72.
+const FPS: f64 = 60.0;
+/// The clock goes back to 0 past this many (scaled) seconds while hidden,
+/// and in any case past `CLOCK_MAX`, so it never loses precision.
+const CLOCK_WRAP: f64 = 2048.0;
+const CLOCK_MAX: f64 = 16384.0;
 
 const COMMON: &str = include_str!("shaders/common.glsl");
 const VERTEX: &str = "attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }";
@@ -135,6 +140,19 @@ struct Gl {
     style: String,
 }
 
+/// 256 x 256 texels of four random bytes each, the same every time.
+fn random_texels() -> Vec<u8> {
+    let mut x: u32 = 0x9e37_79b9;
+    (0..256 * 256 * 4)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
 impl Gl {
     fn new(conn: &Connection) -> Gl {
         let egl = egl::Instance::new(egl::Static);
@@ -164,6 +182,23 @@ impl Gl {
             let tri: [f32; 6] = [-1.0, -1.0, 3.0, -1.0, -1.0, 3.0];
             let bytes = std::slice::from_raw_parts(tri.as_ptr() as *const u8, 24);
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+            // the random numbers, computed once: unit 0 unfiltered, unit 1 blended
+            let texels = random_texels();
+            for (unit, filter) in [(glow::TEXTURE0, glow::NEAREST), (glow::TEXTURE1, glow::LINEAR)] {
+                gl.active_texture(unit);
+                let tex = gl.create_texture().unwrap();
+                gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+                gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+                gl.tex_image_2d(
+                    glow::TEXTURE_2D, 0, glow::RGBA as i32, 256, 256, 0, glow::RGBA, glow::UNSIGNED_BYTE,
+                    glow::PixelUnpackData::Slice(Some(&texels)),
+                );
+                // no mipmaps: a mipmap filter here would leave the texture black
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::REPEAT as i32);
+            }
         }
         Gl { egl, display, config, context, gl, program: None, style: String::new() }
     }
@@ -199,6 +234,9 @@ impl Gl {
                 eprintln!("chlorum-wallpaper: {style}: {}", gl.get_program_info_log(program));
                 return;
             }
+            gl.use_program(Some(program));
+            gl.uniform_1_i32(gl.get_uniform_location(program, "rnd").as_ref(), 0);
+            gl.uniform_1_i32(gl.get_uniform_location(program, "smo").as_ref(), 1);
             self.program = Some(program);
         }
     }
@@ -226,10 +264,13 @@ struct App {
     settings: Settings,
     settings_mtime: Option<SystemTime>,
     paused: bool,
-    clock: f32,
+    clock: f64,
     last: Instant,
+    /// frames drawn and seconds spent running, for the log
+    frames: u64,
+    active: f64,
+    log_at: f64,
     viewporter: Option<WpViewporter>,
-    handle: smithay_client_toolkit::reexports::calloop::LoopHandle<'static, App>,
 }
 
 impl App {
@@ -244,10 +285,14 @@ impl App {
 
     fn draw(&mut self, id: u32, qh: &QueueHandle<Self>) {
         let now = Instant::now();
-        let dt = now.duration_since(self.last).as_secs_f32().min(0.1);
+        let dt = now.duration_since(self.last).as_secs_f64().min(0.1);
         self.last = now;
         // 0% is almost still, 100% is lively.
-        self.clock += dt * (0.08 + 1.6 * self.settings.speed);
+        self.clock += dt * (0.08 + 1.6 * self.settings.speed as f64);
+        if self.clock > CLOCK_MAX {
+            self.clock = 0.0;
+        }
+        self.frames += 1;
         let style = self.settings.style.clone();
         self.gl.use_style(&style);
         let Some(screen) = self.screens.get_mut(&id) else { return };
@@ -266,7 +311,7 @@ impl App {
             if let Some(p) = g.program {
                 gl.use_program(Some(p));
                 let s = &self.settings;
-                gl.uniform_1_f32(gl.get_uniform_location(p, "t").as_ref(), self.clock);
+                gl.uniform_1_f32(gl.get_uniform_location(p, "t").as_ref(), self.clock as f32);
                 gl.uniform_2_f32(gl.get_uniform_location(p, "res").as_ref(), w as f32, h as f32);
                 gl.uniform_1_f32(gl.get_uniform_location(p, "bright").as_ref(), s.brightness);
                 gl.uniform_1_f32(gl.get_uniform_location(p, "amount").as_ref(), s.amount);
@@ -316,26 +361,18 @@ impl CompositorHandler for App {
         if self.paused {
             return;
         }
-        let gap = 1.0 / FPS;
-        if since >= gap * 0.9 {
-            self.draw(id, qh);
+        // Too soon for the next frame: skip this refresh and wait for the
+        // next one, so frames stay in step with the screen.
+        if since < 0.75 / FPS {
+            if let Some(s) = self.screens.get_mut(&id) {
+                let wl = s.layer.wl_surface();
+                wl.frame(qh, wl.clone());
+                wl.commit();
+                s.waiting = true;
+            }
             return;
         }
-        // too soon for the next frame: draw it a little later
-        if let Some(s) = self.screens.get_mut(&id) {
-            s.waiting = true;
-        }
-        let qh = qh.clone();
-        let wait = Duration::from_secs_f64(gap - since);
-        let _ = self.handle.insert_source(Timer::from_duration(wait), move |_, _, app| {
-            if let Some(s) = app.screens.get_mut(&id) {
-                s.waiting = false;
-            }
-            if !app.paused {
-                app.draw(id, &qh);
-            }
-            TimeoutAction::Drop
-        });
+        self.draw(id, qh);
     }
     fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
@@ -453,8 +490,10 @@ pub fn run() {
         paused: false,
         clock: 0.0,
         last: Instant::now(),
+        frames: 0,
+        active: 0.0,
+        log_at: 10.0,
         viewporter: globals.bind(&qh, 1..=1, ()).ok(),
-        handle: event_loop.handle(),
     };
     app.reload();
 
@@ -465,6 +504,23 @@ pub fn run() {
         .insert_source(Timer::from_duration(Duration::from_millis(500)), move |_, _, app| {
             let was = app.paused;
             app.reload();
+            if app.paused {
+                // hidden: a good moment to restart the clock unseen
+                if app.clock > CLOCK_WRAP {
+                    app.clock = 0.0;
+                }
+            } else {
+                app.active += 0.5;
+                // how smooth it runs, in the journal: after 10 s, then every 10 min
+                if app.active >= app.log_at {
+                    let sizes: Vec<String> = app.screens.values().map(|s| format!("{}x{}", s.drawn.0, s.drawn.1)).collect();
+                    let per_screen = app.frames as f64 / app.active / app.screens.len().max(1) as f64;
+                    eprintln!("chlorum-wallpaper: {} at {:.1} fps on {}", app.settings.style, per_screen, sizes.join(", "));
+                    app.frames = 0;
+                    app.active = 0.0;
+                    app.log_at = 600.0;
+                }
+            }
             if was && !app.paused {
                 app.wake(&qh2);
             } else if !app.paused {

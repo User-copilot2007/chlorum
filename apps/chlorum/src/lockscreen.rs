@@ -11,7 +11,6 @@ use cosmic::cctk::sctk::reexports::client::protocol::wl_output::WlOutput;
 use cosmic::iced::event::wayland::{OutputEvent, SessionLockEvent};
 use cosmic::iced::platform_specific::shell::commands::session_lock;
 use cosmic::iced::{self, Alignment, Length, Subscription, event, keyboard, window};
-use cosmic::widget::text_input;
 use cosmic::{Application, Element, widget};
 use std::time::{Duration, Instant};
 
@@ -39,9 +38,9 @@ pub enum Message {
     Output(WlOutput),
     Go,
     Lock(SessionLockEvent),
-    Input(String),
     Submit,
-    Key(keyboard::Key),
+    /// a key and the text it types
+    Key(keyboard::Key, Option<String>),
     Checked(Result<(), String>),
     Quit,
 }
@@ -56,7 +55,6 @@ pub struct Lock {
     error: Option<String>,
     user: String,
     name: String,
-    input: widget::Id,
     started: Instant,
 }
 
@@ -84,7 +82,6 @@ impl Application for Lock {
             error: None,
             user: std::env::var("USER").unwrap_or_default(),
             name: crate::system::display_name(),
-            input: widget::Id::unique(),
             started: Instant::now(),
         };
         // screens are announced right after start; lock once they are known
@@ -96,7 +93,12 @@ impl Application for Lock {
         let mut s = vec![
             iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick),
             event::listen_with(|e, _, _| match e {
-                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => Some(Message::Key(key)),
+                // the lock screen reads the keys itself: no field has to be
+                // chosen first, whatever is typed is the password
+                iced::Event::Keyboard(keyboard::Event::KeyPressed { key, text, modifiers, .. }) => {
+                    let typed = text.map(|t| t.to_string()).filter(|t| !t.chars().any(char::is_control) && !modifiers.control() && !modifiers.logo());
+                    Some(Message::Key(key, typed))
+                }
                 iced::Event::PlatformSpecific(iced::event::PlatformSpecific::Wayland(w)) => match w {
                     iced::event::wayland::Event::Output(OutputEvent::Created(_), o) => Some(Message::Output(o)),
                     iced::event::wayland::Event::SessionLock(ev) => Some(Message::Lock(ev)),
@@ -146,26 +148,33 @@ impl Application for Lock {
                         self.surfaces.push(id);
                         t.push(session_lock::get_lock_surface(id, o));
                     }
-                    t.push(text_input::focus(self.input.clone()));
                     return Task::batch(t);
                 }
             }
-            Message::Lock(SessionLockEvent::Focused(..)) => return text_input::focus(self.input.clone()),
+            Message::Lock(SessionLockEvent::Focused(..)) => {}
             Message::Lock(SessionLockEvent::Finished) | Message::Lock(SessionLockEvent::NotSupported) => {
                 eprintln!("chlorum lock: the compositor refused to lock");
                 return Task::done(cosmic::Action::App(Message::Quit));
             }
             Message::Lock(SessionLockEvent::Unlocked) => return Task::done(cosmic::Action::App(Message::Quit)),
             Message::Lock(_) => {}
-            Message::Input(v) => {
-                if !self.busy {
-                    self.password = v;
-                    self.error = None;
+            Message::Key(k, typed) => {
+                use keyboard::key::Named;
+                if self.busy {
+                    return Task::none();
                 }
-            }
-            Message::Key(k) => {
-                if !self.busy && matches!(k.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)) {
-                    self.password.clear();
+                match k.as_ref() {
+                    keyboard::Key::Named(Named::Enter) => return self.update(Message::Submit),
+                    keyboard::Key::Named(Named::Escape) => self.password.clear(),
+                    keyboard::Key::Named(Named::Backspace) => {
+                        self.password.pop();
+                    }
+                    _ => {
+                        if let Some(t) = typed {
+                            self.password.push_str(&t);
+                            self.error = None;
+                        }
+                    }
                 }
             }
             Message::Submit => {
@@ -195,7 +204,6 @@ impl Application for Lock {
                 self.busy = false;
                 self.password.clear();
                 self.error = Some(e);
-                return text_input::focus(self.input.clone());
             }
             Message::Quit => {
                 let _ = std::fs::remove_file(crate::apps::runtime_dir().join("locked"));
@@ -228,16 +236,14 @@ impl Application for Lock {
             if self.busy {
                 col = col.push(Atom::view(90.0, self.started));
             } else {
-                let input = text_input::text_input("Password", self.password.as_str())
-                    .id(self.input.clone())
-                    .password()
-                    .style(field_style())
-                    .size(30)
-                    .padding([20, 24])
-                    .width(Length::Fixed(560.0))
-                    .on_input(Message::Input)
-                    .on_submit(|_| Message::Submit);
-                col = col.push(bracket(input, 1.0, 10.0));
+                // dots for what is typed, a bar where the next letter goes
+                let shown = if self.password.is_empty() {
+                    text("Type your password", SANS, 26.0, MUTED)
+                } else {
+                    text(format!("{}▏", "•".repeat(self.password.chars().count().min(40))), MONO_BOLD, 30.0, TEXT)
+                };
+                let field = fill(shown, cosmic::iced::Color::from_rgb(0.05, 0.05, 0.05)).padding([20, 24]).width(Length::Fixed(560.0));
+                col = col.push(bracket(field, 1.0, 10.0));
             }
             if let Some(e) = &self.error {
                 col = col.push(text(e.clone(), SANS_BOLD, 21.0, RED));

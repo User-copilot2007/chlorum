@@ -2367,8 +2367,24 @@ static int inside(float x, float y, float w, float h) { return M.x >= x && M.x <
 
 static int ic_on; /* обмеження області, де віджети реагують на мишку (прокручуваний вміст) */
 static float ic_x, ic_y, ic_w, ic_h;
+/* The panel from the keyboard: while it has the focus, every control it
+   draws gets a number; the chosen one is outlined and Enter presses it. */
+static int kb_on, kb_count, kb_total, kb_sel, kb_fire, kb_has, kb_body;
+static float kb_rx, kb_ry, kb_rw, kb_rh;
 static int interact(int id, float x, float y, float w, float h, int *hov) {
   int in = layer == top_layer && inside(x, y, w, h) && (!ic_on || inside(ic_x, ic_y, ic_w, ic_h));
+  if (kb_on) {
+    int i = kb_count++;
+    if (i == kb_sel) {
+      kb_has = 1; kb_body = ic_on;
+      kb_rx = x; kb_ry = y; kb_rw = w; kb_rh = h;
+      if (kb_fire) { kb_fire = 0; if (hov) *hov = 1; return 1; }
+      /* the mouse still works on it */
+      if (hov) *hov = 1;
+      if (in && M.pressed) active_id = id;
+      return in && M.released && active_id == id;
+    }
+  }
   if (hov) *hov = in;
   if (in && M.pressed) active_id = id;
   return in && M.released && active_id == id;
@@ -3832,7 +3848,7 @@ static void tree_rebuild(void) {
   tree_t = SDL_GetTicks();
 }
 
-enum { F_EDIT, F_FILES, F_TERM };
+enum { F_EDIT, F_FILES, F_TERM, F_PANEL };
 static int focus = F_EDIT;
 
 /* Тека вище: дерево показує батьківську теку, попередня лишається розгорнутою. */
@@ -5482,7 +5498,9 @@ static float panel_body(float x, float y0, float w) {
 
   /* КЛАВІШІ */
   SEC(SEC_KEYS, "KEYS");
-  hint("Click a shortcut and press a new one. Backspace clears, Esc cancels. Red: already taken.", x, w, &yy);
+  hint("Without a mouse: F6 goes to the next area (files, page, this panel, terminal), Shift+F6 back; Alt+1 to Alt+4 go straight to one; from the terminal, Ctrl+F6 comes back. In this panel, arrows choose and Enter presses; Esc goes back to the page. F1 opens this list.", x, w, &yy);
+  yy += 4 * fu;
+  hint("Choose a shortcut (click, or Enter here) and press a new one. Backspace clears, Esc cancels. Red: already taken.", x, w, &yy);
   yy += 4 * fu;
   static const char *grp[] = {"Everywhere", "Text", "File tree"};
   float sw = (w - 8 * fu) / 3;
@@ -5523,6 +5541,8 @@ static void draw_panel(void) {
   if (ffocus != &P.author && strcmp(P.author.s, S.author)) field_set(&P.author, S.author);
   if (ffocus != &P.tz && strcmp(P.tz.s, S.tzcustom)) field_set(&P.tz, S.tzcustom);
   /* верх */
+  kb_count = 0; kb_has = 0;
+  kb_on = focus == F_PANEL && !ffocus && P.cap_a < 0;
   float th = panel_top(x + pad, 12 * fu, iw);
   P.top_h = th + 12 * fu;
   fill_rect(x + hair(), P.top_h, w - hair(), hair(), C_LINE, 255);
@@ -5535,6 +5555,24 @@ static void draw_panel(void) {
   ic_on = 1; ic_x = x + hair(); ic_y = by; ic_w = w - hair(); ic_h = bh_;
   float total = panel_body(x + pad, (float)(by + 10 * fu - P.scroll), iw) + 10 * fu;
   ic_on = 0;
+  if (kb_on) {
+    kb_on = 0;
+    kb_total = kb_count;
+    if (kb_sel >= kb_total) kb_sel = kb_total ? kb_total - 1 : 0;
+    kb_fire = 0;
+    if (kb_has) {
+      /* the chosen control: a yellow outline, kept in view */
+      float t = 2 * fu, ox = kb_rx - 3 * fu, oy = kb_ry - 3 * fu, ow2 = kb_rw + 6 * fu, oh2 = kb_rh + 6 * fu;
+      if (!kb_body) SDL_RenderSetClipRect(R, NULL);
+      fill_rect(ox, oy, ow2, t, C_ACC, 255);
+      fill_rect(ox, oy + oh2 - t, ow2, t, C_ACC, 255);
+      fill_rect(ox, oy, t, oh2, C_ACC, 255);
+      fill_rect(ox + ow2 - t, oy, t, oh2, C_ACC, 255);
+      if (kb_body && kb_ry < by + 8 * fu) P.want = P.scroll - (by + 8 * fu - kb_ry);
+      else if (kb_body && kb_ry + kb_rh > st_y - 8 * fu) P.want = P.scroll + (kb_ry + kb_rh - (st_y - 8 * fu));
+      if (P.want < 0 && P.want != -1) P.want = 0;
+    }
+  }
   SDL_RenderSetClipRect(R, NULL);
   double maxs = total - bh_;
   if (maxs < 0) maxs = 0;
@@ -5556,6 +5594,70 @@ static void draw_panel(void) {
   }
 }
 
+/* Moving between the four areas from the keyboard:
+   F6 / Shift+F6 go round files → page → panel → terminal; Alt+1..4 go
+   straight to one; F1 shows the keys. */
+static void go_area(int a) {
+  static const char *say[] = {
+      [F_FILES] = "Files · ↑ ↓ choose · Enter open · F6 next area",
+      [F_EDIT] = "Page · type here · F6 next area",
+      [F_PANEL] = "Panel · ↑ ↓ choose · Enter press · Esc back to the page",
+      [F_TERM] = "Terminal · Ctrl+F6 or Ctrl+` back to the page",
+  };
+  ffocus = NULL;
+  P.cap_a = -1;
+  focus = a;
+  if (a == F_FILES && tree_sel < 0 && nnodes) tree_sel = 0;
+  set_toast(say[a]);
+}
+
+static int area_key(SDL_Keysym ks) {
+  int m = mods_of(ks.mod);
+  if (P.cap_a >= 0) return 0; /* a key is being chosen for an action */
+  static const int order[] = {F_FILES, F_EDIT, F_PANEL, F_TERM};
+  /* programs in the terminal use F1, F6 and Alt+digits themselves: from
+     there, Ctrl+` (or Ctrl+F6) goes back to the page */
+  if (focus == F_TERM) {
+    if (ks.sym == SDLK_F6 && m == MD_CTRL) { go_area(F_EDIT); return 1; }
+    return 0;
+  }
+  if (ks.sym == SDLK_F6 && (m == 0 || m == MD_SHIFT || m == MD_CTRL)) {
+    int i = 0;
+    for (int k = 0; k < 4; k++) if (order[k] == focus) i = k;
+    go_area(order[(i + (m == MD_SHIFT ? 3 : 1)) % 4]);
+    return 1;
+  }
+  if (m == MD_ALT && ks.scancode >= SDL_SCANCODE_1 && ks.scancode <= SDL_SCANCODE_4) {
+    go_area(order[ks.scancode - SDL_SCANCODE_1]);
+    return 1;
+  }
+  if (ks.sym == SDLK_F1 && m == 0) {
+    go_area(F_PANEL);
+    panel_goto(SEC_KEYS);
+    set_toast("Keys · every action and its key · F6 next area");
+    return 1;
+  }
+  return 0;
+}
+
+/* Keys while the panel has the focus and no field in it does. */
+static void panel_nav(SDL_Keysym ks) {
+  int m = mods_of(ks.mod);
+  if (m & (MD_CTRL | MD_SUPER)) { global_key(ks); return; }
+  switch (ks.sym) {
+    case SDLK_UP: case SDLK_LEFT: if (kb_sel > 0) kb_sel--; break;
+    case SDLK_DOWN: case SDLK_RIGHT: if (kb_sel < kb_total - 1) kb_sel++; break;
+    case SDLK_TAB: if (m == MD_SHIFT) { if (kb_sel > 0) kb_sel--; } else if (kb_sel < kb_total - 1) kb_sel++; break;
+    case SDLK_PAGEUP: kb_sel = kb_sel > 8 ? kb_sel - 8 : 0; break;
+    case SDLK_PAGEDOWN: kb_sel = kb_sel + 8 < kb_total ? kb_sel + 8 : (kb_total ? kb_total - 1 : 0); break;
+    case SDLK_HOME: kb_sel = 0; break;
+    case SDLK_END: kb_sel = kb_total ? kb_total - 1 : 0; break;
+    case SDLK_RETURN: case SDLK_KP_ENTER: case SDLK_SPACE: kb_fire = 1; break;
+    case SDLK_ESCAPE: focus = F_EDIT; break;
+    default: global_key(ks); break;
+  }
+}
+
 /* Клавіші, коли фокус у полі панелі або йде перепризначення комбінації. */
 static int panel_key(SDL_Keysym ks) {
   if (P.cap_a >= 0) {
@@ -5574,7 +5676,8 @@ static int panel_key(SDL_Keysym ks) {
   if (ks.sym == SDLK_ESCAPE) {
     if (ffocus == &P.name) P.name_doc = NULL; /* повернути справжню назву */
     if (ffocus == &F.q || ffocus == &F.r) F.open = 0;
-    ffocus = NULL; focus = F_EDIT;
+    ffocus = NULL;
+    if (focus != F_PANEL) focus = F_EDIT;
     return 1;
   }
   if (ks.sym == SDLK_RETURN || ks.sym == SDLK_KP_ENTER) {
@@ -5582,7 +5685,7 @@ static int panel_key(SDL_Keysym ks) {
     else if (ffocus == &F.q) { if (D) find_step(shift ? -1 : 1); }
     else if (ffocus == &F.r) { if (D) { if (cmd) replace_all(); else replace_one(); } }
     else if (ffocus == &P.trows || ffocus == &P.tcols) { if (D) { focus = F_EDIT; ffocus = NULL; tbl_insert_new(atoi(P.trows.s) > 0 ? atoi(P.trows.s) : 3, atoi(P.tcols.s) > 0 ? atoi(P.tcols.s) : 3); } }
-    else { ffocus = NULL; focus = F_EDIT; }
+    else { ffocus = NULL; if (focus != F_PANEL) focus = F_EDIT; }
     return 1;
   }
   if (ks.sym == SDLK_TAB && (ffocus == &F.q || ffocus == &F.r)) { ffocus = ffocus == &F.q ? &F.r : &F.q; return 1; }
@@ -5705,7 +5808,9 @@ static void handle_event(SDL_Event *e) {
       SDL_Keysym ks = e->key.keysym;
       if (font_missing) { if (ks.sym == SDLK_ESCAPE || hit(A_QUIT, ks)) running = 0; break; }
       if (hit(A_TERM, ks)) { focus = focus == F_TERM ? F_EDIT : F_TERM; ffocus = NULL; break; }
+      if (area_key(ks)) break;
       if (panel_key(ks)) break;
+      if (focus == F_PANEL) { panel_nav(ks); break; }
       if (focus == F_TERM) term_key(ks);
       else if (focus == F_FILES) files_key(ks);
       else doc_key(ks);

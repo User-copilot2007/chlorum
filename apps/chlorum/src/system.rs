@@ -159,10 +159,14 @@ pub async fn network() -> String {
 pub enum Update {
     Idle,
     Checking,
-    UpToDate,
-    Available,
-    Installing,
-    Installed,
+    /// the version installed now
+    UpToDate(String),
+    /// the version that will be installed
+    Available(String),
+    /// how far it is (None until the first numbers come)
+    Installing(Option<crate::progress::Progress>),
+    /// the version that starts after the next restart
+    Installed(String),
     Failed(String),
 }
 
@@ -171,29 +175,63 @@ impl Update {
         match self {
             Update::Idle => "Not checked yet".into(),
             Update::Checking => "Checking…".into(),
-            Update::UpToDate => "Chlorum is up to date".into(),
-            Update::Available => "A new version is ready to install".into(),
-            Update::Installing => "Installing in the background. Keep working.".into(),
-            Update::Installed => "Installed. It starts after the next restart.".into(),
+            Update::UpToDate(v) if v.is_empty() => "Chlorum is up to date".into(),
+            Update::UpToDate(v) => format!("Chlorum is up to date ({v})"),
+            Update::Available(v) if v.is_empty() => "A new version is ready to install".into(),
+            Update::Available(v) => format!("Chlorum {v} is ready to install"),
+            Update::Installing(None) => "Starting the update…".into(),
+            Update::Installing(Some(p)) => {
+                let v = if p.version.is_empty() { String::new() } else { format!(" {}", p.version) };
+                match p.phase.as_str() {
+                    "checking" => "Looking for the new version…".into(),
+                    "building" => format!("Preparing Chlorum{v} · {}%", p.percent()),
+                    "installing" => format!("Installing Chlorum{v}…"),
+                    _ => format!("Downloading Chlorum{v} · {}%", p.percent()),
+                }
+            }
+            Update::Installed(v) if v.is_empty() => "Installed. It starts after the next restart.".into(),
+            Update::Installed(v) => format!("Chlorum {v} is installed. It starts after the next restart."),
             Update::Failed(e) => format!("Did not work: {e}"),
+        }
+    }
+
+    /// 0..1 for the line, while installing
+    pub fn fraction(&self) -> Option<f32> {
+        match self {
+            Update::Installing(Some(p)) if p.phase == "installing" => Some(1.0),
+            Update::Installing(Some(p)) => Some(p.percent() as f32 / 100.0),
+            Update::Installing(None) => Some(0.0),
+            _ => None,
         }
     }
 }
 
 pub async fn check_update() -> Update {
     match output("chlorum-update", &["check"]).await {
-        Ok(s) if s.trim() == "available" => Update::Available,
-        Ok(s) if s.trim() == "up-to-date" => Update::UpToDate,
-        Ok(s) => Update::Failed(if s.trim().is_empty() { "no answer".into() } else { s.trim().into() }),
+        Ok(s) => {
+            let s = s.trim();
+            let (state, version) = s.split_once(' ').unwrap_or((s, ""));
+            match state {
+                "available" => Update::Available(version.to_string()),
+                "up-to-date" => Update::UpToDate(version.to_string()),
+                _ => Update::Failed(if s.is_empty() { "no answer".into() } else { s.into() }),
+            }
+        }
         Err(e) => Update::Failed(e),
     }
 }
 
+/// Starts the install in the background; the progress file tells the rest.
 pub async fn install_update() -> Update {
     match output("chlorum-update", &["apply"]).await {
-        Ok(_) => Update::Installed,
+        Ok(_) => Update::Installing(None),
         Err(e) => Update::Failed(e),
     }
+}
+
+/// What an update (started here or by the daily timer) is doing.
+pub fn update_progress() -> Option<crate::progress::Progress> {
+    crate::progress::read(&std::path::PathBuf::from("/run/chlorum-update/update.json"))
 }
 
 // ---------------------------------------------------------------- power

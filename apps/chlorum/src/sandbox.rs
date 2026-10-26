@@ -1,26 +1,40 @@
 //! What each app may use. Every app starts through `chlorum run`, which
 //! reads the owner's choices and, when something is off, starts the app in
-//! a bubblewrap sandbox that leaves it out:
+//! a bubblewrap sandbox that leaves it out.
+//!
+//! Nothing is allowed until the owner says so. The first time an app
+//! starts, a window like a phone's asks about each thing it wants (see
+//! `needs` and ask.rs): Allow or Don't allow. What it did not ask for stays
+//! off; Center → Apps changes any of it later. Programs made in Workshop
+//! follow the same rules when they run (`work run`, `work test`).
 //!
 //!   network   its own empty network: no internet, no local network
 //!   camera    the camera devices are not there (its own /dev)
 //!   sound     no speakers and no microphone (no PipeWire, no ALSA)
-//!   files     no personal files: Library, Downloads and the like are
-//!             replaced by the app's own drop box, which Library shows under
-//!             "Needs an answer". Files chosen for it in the picker are
-//!             copied into that box.
+//!   files     a home folder of its own instead of yours (kept between
+//!             starts; your files, settings and other apps' data are not in
+//!             it, only themes and fonts, read-only). Its Library and
+//!             Downloads are its drop box, which Library shows under "Needs
+//!             an answer". Files chosen for it in the picker are copied into
+//!             that box; a file opened with it from Library is let in, that
+//!             file alone, under /tmp/chlorum-open (`--grant`).
 //!
-//! Any sandboxed app also gets: its own process list, no compositor control
-//! socket, a session bus that only reaches the portals, a Wayland socket
-//! with a security context (niri keeps typing-for-others, screen capture and
-//! overlays away from it), and read-only login and Chlorum settings.
+//! Any sandboxed app also gets: its own process list; an empty runtime
+//! folder ($XDG_RUNTIME_DIR) with only a Wayland socket with a security
+//! context (niri keeps typing-for-others, screen capture and overlays away
+//! from it), a session bus that only reaches the portals, and PipeWire when
+//! it may use sound (so no compositor control, no systemd, no keyboard
+//! mouse, no ssh or gpg agent); and read-only login and Chlorum settings.
 //!
-//! Known gaps: apps opened by other apps (a link, a file type) start
-//! without the sandbox; with only the camera off, a camera shared through
-//! PipeWire is still reachable; X11 apps share one X server.
+//! Known gaps: an app started by an app that may do everything (from a
+//! terminal, say) may do everything too; with only the camera off, a camera
+//! shared through PipeWire is still reachable; X11 apps share one X server;
+//! the Nix daemon is reachable, and it can download for a build even when
+//! the app itself has no network.
 //!
-//! The choices live in ~/.config/chlorum/permissions, one app per line:
-//!   librewolf camera=off sound=off
+//! The choices live in ~/.config/chlorum/permissions, one app per line;
+//! what is not written there has not been asked yet, and is off:
+//!   librewolf network=on sound=on camera=off
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -63,24 +77,55 @@ impl Perm {
         }
     }
 
-    fn from_key(k: &str) -> Option<Perm> {
+    /// The question in the window that asks, for an app called `name`.
+    pub fn question(self, name: &str) -> String {
+        match self {
+            Perm::Network => format!("Allow {name} to use the internet and your network?"),
+            Perm::Camera => format!("Allow {name} to use the camera?"),
+            Perm::Sound => format!("Allow {name} to play sound and use the microphone?"),
+            Perm::Files => format!("Allow {name} to see your personal files?"),
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<Perm> {
         Perm::ALL.into_iter().find(|p| p.key() == k)
     }
 }
 
-/// Everything off that the owner turned off; missing means on.
-pub type Denied = HashMap<String, Vec<Perm>>;
+/// The owner's answers: app → (permission → allowed). Not there: not
+/// asked yet, which counts as not allowed.
+pub type Choices = HashMap<String, HashMap<Perm, bool>>;
+
+/// Apps that are part of the system itself and start as they are: the
+/// Library is where files are chosen, so it has to see them; Terminal and
+/// Typewriter (with its terminal) are where the system is looked after and
+/// programs are made, and they start other apps, which then ask for
+/// themselves.
+pub const SYSTEM: &[&str] = &["chlorum-library", "com.system76.CosmicTerm", "chlorum-typewriter"];
+
+/// What an app asks for the first time it starts. Apps may say it in their
+/// .desktop entry (`X-Chlorum-Permissions=network;sound;`); for the ones
+/// Chlorum ships it is known; anything else asks about everything.
+pub fn needs(app: &str, declared: Option<&str>) -> Vec<Perm> {
+    if let Some(d) = declared {
+        return d.split([';', ',', ' ']).filter_map(|k| Perm::from_key(k.trim())).collect();
+    }
+    match app {
+        "librewolf" | "firefox" | "chromium" => vec![Perm::Network, Perm::Sound, Perm::Camera],
+        _ => Perm::ALL.to_vec(),
+    }
+}
 
 fn store() -> PathBuf {
     crate::apps::config_dir().join("chlorum/permissions")
 }
 
-pub fn load() -> Denied {
+pub fn load() -> Choices {
     parse(&std::fs::read_to_string(store()).unwrap_or_default())
 }
 
-fn parse(s: &str) -> Denied {
-    let mut out = Denied::new();
+fn parse(s: &str) -> Choices {
+    let mut out = Choices::new();
     for line in s.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -88,31 +133,30 @@ fn parse(s: &str) -> Denied {
         }
         let mut parts = line.split_whitespace();
         let Some(app) = parts.next() else { continue };
-        let off: Vec<Perm> = parts
+        let set: HashMap<Perm, bool> = parts
             .filter_map(|kv| kv.split_once('='))
-            .filter(|(_, v)| *v == "off")
-            .filter_map(|(k, _)| Perm::from_key(k))
+            .filter_map(|(k, v)| Some((Perm::from_key(k)?, match v { "on" => true, "off" => false, _ => return None })))
             .collect();
-        if !off.is_empty() {
-            out.insert(app.to_string(), off);
+        if !set.is_empty() {
+            out.entry(app.to_string()).or_default().extend(set);
         }
     }
     out
 }
 
-fn render(d: &Denied) -> String {
-    let mut apps: Vec<&String> = d.keys().collect();
+fn render(c: &Choices) -> String {
+    let mut apps: Vec<&String> = c.keys().collect();
     apps.sort();
-    let mut s = String::from("# What apps may use. Changed in Center → Apps.\n");
+    let mut s = String::from("# What apps may use: on, off; not written = not asked yet (off). Changed in Center → Apps.\n");
     for a in apps {
-        let off = &d[a];
-        if off.is_empty() {
+        let set = &c[a];
+        if set.is_empty() {
             continue;
         }
         s.push_str(a);
         for p in Perm::ALL {
-            if off.contains(&p) {
-                s.push_str(&format!(" {}=off", p.key()));
+            if let Some(on) = set.get(&p) {
+                s.push_str(&format!(" {}={}", p.key(), if *on { "on" } else { "off" }));
             }
         }
         s.push('\n');
@@ -120,23 +164,31 @@ fn render(d: &Denied) -> String {
     s
 }
 
-pub fn allowed(d: &Denied, app: &str, p: Perm) -> bool {
-    !d.get(app).is_some_and(|v| v.contains(&p))
+pub fn allowed(c: &Choices, app: &str, p: Perm) -> bool {
+    SYSTEM.contains(&app) || c.get(app).and_then(|m| m.get(&p)).copied().unwrap_or(false)
+}
+
+/// Has the owner answered about this one?
+pub fn answered(c: &Choices, app: &str, p: Perm) -> bool {
+    c.get(app).is_some_and(|m| m.contains_key(&p))
 }
 
 pub fn set(app: &str, p: Perm, on: bool) -> std::io::Result<()> {
-    let mut d = load();
-    let v = d.entry(app.to_string()).or_default();
-    v.retain(|x| *x != p);
-    if !on {
-        v.push(p);
+    set_many(app, &[(p, on)])
+}
+
+pub fn set_many(app: &str, answers: &[(Perm, bool)]) -> std::io::Result<()> {
+    let mut c = load();
+    let m = c.entry(app.to_string()).or_default();
+    for (p, on) in answers {
+        m.insert(*p, *on);
     }
     let path = store();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("new");
-    std::fs::write(&tmp, render(&d))?;
+    std::fs::write(&tmp, render(&c))?;
     std::fs::rename(tmp, path)
 }
 
@@ -156,37 +208,70 @@ pub fn drop_boxes() -> Vec<PathBuf> {
     std::fs::read_dir(root).map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect()).unwrap_or_default()
 }
 
-/// Folders with personal files that an app without "files" does not see.
-const PERSONAL: &[&str] = &[
-    "Library",
-    "Downloads",
-    "Desktop",
-    "Documents",
-    "Pictures",
-    "Music",
-    "Videos",
-    "Templates",
-    "Public",
-    ".ssh",
-    ".gnupg",
+fn data_home(home: &Path) -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share"))
+}
+
+/// The home folder an app without "files" gets instead of yours: its own,
+/// kept between starts. Your files, your other apps' data and your
+/// settings are not in it.
+pub fn private_home(app: &str) -> PathBuf {
+    data_home(&home()).join("chlorum/homes").join(app.replace('/', "_"))
+}
+
+/// Read-only from your home into a private one, so apps still look right:
+/// themes, fonts, cursor.
+const LOOKS: &[&str] = &[
+    ".config/cosmic",
+    ".config/gtk-3.0",
+    ".config/gtk-4.0",
+    ".config/fontconfig",
+    ".local/share/fonts",
+    ".icons",
+    ".fonts",
 ];
-/// The same, under the data folder (~/.local/share).
-const PERSONAL_DATA: &[&str] = &[
-    "keyrings",
-    "Trash",
-    // every app's drop box: its own is bound back in below
-    "chlorum",
-];
+
+/// An app's own data, kept where it always was even when it may not see
+/// your files: the browser keeps its profile (bookmarks, sign-ins).
+fn own_dirs(app: &str) -> &'static [&'static str] {
+    match app {
+        "librewolf" => &[".librewolf", ".cache/librewolf"],
+        "firefox" => &[".mozilla", ".cache/mozilla"],
+        _ => &[],
+    }
+}
 
 /// What starts things at login or decides what apps may do: a sandboxed
 /// app must not be able to change it (and so let itself out next time).
 fn protected(home: &Path) -> Vec<PathBuf> {
     let config = crate::apps::config_dir();
-    let data = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share"));
+    let data = data_home(home);
     let mut v: Vec<PathBuf> = ["chlorum", "niri", "systemd", "autostart", "environment.d"].iter().map(|d| config.join(d)).collect();
     v.push(data.join("applications"));
+    v.push(data.join("systemd"));
     v.extend([".local/bin", ".bashrc", ".bash_profile", ".profile"].iter().map(|f| home.join(f)));
     v
+}
+
+/// Makes every protected place exist, so that it can be made read-only: a
+/// missing one could otherwise be created by the app.
+pub fn ensure_protected(home: &Path) {
+    for p in protected(home) {
+        if p.exists() {
+            continue;
+        }
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let body = match name.as_str() {
+            // the same as having none: bash then reads ~/.profile
+            ".bash_profile" => Some("# Made by Chlorum so that apps cannot add one. Same as having none.\n[ -f ~/.profile ] && . ~/.profile\n"),
+            ".bashrc" | ".profile" => Some(""),
+            _ => None,
+        };
+        let _ = match body {
+            Some(b) => std::fs::write(&p, b),
+            None => std::fs::create_dir_all(&p),
+        };
+    }
 }
 
 /// /dev entries bubblewrap makes itself with --dev.
@@ -209,29 +294,48 @@ pub struct Dev {
     pub link: bool,
 }
 
-/// The bubblewrap arguments for an app with `off` turned off.
-pub fn bwrap_args(app: &str, off: &[Perm], runtime: &Path, home: &Path, devices: &[Dev], outside: &Outside) -> Vec<String> {
+/// Where a file opened with an app that may not see your files is shown
+/// to it: in its own /tmp, so nothing is left behind anywhere.
+pub fn grant_place(i: usize, src: &Path) -> PathBuf {
+    let name = src.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
+    PathBuf::from(format!("/tmp/chlorum-open/{i}/{name}"))
+}
+
+/// The bubblewrap arguments for an app with `off` turned off. `grants` are
+/// (file, where the app sees it).
+pub fn bwrap_args(app: &str, off: &[Perm], runtime: &Path, home: &Path, devices: &[Dev], outside: &Outside, grants: &[(PathBuf, PathBuf)]) -> Vec<String> {
     let s = |p: &Path| p.to_string_lossy().to_string();
     let mut a: Vec<String> = vec!["--dev-bind".into(), "/".into(), "/".into()];
     // its own process list: it cannot reach other processes or their files
     // through /proc
     a.extend(["--unshare-pid", "--proc", "/proc", "--new-session"].map(String::from));
+    a.extend(["--setenv", "CHLORUM_SANDBOXED", "1", "--unsetenv", "NIRI_SOCKET"].map(String::from));
+    let no_sound = off.contains(&Perm::Sound);
 
-    // the compositor's control socket would let it start anything outside
-    a.extend(["--unsetenv".into(), "NIRI_SOCKET".into()]);
-    if let Some(n) = std::env::var_os("NIRI_SOCKET").filter(|n| Path::new(n).exists()) {
-        a.extend(["--ro-bind".into(), "/dev/null".into(), n.to_string_lossy().to_string()]);
-    }
-    // the session bus would let it start anything too: only the filtered one
-    let bus = runtime.join("bus");
-    match &outside.bus {
-        Some(p) => a.extend(["--ro-bind".into(), s(p), s(&bus)]),
-        None if bus.exists() => a.extend(["--ro-bind".into(), "/dev/null".into(), s(&bus)]),
-        None => {}
-    }
-    if let Some(w) = &outside.wayland {
+    // The session's runtime folder holds the keys to everything (the
+    // compositor, the session bus, systemd, the keyboard mouse, ssh and gpg
+    // agents): an empty one, with back only what it may use.
+    if !runtime.as_os_str().is_empty() && runtime.is_dir() {
+        a.extend(["--perms".into(), "0700".into(), "--tmpfs".into(), s(runtime)]);
         let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".into());
-        a.extend(["--ro-bind".into(), s(w), s(&runtime.join(display))]);
+        let wl = runtime.join(&display);
+        match &outside.wayland {
+            Some(w) => a.extend(["--ro-bind".into(), s(w), s(&wl)]),
+            // no sandboxed socket (an old compositor): the normal one
+            None if wl.exists() => a.extend(["--ro-bind".into(), s(&wl), s(&wl)]),
+            None => {}
+        }
+        if let Some(p) = &outside.bus {
+            a.extend(["--ro-bind".into(), s(p), s(&runtime.join("bus"))]);
+        }
+        if !no_sound {
+            for name in ["pipewire-0", "pulse"] {
+                let p = runtime.join(name);
+                if p.exists() {
+                    a.extend(["--ro-bind".into(), s(&p), s(&p)]);
+                }
+            }
+        }
     }
     for p in protected(home) {
         if p.exists() {
@@ -243,7 +347,6 @@ pub fn bwrap_args(app: &str, off: &[Perm], runtime: &Path, home: &Path, devices:
         a.push("--unshare-net".into());
     }
     let no_camera = off.contains(&Perm::Camera);
-    let no_sound = off.contains(&Perm::Sound);
     if no_camera || no_sound {
         // a /dev of its own with only what it may use: a camera plugged in
         // later does not appear either
@@ -258,28 +361,8 @@ pub fn bwrap_args(app: &str, off: &[Perm], runtime: &Path, home: &Path, devices:
             a.extend(["--dev-bind".into(), s(&d.path), s(&d.path)]);
         }
     }
-    if no_sound {
-        for name in ["pipewire-0", "pipewire-0-manager", "pulse"] {
-            let p = runtime.join(name);
-            if p.is_dir() {
-                a.extend(["--tmpfs".into(), s(&p)]);
-            } else if p.exists() {
-                a.extend(["--ro-bind".into(), "/dev/null".into(), s(&p)]);
-            }
-        }
-    }
     if off.contains(&Perm::Files) {
-        let data = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local/share"));
-        for p in PERSONAL.iter().map(|n| home.join(n)).chain(PERSONAL_DATA.iter().map(|n| data.join(n))) {
-            if p.exists() {
-                a.extend(["--tmpfs".into(), s(&p)]);
-            }
-        }
-        // what it saves or downloads lands in its drop box
-        let boxdir = drop_box(app);
-        for name in ["Library", "Downloads"] {
-            a.extend(["--bind".into(), s(&boxdir), s(&home.join(name))]);
-        }
+        // no drives, no shared /tmp (first: a home could be under these)
         for p in ["/run/media", "/media", "/mnt"] {
             if Path::new(p).exists() {
                 a.extend(["--tmpfs".into(), p.into()]);
@@ -288,6 +371,31 @@ pub fn bwrap_args(app: &str, off: &[Perm], runtime: &Path, home: &Path, devices:
         a.extend(["--tmpfs".into(), "/tmp".into()]);
         if Path::new("/tmp/.X11-unix").exists() {
             a.extend(["--ro-bind".into(), "/tmp/.X11-unix".into(), "/tmp/.X11-unix".into()]);
+        }
+        // a home of its own: none of your files, settings or other apps' data
+        a.extend(["--bind".into(), s(&private_home(app)), s(home)]);
+        for rel in LOOKS {
+            let p = home.join(rel);
+            if p.exists() {
+                a.extend(["--ro-bind".into(), s(&p), s(&p)]);
+            }
+        }
+        for rel in own_dirs(app) {
+            let p = home.join(rel);
+            if p.is_dir() {
+                a.extend(["--bind".into(), s(&p), s(&p)]);
+            }
+        }
+        // what it saves or downloads lands in its drop box
+        let boxdir = drop_box(app);
+        for name in ["Library", "Downloads"] {
+            a.extend(["--bind".into(), s(&boxdir), s(&home.join(name))]);
+        }
+        // what the owner opened with it (from Library): that, and only that
+        for (src, dest) in grants {
+            if src.exists() && !protected(home).iter().any(|p| src.starts_with(p)) {
+                a.extend(["--bind".into(), s(src), s(dest)]);
+            }
         }
     }
     a
@@ -385,53 +493,152 @@ fn bus_proxy(app: &str, keep: &std::os::unix::net::UnixStream) -> Option<PathBuf
     None
 }
 
-/// `chlorum run <app-id> <command line>`: start an app with what it may use.
+/// What the owner allows `app` now. The first time, a window asks about
+/// each thing it wants and the answers are kept; when that window cannot
+/// be shown, what has not been answered stays off (and is asked next time).
+pub fn resolve(app: &str, name: &str, icon: &str, wants: &[Perm]) -> Vec<Perm> {
+    let mut choices = load();
+    // inside another app's sandbox nobody can be asked (and nothing saved):
+    // what has not been answered stays off
+    if std::env::var_os("CHLORUM_SANDBOXED").is_some() {
+        if wants.iter().any(|p| !answered(&choices, app, *p)) {
+            eprintln!("chlorum: {app} has not been allowed what it asks for yet. Start it from Home (or a terminal outside any app) to be asked, or choose in Center → Apps.");
+        }
+        return Perm::ALL.into_iter().filter(|p| !allowed(&choices, app, *p)).collect();
+    }
+    let unanswered = wants.iter().any(|p| !answered(&choices, app, *p));
+    // one question at a time: wait for any other, then look again (it may
+    // have been about this same app)
+    let _turn = if unanswered && !SYSTEM.contains(&app) { take_turn() } else { None };
+    if _turn.is_some() {
+        choices = load();
+    }
+    let ask: Vec<Perm> = wants.iter().copied().filter(|p| !answered(&choices, app, *p)).collect();
+    if !ask.is_empty() && !SYSTEM.contains(&app) {
+        match crate::ask::ask(app, name, icon, &ask) {
+            Ok(answers) => {
+                if let Err(e) = set_many(app, &answers) {
+                    eprintln!("chlorum: {app}: could not keep the answers: {e}");
+                }
+                choices = load();
+                for (p, on) in answers {
+                    choices.entry(app.to_string()).or_default().insert(p, on);
+                }
+            }
+            Err(e) => eprintln!("chlorum: {app}: could not ask ({e}); starting with nothing new allowed"),
+        }
+    }
+    Perm::ALL.into_iter().filter(|p| !allowed(&choices, app, *p)).collect()
+}
+
+fn ask_lock() -> Option<std::fs::File> {
+    let dir = crate::apps::runtime_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("ask.lock")).ok()
+}
+
+/// Holds the lock that lets one question be asked at a time (until
+/// dropped). The kernel lets go of it when the process ends, however.
+fn take_turn() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let f = ask_lock()?;
+    // SAFETY: flock on a descriptor we own
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    Some(f)
+}
+
+/// Is a question on screen right now? (Someone holds the lock.) The shell
+/// then gives up the keyboard. Sandboxed apps cannot reach the lock.
+pub fn asking() -> bool {
+    use std::os::fd::AsRawFd;
+    let Some(f) = ask_lock() else { return false };
+    // SAFETY: flock on a descriptor we own; closing the file lets go
+    let free = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    !free
+}
+
+/// Everything a sandbox needs from outside: the /dev list, a sandboxed
+/// Wayland socket and a filtered session bus. The sockets stay alive as
+/// long as this process and what it becomes (exec) live.
+pub fn prepare(app: &str) -> (Vec<Dev>, Outside) {
+    let devices: Vec<Dev> = std::fs::read_dir("/dev")
+        .map(|rd| rd.flatten().map(|e| Dev { link: e.file_type().is_ok_and(|t| t.is_symlink()), path: e.path() }).collect())
+        .unwrap_or_default();
+    let mut outside = Outside::default();
+    let mut keep = Vec::new();
+    match wayland_context(app) {
+        Ok((path, k)) => {
+            outside.wayland = Some(path);
+            keep.push(k);
+        }
+        Err(e) => eprintln!("chlorum: {app}: no sandboxed Wayland socket ({e}); using the normal one"),
+    }
+    if let Ok((mine, theirs)) = std::os::unix::net::UnixStream::pair() {
+        outside.bus = bus_proxy(app, &theirs);
+        drop(theirs);
+        keep.push(mine);
+    }
+    if outside.bus.is_none() {
+        eprintln!("chlorum: {app}: no filtered session bus; it gets none");
+    }
+    for k in &keep {
+        inherit(k);
+    }
+    std::mem::forget(keep);
+    (devices, outside)
+}
+
+pub fn runtime() -> PathBuf {
+    PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_default())
+}
+
+/// `chlorum run <app-id> [--grant <path>]... <command line>`: start an app
+/// with what it may use. `--grant` lets one file or folder in, for an app
+/// that may not see personal files (Library uses it to open a file).
 pub fn run_cli(args: &[String]) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
-    let app = args.first().ok_or("usage: chlorum run <app-id> <command>")?;
-    let line = args[1..].join(" ");
+    let app = args.first().ok_or("usage: chlorum run <app-id> [--grant <path>] <command>")?;
+    let mut rest = &args[1..];
+    // (as written on the command line, the file itself)
+    let mut grants: Vec<(String, PathBuf)> = Vec::new();
+    while rest.first().map(String::as_str) == Some("--grant") {
+        let p = rest.get(1).ok_or("--grant needs a path")?;
+        grants.push((p.clone(), std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p))));
+        rest = &rest[2..];
+    }
+    let mut line = rest.join(" ");
     if line.trim().is_empty() {
         return Err("nothing to run".into());
     }
-    let denied = load();
-    let off: Vec<Perm> = Perm::ALL.into_iter().filter(|p| !allowed(&denied, app, *p)).collect();
+    let entry = crate::apps::installed().remove(app.as_str());
+    let name = entry.as_ref().map(|a| a.name.clone()).unwrap_or_else(|| app.clone());
+    let icon = entry.as_ref().map(|a| a.icon.clone()).unwrap_or_else(|| "application-x-executable".into());
+    let wants = needs(app, entry.as_ref().and_then(|a| a.permissions.as_deref()));
+    let off = resolve(app, &name, &icon, &wants);
     let mut cmd = if off.is_empty() {
         let mut c = std::process::Command::new("sh");
         c.arg("-c").arg(format!("exec {line}"));
         c
     } else {
+        let home = home();
+        ensure_protected(&home);
+        let mut places = Vec::new();
         if off.contains(&Perm::Files) {
             std::fs::create_dir_all(drop_box(app)).map_err(|e| e.to_string())?;
-        }
-        let runtime = PathBuf::from(std::env::var("XDG_RUNTIME_DIR").unwrap_or_default());
-        let devices: Vec<Dev> = std::fs::read_dir("/dev")
-            .map(|rd| rd.flatten().map(|e| Dev { link: e.file_type().is_ok_and(|t| t.is_symlink()), path: e.path() }).collect())
-            .unwrap_or_default();
-        // the ends that keep the Wayland listener and the bus proxy alive
-        // exactly as long as the sandbox
-        let mut outside = Outside::default();
-        let mut keep = Vec::new();
-        match wayland_context(app) {
-            Ok((path, k)) => {
-                outside.wayland = Some(path);
-                keep.push(k);
+            std::fs::create_dir_all(private_home(app)).map_err(|e| e.to_string())?;
+            for rel in own_dirs(app) {
+                let _ = std::fs::create_dir_all(home.join(rel));
             }
-            Err(e) => eprintln!("chlorum: {app}: no sandboxed Wayland socket ({e}); using the normal one"),
+            // the app is told where it sees each opened file
+            for (i, (written, file)) in grants.iter().enumerate() {
+                let place = grant_place(i, file);
+                line = line.replace(&crate::apps::quote(written), &crate::apps::quote(&place.to_string_lossy()));
+                places.push((file.clone(), place));
+            }
         }
-        if let Ok((mine, theirs)) = std::os::unix::net::UnixStream::pair() {
-            outside.bus = bus_proxy(app, &theirs);
-            drop(theirs);
-            keep.push(mine);
-        }
-        if outside.bus.is_none() {
-            eprintln!("chlorum: {app}: no filtered session bus; it gets none");
-        }
-        for k in &keep {
-            inherit(k);
-        }
-        std::mem::forget(keep);
+        let (devices, outside) = prepare(app);
         let mut c = std::process::Command::new("bwrap");
-        c.args(bwrap_args(app, &off, &runtime, &home(), &devices, &outside)).arg("--").arg("sh").arg("-c").arg(format!("exec {line}"));
+        c.args(bwrap_args(app, &off, &runtime(), &home, &devices, &outside, &places)).arg("--").arg("sh").arg("-c").arg(format!("exec {line}"));
         c
     };
     cmd.env("CHLORUM_APP", app);
@@ -503,20 +710,31 @@ mod tests {
 
     #[test]
     fn store_round_trip() {
-        let d = parse("# c\nlibrewolf camera=off sound=off network=on\nfoo files=off\n\nbar network=on\n");
-        assert_eq!(d["librewolf"], vec![Perm::Camera, Perm::Sound]);
-        assert_eq!(d["foo"], vec![Perm::Files]);
-        assert!(!d.contains_key("bar"));
-        assert!(allowed(&d, "bar", Perm::Network));
+        let d = parse("# c\nlibrewolf camera=off sound=off network=on\nfoo files=off\n\nbar network=maybe\n");
+        assert!(allowed(&d, "librewolf", Perm::Network));
         assert!(!allowed(&d, "librewolf", Perm::Camera));
+        assert!(answered(&d, "librewolf", Perm::Sound));
+        // never asked: not allowed
+        assert!(!answered(&d, "librewolf", Perm::Files));
+        assert!(!allowed(&d, "librewolf", Perm::Files));
+        assert!(!allowed(&d, "nobody", Perm::Network));
+        assert!(!d.contains_key("bar"));
+        assert!(allowed(&d, "chlorum-library", Perm::Files));
         assert_eq!(parse(&render(&d)), d);
+    }
+
+    #[test]
+    fn what_apps_ask_for() {
+        assert_eq!(needs("librewolf", None), vec![Perm::Network, Perm::Sound, Perm::Camera]);
+        assert_eq!(needs("x", Some("network; files")), vec![Perm::Network, Perm::Files]);
+        assert_eq!(needs("unknown", None).len(), 4);
     }
 
     #[test]
     fn sandbox_args() {
         let dev = |p: &str, link| Dev { path: PathBuf::from(p), link };
         let devs = vec![dev("/dev/video0", false), dev("/dev/sda", false), dev("/dev/media1", false), dev("/dev/snd", false), dev("/dev/null", false), dev("/dev/cdrom", true), dev("/dev/dri", false)];
-        let a = bwrap_args("x", &[Perm::Network, Perm::Camera], Path::new("/nonexistent"), Path::new("/nonexistent"), &devs, &Outside::default());
+        let a = bwrap_args("x", &[Perm::Network, Perm::Camera], Path::new("/nonexistent"), Path::new("/nonexistent"), &devs, &Outside::default(), &[]);
         let j = a.join(" ");
         assert!(j.starts_with("--dev-bind / / --unshare-pid --proc /proc"));
         assert!(j.contains("--unsetenv NIRI_SOCKET"));
@@ -528,8 +746,40 @@ mod tests {
         assert!(!j.contains("media1"));
         assert!(!j.contains("cdrom"));
         assert!(!j.contains("--dev-bind /dev/null"));
-        let a = bwrap_args("x", &[Perm::Sound], Path::new("/nonexistent"), Path::new("/nonexistent"), &devs, &Outside::default()).join(" ");
+        let a = bwrap_args("x", &[Perm::Sound], Path::new("/nonexistent"), Path::new("/nonexistent"), &devs, &Outside::default(), &[]).join(" ");
         assert!(a.contains("/dev/video0"));
         assert!(!a.contains("/dev/snd"));
+    }
+
+    #[test]
+    fn runtime_and_files() {
+        let tmp = std::env::temp_dir().join(format!("chlorum-test-{}", std::process::id()));
+        let run = tmp.join("run");
+        std::fs::create_dir_all(run.join("pulse")).unwrap();
+        std::fs::write(run.join("pipewire-0"), "").unwrap();
+        std::fs::write(run.join("bus"), "").unwrap();
+        let home = tmp.join("home");
+        let file = home.join("Library/a b.txt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "x").unwrap();
+        let out = Outside { wayland: Some(PathBuf::from("/x/wl-1")), bus: Some(PathBuf::from("/x/bus-1")) };
+        let place = grant_place(0, &file);
+        let j = bwrap_args("app", &[Perm::Files, Perm::Sound], &run, &home, &[], &out, &[(file.clone(), place.clone())]).join(" ");
+        let r = run.to_string_lossy();
+        // an empty runtime folder with only the sandboxed sockets
+        assert!(j.contains(&format!("--tmpfs {r}")));
+        assert!(j.contains(&format!("--ro-bind /x/bus-1 {r}/bus")));
+        assert!(j.contains("--ro-bind /x/wl-1"));
+        assert!(!j.contains("pipewire-0"), "no sound: no PipeWire");
+        // its own home, the opened file in its /tmp
+        assert!(j.contains(&format!("--bind {} {}", private_home("app").display(), home.display())));
+        assert_eq!(place, PathBuf::from("/tmp/chlorum-open/0/a b.txt"));
+        assert!(j.contains(&format!("--bind {} /tmp/chlorum-open/0/a b.txt", file.display())));
+        let j = bwrap_args("app", &[Perm::Network], &run, &home, &[], &out, &[]).join(" ");
+        assert!(j.contains("pipewire-0") && j.contains("pulse"));
+        assert!(!j.contains("chlorum/homes"), "files allowed: the real home");
+        ensure_protected(&home);
+        assert!(home.join(".bash_profile").is_file());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -1401,14 +1401,44 @@ fn url_path(p: &Path) -> String {
     s
 }
 
+/// Opens a file with the app made for its type, through `chlorum run`: the
+/// app gets what the owner allows it, and this one file even when it may
+/// not see personal files. A folder opens in Typewriter.
 fn open(path: &Path) {
-    let program = if path.is_dir() { "typewriter" } else { "xdg-open" };
-    let _ = std::process::Command::new(program)
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        let ask = |args: &[&std::ffi::OsStr]| {
+            std::process::Command::new("xdg-mime")
+                .args(args)
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        };
+        let id = if path.is_dir() {
+            Some("chlorum-typewriter".to_string())
+        } else {
+            ask(&["query".as_ref(), "filetype".as_ref(), path.as_os_str()])
+                .and_then(|mime| ask(&["query".as_ref(), "default".as_ref(), mime.as_ref()]))
+                .map(|d| d.trim_end_matches(".desktop").to_string())
+        };
+        let app = id.and_then(|id| crate::apps::installed().remove(&id));
+        let quoted = crate::apps::quote(&path.to_string_lossy());
+        let line = match app {
+            // the command line is one word for `chlorum run`, which runs it through sh
+            Some(a) => format!("chlorum run {} --grant {} {}", crate::apps::quote(&a.id), quoted, crate::apps::quote(&format!("{} {}", a.exec, quoted))),
+            None if path.is_dir() => format!("typewriter {quoted}"),
+            None => format!("xdg-open {quoted}"),
+        };
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(line)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut c| c.wait());
+    });
 }
 
 fn load_rules() -> HashMap<String, String> {

@@ -153,14 +153,24 @@ enum Section {
     Sound,
     Keyboard,
     Screen,
+    Home,
     Apps,
     Updates,
     About,
 }
 
 impl Section {
-    const ALL: [Section; 8] =
-        [Section::Wallpaper, Section::Network, Section::Sound, Section::Keyboard, Section::Screen, Section::Apps, Section::Updates, Section::About];
+    const ALL: [Section; 9] = [
+        Section::Wallpaper,
+        Section::Network,
+        Section::Sound,
+        Section::Keyboard,
+        Section::Screen,
+        Section::Home,
+        Section::Apps,
+        Section::Updates,
+        Section::About,
+    ];
     fn label(self) -> &'static str {
         match self {
             Section::Wallpaper => "Wallpaper",
@@ -168,6 +178,7 @@ impl Section {
             Section::Sound => "Sound",
             Section::Keyboard => "Keyboard",
             Section::Screen => "Screen",
+            Section::Home => "Home",
             Section::Apps => "Apps",
             Section::Updates => "Updates",
             Section::About => "About",
@@ -222,13 +233,17 @@ pub struct Shell {
     layout: Layout,
     installed: HashMap<String, App>,
     /// Center → Apps: what each app may use, and the app being looked at
-    denied: crate::sandbox::Denied,
+    denied: crate::sandbox::Choices,
     perm_app: Option<String>,
     /// Center → Screen: when the screen turns off and locks by itself
     idle: crate::idle::Times,
     /// notifications wait in the menu without popping up
     dnd: bool,
     pinned: Vec<String>,
+    /// the update progress last read from its file
+    seen_progress: Option<crate::progress::Progress>,
+    /// how many apps Home shows (0: all of them)
+    home_count: usize,
     started: bool,
 
     /// The one full-screen surface Home and the menu are drawn on. It is made
@@ -314,6 +329,7 @@ impl Application for Shell {
             idle: crate::idle::load(),
             dnd: dnd_path().exists(),
             pinned: apps::id_list("home-apps", apps::DEFAULT_PINNED),
+            home_count: load_home_count(),
             started: false,
             home: None,
             surface: window::Id::unique(),
@@ -338,6 +354,7 @@ impl Application for Shell {
             sound: Sound::default(),
             network: String::new(),
             update: Update::Idle,
+            seen_progress: None,
             user: system::display_name(),
             super_seq: 0,
             expect_focus: Vec::new(),
@@ -368,6 +385,8 @@ impl Application for Shell {
             shell.open_home(),
             Task::perform(system::sound(), |s| cosmic::Action::App(Message::Sound(s))),
             Task::perform(system::network(), |s| cosmic::Action::App(Message::Network(s))),
+            // a minute after start, look for a new version (then every 6 hours)
+            Task::perform(tokio::time::sleep(Duration::from_secs(60)), |_| cosmic::Action::App(Message::Command("check-update".into()))),
         ]);
         (shell, t)
     }
@@ -444,6 +463,22 @@ impl Shell {
         match message {
             Message::Frame => return self.step(),
             Message::Tick => {
+                // an app is asking for permission: its window takes the keyboard
+                if crate::ask::asking() && (self.home.is_some() || self.menu.is_some()) {
+                    self.close_home_now_if_open();
+                    self.close_menu();
+                }
+                // an update started here or by the daily timer: follow it
+                if let Some(p) = system::update_progress() {
+                    if self.seen_progress.as_ref() != Some(&p) {
+                        self.seen_progress = Some(p.clone());
+                        self.update = match p.phase.as_str() {
+                            "done" => Update::Installed(p.version.clone()),
+                            "failed" => Update::Failed(if p.message.is_empty() { "the update stopped".into() } else { p.message.clone() }),
+                            _ => Update::Installing(Some(p)),
+                        };
+                    }
+                }
                 // frames late or missing: finish the move anyway, never leave
                 // the menu or Home half-open
                 if self.animating() && self.last_frame.elapsed() > Duration::from_millis(200) {
@@ -473,7 +508,7 @@ impl Shell {
             Message::Sound(s) => self.sound = s,
             Message::Network(n) => self.network = n,
             Message::Update(u) => {
-                let start = u == Update::Available && self.update == Update::Installing;
+                let start = matches!(u, Update::Available(_)) && matches!(self.update, Update::Installing(_));
                 self.update = u;
                 if start {
                     return Task::perform(system::install_update(), |u| cosmic::Action::App(Message::Update(u)));
@@ -611,6 +646,32 @@ fn open_surface(settings: SctkLayerSurfaceSettings) -> Task<Message> {
     Task::batch([get_layer_surface(settings), nudge(400), nudge(1200)])
 }
 
+/// The line that fills while an update downloads and installs.
+fn progress_line<'a>(x: f32, width: f32, f: f32) -> Element<'a, Message> {
+    let x = x.clamp(0.0, 1.0);
+    widget::Row::new()
+        .push(fill(space((width * x).max(1.0), 6.0), alpha(YELLOW, f)))
+        .push(fill(space((width * (1.0 - x)).max(1.0), 6.0), alpha(PANEL_2, f)))
+        .into()
+}
+
+/// Choices for how many apps Home shows; 0 is all of them.
+const HOME_COUNTS: &[usize] = &[4, 6, 8, 12, 16, 24, 0];
+
+fn load_home_count() -> usize {
+    match std::fs::read_to_string(apps::config_dir().join("chlorum/home-count")).map(|s| s.trim().to_string()) {
+        Ok(s) if s == "all" => 0,
+        Ok(s) => s.parse().ok().filter(|n| HOME_COUNTS.contains(n)).unwrap_or(6),
+        Err(_) => 6,
+    }
+}
+
+fn save_home_count(n: usize) -> std::io::Result<()> {
+    let dir = apps::config_dir().join("chlorum");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("home-count"), if n == 0 { "all\n".to_string() } else { format!("{n}\n") })
+}
+
 fn dnd_path() -> std::path::PathBuf {
     apps::config_dir().join("chlorum/do-not-disturb")
 }
@@ -634,6 +695,9 @@ impl Shell {
     // ================================================================ surfaces
 
     fn open_home(&mut self) -> Task<Message> {
+        if crate::ask::asking() {
+            return Task::none();
+        }
         self.home_closing = false;
         self.page = Page::Main;
         self.act = None;
@@ -668,6 +732,9 @@ impl Shell {
     }
 
     fn toggle_menu(&mut self) -> Task<Message> {
+        if crate::ask::asking() && self.menu.is_none() {
+            return Task::none();
+        }
         if self.menu.is_some() && !self.menu_closing {
             self.close_menu();
             return Task::none();
@@ -922,6 +989,16 @@ impl Shell {
                 self.close_menu();
                 return self.open_home();
             }
+            "check-update" => {
+                let again = Task::perform(tokio::time::sleep(Duration::from_secs(6 * 3600)), |_| {
+                    cosmic::Action::App(Message::Command("check-update".into()))
+                });
+                if matches!(self.update, Update::Idle | Update::UpToDate(_) | Update::Failed(_)) {
+                    self.update = Update::Checking;
+                    return Task::batch([Task::perform(system::check_update(), |u| cosmic::Action::App(Message::Update(u))), again]);
+                }
+                return again;
+            }
             "lock" => {
                 self.close_menu();
                 return lock();
@@ -961,13 +1038,16 @@ impl Shell {
                 icon: app.map(|a| a.icon.clone()).or_else(|| w.app_id.clone()).unwrap_or_default(),
             });
         }
-        for id in &self.pinned {
-            if running_apps.contains(id) {
-                continue;
+        // the chosen apps first, then the rest by name, as many as asked for
+        let mut list: Vec<App> = self.pinned.iter().filter_map(|id| self.installed.get(id).cloned()).collect();
+        for a in self.all_apps() {
+            if !list.iter().any(|b| b.id == a.id) {
+                list.push(a);
             }
-            if let Some(a) = self.installed.get(id) {
-                out.push(Tile::App(a.clone()));
-            }
+        }
+        let limit = if self.home_count == 0 { usize::MAX } else { self.home_count };
+        for a in list.into_iter().filter(|a| !running_apps.contains(&a.id)).take(limit) {
+            out.push(Tile::App(a));
         }
         out.push(Tile::Center);
         out.push(Tile::AllApps);
@@ -1112,7 +1192,7 @@ impl Shell {
     }
 
     fn all_apps(&self) -> Vec<App> {
-        let mut v: Vec<App> = self.installed.values().filter(|a| a.id != "chlorum-shell").cloned().collect();
+        let mut v: Vec<App> = self.installed.values().filter(|a| !apps::HIDDEN.contains(&a.id.as_str())).cloned().collect();
         v.sort_by_key(|a| a.name.to_lowercase());
         v
     }
@@ -1248,6 +1328,15 @@ impl Shell {
                     }
                 }
             }
+            Section::Home => {
+                if dir != 0 {
+                    let i = HOME_COUNTS.iter().position(|c| *c == self.home_count).unwrap_or(0) as i32;
+                    self.home_count = HOME_COUNTS[(i + dir).clamp(0, HOME_COUNTS.len() as i32 - 1) as usize];
+                    if let Err(e) = save_home_count(self.home_count) {
+                        self.toast(&format!("Could not save: {e}"));
+                    }
+                }
+            }
             Section::Screen => {
                 if dir != 0 {
                     let mut t = self.idle;
@@ -1317,6 +1406,7 @@ impl Shell {
             Section::Sound => if self.sound.present { 2 } else { 0 },
             Section::Keyboard => crate::setupd::LAYOUTS.len(),
             Section::Screen => 2,
+            Section::Home => 1,
             Section::Apps => if self.perm_app.is_some() { crate::sandbox::Perm::ALL.len() } else { self.app_list().len() },
             Section::Updates => 1,
             Section::About => 0,
@@ -1325,9 +1415,9 @@ impl Shell {
 
     fn update_action(&mut self) -> Task<Message> {
         match self.update {
-            Update::Checking | Update::Installing => Task::none(),
-            Update::Available => {
-                self.update = Update::Installing;
+            Update::Checking | Update::Installing(_) => Task::none(),
+            Update::Available(_) => {
+                self.update = Update::Installing(None);
                 Task::perform(system::install_update(), |u| cosmic::Action::App(Message::Update(u)))
             }
             _ => {
@@ -1368,7 +1458,7 @@ impl Shell {
             let v = if self.sound.muted { "MUTED".to_string() } else { format!("VOL {:.0}", self.sound.volume * 100.0) };
             chips = chips.push(chip(v, false));
         }
-        if matches!(self.update, Update::Available | Update::Installed) {
+        if matches!(self.update, Update::Available(_) | Update::Installed(_)) {
             chips = chips.push(chip("UPDATE READY".into(), true));
         }
         if self.dnd {
@@ -1386,8 +1476,14 @@ impl Shell {
         let tiles = self.tiles();
         let sel = self.sel.min(tiles.len().saturating_sub(1));
         let mut ribbon = widget::Row::new().spacing(22).align_y(Alignment::End).height(Length::Fixed(272.0));
-        for (i, t) in tiles.iter().enumerate() {
+        // a long row slides along with the choice
+        const SHOWN: usize = 14;
+        let start = sel.saturating_sub(SHOWN / 2).min(tiles.len().saturating_sub(SHOWN));
+        for (i, t) in tiles.iter().enumerate().skip(start).take(SHOWN) {
             ribbon = ribbon.push(self.tile_view(i, t, f));
+        }
+        if tiles.len() > SHOWN {
+            ribbon = ribbon.push(text(format!("{} / {}", sel + 1, tiles.len()), MONO, 15.0, alpha(TEXT_2, f)));
         }
         let tile = &tiles[sel];
         let sub = match tile {
@@ -1515,6 +1611,7 @@ impl Shell {
             Section::Sound => self.sound_view(f),
             Section::Keyboard => self.keyboard_view(f),
             Section::Screen => self.screen_view(f),
+            Section::Home => self.home_settings_view(f),
             Section::Apps => self.apps_view(f),
             Section::Updates => self.updates_view(f),
             Section::About => self.about_view(f),
@@ -1638,6 +1735,23 @@ impl Shell {
         widget::scrollable(col).height(Length::Fill).into()
     }
 
+    fn home_settings_view(&self, f: f32) -> Element<'_, Message> {
+        let label = |c: usize| if c == 0 { "All".to_string() } else { c.to_string() };
+        let mut r = widget::Row::new().spacing(10);
+        for c in HOME_COUNTS {
+            let sel = *c == self.home_count;
+            r = r.push(
+                fill(text(label(*c), SANS_BOLD, 18.0, alpha(if sel { BLACK } else { TEXT }, f)), alpha(if sel { YELLOW } else { PANEL_2 }, f))
+                    .padding([12, 20]),
+            );
+        }
+        widget::Column::new()
+            .push(text("The apps in the row on Home. Your own choice comes first, then the others by name; open apps are always there.", SANS, 20.0, alpha(TEXT_2, f)))
+            .push(self.row_box(0, "Apps on Home", label(self.home_count), r.into(), f))
+            .spacing(26)
+            .into()
+    }
+
     fn screen_view(&self, f: f32) -> Element<'_, Message> {
         use crate::idle::{LOCK, SCREEN_OFF, label};
         let choice = |list: &'static [u32], now: u32, on: bool| -> Element<'_, Message> {
@@ -1679,7 +1793,7 @@ impl Shell {
                         .push(
                             widget::Column::new()
                                 .push(text(p.label(), SANS_BOLD, 21.0, alpha(fg, f)))
-                                .push(text(if on { "Allowed." } else { p.off_means() }, SANS, 16.0, alpha(if sel { BLACK } else { TEXT_2 }, f)))
+                                .push(text(if on { "Allowed." } else if !crate::sandbox::answered(&self.denied, app, *p) { "Not allowed: it has not asked for this." } else { p.off_means() }, SANS, 16.0, alpha(if sel { BLACK } else { TEXT_2 }, f)))
                                 .spacing(4),
                         )
                         .push(hfill())
@@ -1694,7 +1808,7 @@ impl Shell {
             return col.into();
         }
         col = col
-            .push(text("Choose an app to see what it may use: internet, camera, sound, your files.", SANS, 20.0, alpha(TEXT_2, f)))
+            .push(text("Apps may use nothing until you allow it. Choose one to see what it may use: internet, camera, sound, your files.", SANS, 20.0, alpha(TEXT_2, f)))
             .push(space(1.0, 10.0));
         let list = self.app_list();
         // the chosen app stays in view: show a window of the list around it
@@ -1702,8 +1816,16 @@ impl Shell {
         let sel = self.row.unwrap_or(0);
         let start = sel.saturating_sub(SHOWN / 2).min(list.len().saturating_sub(SHOWN));
         for (i, a) in list.iter().enumerate().skip(start).take(SHOWN) {
-            let off: Vec<&str> = Perm::ALL.iter().filter(|p| !allowed(&self.denied, &a.id, **p)).map(|p| p.key()).collect();
-            let detail = if off.is_empty() { "ALL ALLOWED".to_string() } else { format!("{} OFF", off.join(" · ").to_uppercase()) };
+            let on: Vec<&str> = Perm::ALL.iter().filter(|p| allowed(&self.denied, &a.id, **p)).map(|p| p.key()).collect();
+            let detail = if crate::sandbox::SYSTEM.contains(&a.id.as_str()) {
+                "PART OF THE SYSTEM".to_string()
+            } else if on.is_empty() {
+                "NOTHING ALLOWED".to_string()
+            } else if on.len() == Perm::ALL.len() {
+                "ALL ALLOWED".to_string()
+            } else {
+                format!("{} ALLOWED", on.join(" · ").to_uppercase())
+            };
             col = col.push(self.list_row(i, a.name.clone(), detail, f));
         }
         if list.len() > SHOWN {
@@ -1742,14 +1864,18 @@ impl Shell {
 
     fn updates_view(&self, f: f32) -> Element<'_, Message> {
         let label = match self.update {
-            Update::Available => "Install now",
-            Update::Checking | Update::Installing => "Please wait…",
+            Update::Available(_) => "Install now",
+            Update::Checking | Update::Installing(_) => "Please wait…",
             _ => "Check for updates",
         };
         let b = fill(text(label, SANS_BOLD, 21.0, alpha(BLACK, f)), alpha(YELLOW, f)).padding([16, 26]);
         widget::Column::new()
             .push(text(format!("Chlorum {}", system::version()), SANS_BOLD, 30.0, alpha(TEXT, f)))
             .push(text(self.update.text(), SANS, 22.0, alpha(TEXT_2, f)))
+            .push(match self.update.fraction() {
+                Some(x) => progress_line(x, 900.0, f),
+                None => space(1.0, 1.0),
+            })
             .push(space(1.0, 20.0))
             .push(self.row_box(0, "Updates", String::new(), b.into(), f))
             .spacing(10)
@@ -1779,7 +1905,7 @@ impl Shell {
 
     fn cards(&self) -> Vec<Card> {
         let mut v = vec![Card::Layout, Card::Apps, Card::Notes];
-        if matches!(self.update, Update::Available | Update::Installing | Update::Installed) {
+        if matches!(self.update, Update::Available(_) | Update::Installing(_) | Update::Installed(_)) {
             v.push(Card::Update);
         }
         v.extend([Card::Sound, Card::Home, Card::Center, Card::Power]);
@@ -2140,7 +2266,22 @@ impl Shell {
                 };
                 ("NOTIFICATIONS", if n == 0 { "None".into() } else { format!("{n} new") }, text(last, MONO, 12.0, alpha(if self.dnd { YELLOW } else { TEXT_2 }, f)))
             }
-            Card::Update => ("UPDATE", "New version".into(), text(self.update.text().to_uppercase(), MONO, 12.0, alpha(TEXT_2, f))),
+            Card::Update => {
+                let value = match &self.update {
+                    Update::Available(v) | Update::Installed(v) if !v.is_empty() => v.clone(),
+                    Update::Installing(Some(p)) if !p.version.is_empty() => p.version.clone(),
+                    _ => "New version".into(),
+                };
+                let below: Element<'_, Message> = match self.update.fraction() {
+                    Some(x) => widget::Column::new()
+                        .push(text(self.update.text().to_uppercase(), MONO, 11.0, alpha(TEXT_2, f)))
+                        .push(progress_line(x, 140.0, f))
+                        .spacing(6)
+                        .into(),
+                    None => text(self.update.text().to_uppercase(), MONO, 12.0, alpha(TEXT_2, f)).into(),
+                };
+                ("UPDATE", value, below)
+            }
             Card::Sound => {
                 let v = if self.sound.muted { "Off".to_string() } else { format!("{:.0}", self.sound.volume * 100.0) };
                 ("SOUND", v, slider(self.sound.volume, 136.0, self.sub == Sub::Sound, f))

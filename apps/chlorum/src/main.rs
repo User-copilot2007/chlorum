@@ -16,6 +16,7 @@
 //   chlorum setupd       first-start helper (root, until the first profile exists)
 
 mod apps;
+mod ask;
 mod atom;
 mod drives;
 mod greeter;
@@ -28,6 +29,7 @@ mod niri;
 mod notify;
 mod pointer;
 mod portal;
+mod progress;
 mod sandbox;
 mod setupd;
 mod shell;
@@ -67,7 +69,9 @@ fn main() {
         "mouse" => pointer::mouse_cli(&args[2..]),
         "idle" => idle::run(),
         "work" => workshop::cli(&args[2..]),
+        "update-progress" => progress::cli(&args[2..]),
         "run" => sandbox::run_cli(&args[2..]),
+        "ask" => ask::run(&args[2..]),
         "wallpaper" => {
             wallpaper::run();
             Ok(())

@@ -4,13 +4,15 @@
 //              (when there is none on screen, the page scrolls as usual)
 //   Enter      press it
 //   F          put a letter on every button and link; type it to press
+//   Alt .      the same, from anywhere, even while typing in a text box
 //   Esc        leave letter mode, or leave the text box the page put you in
 //   ?          show these keys
 //
 // Each can be turned off on the add-on's settings page.
 //
-// Pages that use these keys themselves (games, video players, editors)
-// keep them: Chlorum Keys only acts when the page did not.
+// F, Alt . , ? and Esc come first, before the page sees them (YouTube uses F
+// for full screen, chat sites put you in their text box). The arrows and
+// Enter stay with pages that use them (video players, games, editors).
 
 (() => {
   if (window.__chlorumKeys) return;
@@ -32,6 +34,23 @@
   const TEXT_TYPES = new Set(["", "text", "search", "email", "url", "tel", "password", "number",
     "date", "datetime-local", "month", "time", "week"]);
 
+  // The element that really has the keyboard, inside web components too.
+  function active() {
+    let el = document.activeElement;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+    return el;
+  }
+
+  // Is `top` (found at a point) `el` itself, inside it, or what holds it?
+  function same(top, el) {
+    if (!top) return false;
+    if (top === el || el.contains(top) || top.contains(el)) return true;
+    for (let n = el.getRootNode(); n && n.host; n = n.host.getRootNode()) {
+      if (n.host === top || top.contains(n.host)) return true;
+    }
+    return false;
+  }
+
   function typing(el) {
     if (!el) return false;
     if (el.isContentEditable) return true;
@@ -52,9 +71,9 @@
     for (const [fx, fy] of pts) {
       const x = Math.min(Math.max(r.left + r.width * fx, 0), innerWidth - 1);
       const y = Math.min(Math.max(r.top + r.height * fy, 0), innerHeight - 1);
-      const top = document.elementFromPoint(x, y);
-      if (top && (top === el || el.contains(top) || top.contains(el) ||
-          (el.tagName === "INPUT" && top.tagName === "LABEL" && top.control === el))) return r;
+      const root = el.getRootNode();
+      const top = (root.elementFromPoint ? root : document).elementFromPoint(x, y);
+      if (same(top, el) || (top && el.tagName === "INPUT" && top.tagName === "LABEL" && top.control === el)) return r;
     }
     return null;
   }
@@ -62,12 +81,23 @@
   function targets() {
     const out = [];
     const seen = new Set();
-    for (const el of document.querySelectorAll(CLICKABLE)) {
+    for (const el of everywhere()) {
       // a link wrapping a button counts once
       if (seen.has(el.parentElement) && el.closest("a[href],button") !== el) continue;
       const r = onScreen(el);
       if (r) { out.push({ el, r }); seen.add(el); }
     }
+    return out;
+  }
+
+  // Everything clickable, also inside web components (YouTube is made of them).
+  function everywhere() {
+    const out = [];
+    const walk = (root) => {
+      for (const el of root.querySelectorAll(CLICKABLE)) out.push(el);
+      for (const el of root.querySelectorAll("*")) if (el.shadowRoot) walk(el.shadowRoot);
+    };
+    walk(document);
     return out;
   }
 
@@ -153,7 +183,7 @@
   // ------------------------------------------------------------ arrows
 
   function nearest(dir) {
-    const cur = document.activeElement;
+    const cur = active();
     let o = cur && cur !== document.body && cur.matches && cur.matches(CLICKABLE) ? onScreen(cur) : null;
     if (!o) {
       // nothing chosen yet: start from the edge we move away from
@@ -205,29 +235,50 @@
   // Letter mode takes every key first.
   window.addEventListener("keydown", (e) => { if (hint) hintKey(e); }, true);
 
-  // Everything else only when the page itself did nothing with the key.
+  // Letters, help and Esc: before the page, so no site can take them.
   window.addEventListener("keydown", (e) => {
-    if (hint || help || e.defaultPrevented || e.ctrlKey || e.altKey || e.metaKey) return;
-    const el = document.activeElement;
-    const dir = opt.arrows ? { ArrowRight: "right", ArrowLeft: "left", ArrowDown: "down", ArrowUp: "up" }[e.key] : undefined;
-    // pages often put you in a search box: Esc lets you out
-    if (e.key === "Escape" && opt.escape && typing(el)) {
-      el.blur();
+    if (hint || help || e.ctrlKey || e.metaKey || e.isComposing) return;
+    const el = active();
+    // Alt . : letters from anywhere, even from inside a text box
+    if (opt.letters && e.altKey && !e.shiftKey && (e.key === "." || e.code === "Period")) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (typing(el)) el.blur();
+      showHints();
       return;
     }
+    if (e.altKey) return;
+    // pages often put you in a search or chat box: Esc lets you out
+    // (the page still sees the Esc, to close its own menus)
+    if (e.key === "Escape" && opt.escape && typing(el)) {
+      el.blur();
+      passing = null;
+      return;
+    }
+    const arrow = e.key.startsWith("Arrow");
     if (passing && passing !== el) passing = null;
-    if (passing && !dir && e.key !== (opt.letterKey || "f") && e.key !== "?") passing = null;
-    if (typing(el) && !passing && !(dir && canLeave(el, dir))) return;
-    if (opt.letters && e.key.toLowerCase() === (opt.letterKey || "f") && !e.shiftKey && window === window.top) {
+    if (passing && !arrow && e.key.toLowerCase() !== (opt.letterKey || "f") && e.key !== "?") passing = null;
+    if (typing(el) && !passing) return;
+    if (opt.letters && e.key.toLowerCase() === (opt.letterKey || "f") && !e.shiftKey) {
       e.preventDefault();
+      e.stopImmediatePropagation();
       showHints();
       return;
     }
     if (e.key === "?" && opt.help && window === window.top) {
       e.preventDefault();
+      e.stopImmediatePropagation();
       toggleHelp();
-      return;
     }
+  }, true);
+
+  // Arrows and Enter only when the page itself did nothing with the key.
+  window.addEventListener("keydown", (e) => {
+    if (hint || help || e.defaultPrevented || e.ctrlKey || e.altKey || e.metaKey) return;
+    const el = active();
+    const dir = opt.arrows ? { ArrowRight: "right", ArrowLeft: "left", ArrowDown: "down", ArrowUp: "up" }[e.key] : undefined;
+    if (passing && passing !== el) passing = null;
+    if (typing(el) && !passing && !(dir && canLeave(el, dir))) return;
     if (dir && !e.shiftKey) {
       const next = nearest(dir);
       if (next) {
@@ -268,6 +319,7 @@
       <tr class="${opt.arrows ? "" : "off"}"><td><kbd>← ↑ ↓ →</kbd></td><td>Move to the next button or link</td></tr>
       <tr><td><kbd>Enter</kbd></td><td>Press it</td></tr>
       <tr class="${opt.letters ? "" : "off"}"><td><kbd>${k}</kbd></td><td>A letter on every button and link: type it to press</td></tr>
+      <tr class="${opt.letters ? "" : "off"}"><td><kbd>Alt .</kbd></td><td>The same from anywhere, even while typing in a text box</td></tr>
       <tr class="${opt.escape ? "" : "off"}"><td><kbd>Esc</kbd></td><td>Leave a text box, so the arrows move again</td></tr>
       <tr><td><kbd>Ctrl L</kbd></td><td>Address bar · <kbd>Ctrl T</kbd> new tab · <kbd>Ctrl W</kbd> close tab</td></tr>
       <tr><td><kbd>Alt ←</kbd></td><td>Back · <kbd>Alt →</kbd> forward · <kbd>Ctrl Tab</kbd> next tab</td></tr>

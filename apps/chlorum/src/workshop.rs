@@ -7,6 +7,14 @@
 //! .workshop folder), and the commands run in a box that sees only the
 //! project, never your personal files.
 //!
+//! The program itself (`work run`, `work test`) is an app like any other:
+//! it may use nothing (internet, camera, sound, your files) until you allow
+//! it. What it wants is written in workshop.toml (`permissions = "network"`);
+//! the first time, Chlorum asks you about each one, like a phone does. The
+//! answers are kept under the app "work.<name>" in Center → Apps. Getting
+//! the tools and libraries ready happens first, in the tools' box, which
+//! may download but never sees your files.
+//!
 //! Every language has the same five commands:
 //!   work check    is it right? (compiler warnings as errors, linters)
 //!   work format   tidy the code the standard way
@@ -78,13 +86,13 @@ impl Lang {
         Some(match (self, what) {
             (Lang::C, "check") => format!("{setup} && ninja -C build && {c_files} | xargs -r clang-format --dry-run --Werror"),
             (Lang::C, "format") => format!("{c_files} | xargs -r clang-format -i"),
-            (Lang::C, "test") => format!("{setup} && meson test -C build --print-errorlogs"),
-            (Lang::C, "run") => format!("{setup} && ninja -C build && ./build/{name}"),
+            (Lang::C, "test") => "meson test -C build --print-errorlogs --no-rebuild".into(),
+            (Lang::C, "run") => format!("./build/{name}"),
             (Lang::C, "build") => format!("test -d release || meson setup release --buildtype=release; ninja -C release && echo \"Built: release/{name}\""),
             (Lang::Rust, "check") => "cargo clippy --all-targets -- -D warnings && cargo fmt --check".into(),
             (Lang::Rust, "format") => "cargo fmt".into(),
-            (Lang::Rust, "test") => "cargo test".into(),
-            (Lang::Rust, "run") => "cargo run".into(),
+            (Lang::Rust, "test") => "cargo test --offline -q".into(),
+            (Lang::Rust, "run") => "cargo run --offline -q".into(),
             (Lang::Rust, "build") => "cargo build --release && echo \"Built: target/release/\"".into(),
             (Lang::Python, "check") => "ruff check . && ruff format --check . && pyright".into(),
             (Lang::Python, "format") => "ruff check --fix . ; ruff format .".into(),
@@ -99,7 +107,22 @@ impl Lang {
             _ => return None,
         })
     }
+
+    /// For `run` and `test`: what gets the program ready (downloads,
+    /// compiling), done in the tools' box before the program starts.
+    pub fn prepare(self, what: &str) -> Option<String> {
+        let setup = "test -d build || meson setup build --warnlevel=3 --werror";
+        match (self, what) {
+            (Lang::C, "run" | "test") => Some(format!("{setup} && ninja -C build")),
+            (Lang::Rust, "run") => Some("cargo build -q".into()),
+            (Lang::Rust, "test") => Some("cargo test --no-run -q".into()),
+            _ => None,
+        }
+    }
 }
+
+/// The commands that start the program itself: they run with its permissions.
+pub const PROGRAM: [&str; 2] = ["run", "test"];
 
 pub const COMMANDS: [&str; 5] = ["check", "format", "test", "run", "build"];
 
@@ -135,6 +158,16 @@ pub struct Project {
     pub name: String,
     pub dir: PathBuf,
     pub lang: Lang,
+    /// what the program asks to use, from workshop.toml; None: not said,
+    /// so it is asked about everything
+    pub permissions: Option<String>,
+}
+
+impl Project {
+    /// The program's name among the apps, for its permissions.
+    pub fn app_id(&self) -> String {
+        format!("work.{}", tidy_name(&self.name))
+    }
 }
 
 /// The project a folder belongs to: it or the nearest one above it with a
@@ -153,7 +186,7 @@ pub fn find(start: &Path) -> Option<Project> {
             };
             let name = get("name").unwrap_or_else(|| dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
             let lang = get("language").and_then(|l| Lang::parse(&l))?;
-            return Some(Project { name, dir: dir.to_path_buf(), lang });
+            return Some(Project { name, dir: dir.to_path_buf(), lang, permissions: get("permissions") });
         }
         d = dir.parent();
     }
@@ -184,7 +217,19 @@ pub fn create(name: &str, lang: Lang) -> Result<PathBuf, String> {
     let module = name.replace('-', "_");
     let w = |rel: &str, body: String| write(&dir, rel, &body).map_err(|e| e.to_string());
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    w("workshop.toml", format!("# A Workshop project: `work check | format | test | run | build`.\nname = \"{name}\"\nlanguage = \"{}\"\n", lang.key()))?;
+    w(
+        "workshop.toml",
+        format!(
+            "# A Workshop project: `work check | format | test | run | build`.\n\
+             name = \"{name}\"\n\
+             language = \"{}\"\n\
+             # What the program asks to use when it runs: network, camera, sound,\n\
+             # files (your personal files). Nothing by default. Chlorum asks you\n\
+             # once about each; change the answers in Center → Apps (work.{name}).\n\
+             permissions = \"\"\n",
+            lang.key()
+        ),
+    )?;
     w(
         "workshop.nix",
         format!(
@@ -264,18 +309,63 @@ pub fn create(name: &str, lang: Lang) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// The box: a bubblewrap sandbox where the home folder is empty except
-/// for the project, caches live in the project, and the compositor's
-/// control socket is out of reach.
+/// The tools' box: a bubblewrap sandbox where the home folder is empty
+/// except for the project, caches live in the project, and the
+/// compositor's control socket is out of reach.
 fn boxed(p: &Project, inner: &[String]) -> std::process::Command {
+    let home = home();
+    let mut c = std::process::Command::new("bwrap");
+    c.args(["--dev-bind", "/", "/", "--tmpfs"]).arg(&home);
+    if let Some(n) = std::env::var_os("NIRI_SOCKET").filter(|n| Path::new(n).exists()) {
+        c.args(["--ro-bind", "/dev/null"]).arg(n);
+    }
+    c.args(["--unsetenv", "NIRI_SOCKET"]);
+    inside(&mut c, p, inner);
+    c
+}
+
+/// The program's box: what it may use is the owner's answer (see
+/// sandbox.rs), the same as for any app; asked the first time.
+fn program_box(p: &Project, inner: &[String]) -> std::process::Command {
+    use crate::sandbox::{self, Perm};
+    let app = p.app_id();
+    let wants = sandbox::needs(&app, p.permissions.as_deref());
+    let off = sandbox::resolve(&app, &p.name, "applications-development", &wants);
+    let on: Vec<&str> = Perm::ALL.iter().filter(|x| !off.contains(x)).map(|x| x.key()).collect();
+    eprintln!(
+        "work: {} may use {} (asked for in workshop.toml, answered in Center → Apps → {app})",
+        p.name,
+        if on.is_empty() { "nothing".to_string() } else { on.join(", ") }
+    );
+    let home = home();
+    sandbox::ensure_protected(&home);
+    if off.contains(&Perm::Files) {
+        let _ = std::fs::create_dir_all(sandbox::drop_box(&app));
+        let _ = std::fs::create_dir_all(sandbox::private_home(&app));
+    }
+    let (devices, outside) = sandbox::prepare(&app);
+    let mut c = std::process::Command::new("bwrap");
+    c.args(sandbox::bwrap_args(&app, &off, &sandbox::runtime(), &home, &devices, &outside, &[]));
+    if off.contains(&Perm::Files) {
+        // nothing of yours, only the project
+        c.arg("--tmpfs").arg(&home);
+    }
+    c.args(["--setenv", "CHLORUM_APP", &app]);
+    if off.contains(&Perm::Files) {
+        c.args(["--setenv", "CHLORUM_NO_FILES", "1"]);
+    }
+    inside(&mut c, p, inner);
+    c
+}
+
+/// What both boxes share: the project, its caches, its own home.
+fn inside(c: &mut std::process::Command, p: &Project, inner: &[String]) {
     let home = home();
     let ws = p.dir.join(".workshop");
     for sub in ["home", "cache", "config", "data", "cargo", "npm", "uv"] {
         let _ = std::fs::create_dir_all(ws.join(sub));
     }
     let s = |p: &Path| p.to_string_lossy().to_string();
-    let mut c = std::process::Command::new("bwrap");
-    c.args(["--dev-bind", "/", "/", "--tmpfs"]).arg(s(&home));
     c.args(["--bind"]).arg(s(&p.dir)).arg(s(&p.dir));
     // your name and e-mail for commits, read-only
     for f in [".gitconfig", ".config/git"] {
@@ -284,10 +374,7 @@ fn boxed(p: &Project, inner: &[String]) -> std::process::Command {
             c.arg("--ro-bind").arg(s(&src)).arg(s(&ws.join("home").join(f)));
         }
     }
-    if let Some(n) = std::env::var_os("NIRI_SOCKET").filter(|n| Path::new(n).exists()) {
-        c.args(["--ro-bind", "/dev/null"]).arg(n);
-    }
-    c.args(["--unsetenv", "NIRI_SOCKET", "--die-with-parent", "--chdir"]).arg(s(&p.dir));
+    c.args(["--die-with-parent", "--chdir"]).arg(s(&p.dir));
     let env = [
         ("HOME", ws.join("home")),
         ("XDG_CACHE_HOME", ws.join("cache")),
@@ -302,7 +389,6 @@ fn boxed(p: &Project, inner: &[String]) -> std::process::Command {
     }
     c.args(["--setenv", "WORKSHOP", &p.name, "--setenv", "PYTHONDONTWRITEBYTECODE", "1"]);
     c.arg("--").args(inner);
-    c
 }
 
 /// nix-shell with only the project's tools (plus what the box passes on).
@@ -311,6 +397,7 @@ fn in_shell(run: Option<String>) -> Vec<String> {
     for k in [
         "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "CARGO_HOME", "npm_config_cache", "UV_CACHE_DIR",
         "WORKSHOP", "PYTHONDONTWRITEBYTECODE", "WAYLAND_DISPLAY", "DISPLAY", "TERM", "LANG", "PS1",
+        "CHLORUM_APP", "CHLORUM_NO_FILES", "DBUS_SESSION_BUS_ADDRESS",
     ] {
         v.push("--keep".into());
         v.push(k.into());
@@ -338,8 +425,25 @@ fn run_in_box(p: &Project, run: Option<String>) -> Result<(), String> {
         // SAFETY: single-threaded; only our own environment
         unsafe { std::env::set_var("PS1", format!("\\[\\e[1;33m\\][{}]\\[\\e[0m\\] \\w \\$ ", p.name)) };
     }
-    let status = boxed(p, &in_shell(run)).status().map_err(|e| format!("could not open the box: {e}"))?;
+    finish(boxed(p, &in_shell(run)).status())
+}
+
+fn finish(status: std::io::Result<std::process::ExitStatus>) -> Result<(), String> {
+    let status = status.map_err(|e| format!("could not open the box: {e}"))?;
     if status.success() { Ok(()) } else { std::process::exit(status.code().unwrap_or(1)) }
+}
+
+/// `work run` / `work test`: get ready in the tools' box, then start the
+/// program in its own box, with its permissions.
+fn run_program(p: &Project, what: &str) -> Result<(), String> {
+    if let Some(prep) = p.lang.prepare(what) {
+        let ok = boxed(p, &in_shell(Some(prep))).status().map_err(|e| format!("could not open the box: {e}"))?;
+        if !ok.success() {
+            std::process::exit(ok.code().unwrap_or(1));
+        }
+    }
+    let line = p.lang.command(what, &p.name).ok_or("unknown command")?;
+    finish(program_box(p, &in_shell(Some(line))).status())
 }
 
 const HELP: &str = "work — programming without cluttering the system
@@ -393,6 +497,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             println!("Clean: only your code is left in {}.", p.name);
             Ok(())
         }
+        cmd if PROGRAM.contains(&cmd) => run_program(&here()?, cmd),
         cmd if COMMANDS.contains(&cmd) => {
             let p = here()?;
             let line = p.lang.command(cmd, &p.name).ok_or("unknown command")?;
