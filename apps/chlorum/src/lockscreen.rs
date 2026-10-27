@@ -36,6 +36,8 @@ pub enum Message {
     Tick,
     Frame,
     Output(WlOutput),
+    /// a screen went away (unplugged, or a monitor switched off at its button)
+    OutputGone(WlOutput),
     Go,
     Lock(SessionLockEvent),
     Submit,
@@ -49,6 +51,8 @@ pub struct Lock {
     core: Core,
     outputs: Vec<WlOutput>,
     asked: bool,
+    /// the compositor said the session is locked
+    locked: bool,
     surfaces: Vec<window::Id>,
     password: String,
     busy: bool,
@@ -56,6 +60,22 @@ pub struct Lock {
     user: String,
     name: String,
     started: Instant,
+}
+
+impl Lock {
+    /// Fresh lock surfaces on every screen there is now. A screen that was
+    /// switched off and on comes back as a new one; a surface made for the
+    /// old one would never be drawn again (the clock stood still and keys
+    /// seemed to do nothing). The session stays locked meanwhile.
+    fn rebuild(&mut self) -> Task<Message> {
+        let mut t: Vec<Task<Message>> = self.surfaces.drain(..).map(session_lock::destroy_lock_surface).collect();
+        for o in self.outputs.clone() {
+            let id = window::Id::unique();
+            self.surfaces.push(id);
+            t.push(session_lock::get_lock_surface(id, o));
+        }
+        Task::batch(t)
+    }
 }
 
 impl Application for Lock {
@@ -76,6 +96,7 @@ impl Application for Lock {
             core,
             outputs: vec![],
             asked: false,
+            locked: false,
             surfaces: vec![],
             password: String::new(),
             busy: false,
@@ -100,7 +121,9 @@ impl Application for Lock {
                     Some(Message::Key(key, typed))
                 }
                 iced::Event::PlatformSpecific(iced::event::PlatformSpecific::Wayland(w)) => match w {
-                    iced::event::wayland::Event::Output(OutputEvent::Created(_), o) => Some(Message::Output(o)),
+                    // a screen switched back on may only report new details
+                    iced::event::wayland::Event::Output(OutputEvent::Created(_) | OutputEvent::InfoUpdate(_), o) => Some(Message::Output(o)),
+                    iced::event::wayland::Event::Output(OutputEvent::Removed, o) => Some(Message::OutputGone(o)),
                     iced::event::wayland::Event::SessionLock(ev) => Some(Message::Lock(ev)),
                     _ => None,
                 },
@@ -118,13 +141,19 @@ impl Application for Lock {
             Message::Tick | Message::Frame => {}
             Message::Output(o) => {
                 if !self.outputs.contains(&o) {
-                    self.outputs.push(o.clone());
-                    // a screen plugged in while locked gets the lock screen too
-                    if !self.surfaces.is_empty() {
-                        let id = window::Id::unique();
-                        self.surfaces.push(id);
-                        return session_lock::get_lock_surface(id, o);
+                    self.outputs.push(o);
+                    // a screen plugged in (or switched back on) while locked
+                    if self.locked {
+                        eprintln!("chlorum lock: a screen came back: drawing the lock screen anew");
+                        return self.rebuild();
                     }
+                }
+            }
+            Message::OutputGone(o) => {
+                self.outputs.retain(|x| *x != o);
+                if self.locked {
+                    eprintln!("chlorum lock: a screen went away: drawing the lock screen anew");
+                    return self.rebuild();
                 }
             }
             Message::Go => {
@@ -141,14 +170,9 @@ impl Application for Lock {
                 }
             }
             Message::Lock(SessionLockEvent::Locked) => {
-                if self.surfaces.is_empty() {
-                    let mut t = Vec::new();
-                    for o in self.outputs.clone() {
-                        let id = window::Id::unique();
-                        self.surfaces.push(id);
-                        t.push(session_lock::get_lock_surface(id, o));
-                    }
-                    return Task::batch(t);
+                if !self.locked {
+                    self.locked = true;
+                    return self.rebuild();
                 }
             }
             Message::Lock(SessionLockEvent::Focused(..)) => {}
@@ -195,6 +219,7 @@ impl Application for Lock {
             }
             Message::Checked(Ok(())) => {
                 self.busy = false;
+                self.locked = false;
                 let mut t: Vec<Task<Message>> = self.surfaces.drain(..).map(session_lock::destroy_lock_surface).collect();
                 t.push(session_lock::unlock());
                 t.push(Task::perform(tokio::time::sleep(Duration::from_millis(400)), |_| cosmic::Action::App(Message::Quit)));
