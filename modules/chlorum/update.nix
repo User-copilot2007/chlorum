@@ -39,7 +39,7 @@ let
 
       install() {
         if ! remote; then
-          chlorum update-progress "$P" failed "" "Could not reach the Chlorum update server."
+          chlorum update-progress "$P" "failed" "" "Could not reach the Chlorum update server."
           return 1
         fi
         # already running, or already waiting for the next start: nothing to do
@@ -49,16 +49,16 @@ let
         if [ "$rev" = "$running" ] || [ "$rev" = "$staged" ]; then
           return 0
         fi
-        chlorum update-progress "$P" checking "$version"
+        chlorum update-progress "$P" "checking" "$version"
         # whatever stops the install from here on shows as failed, never as
         # "Installing..." forever
         set -o errtrace
-        trap 'chlorum update-progress "$P" failed "$version" "The install stopped. Nothing changed; try again later."' ERR
+        trap 'chlorum update-progress "$P" "failed" "$version" "The install stopped. Nothing changed; try again later."' ERR
         # Nix tells what it downloads and builds; chlorum turns it into a line
         local fifo out ok=0
         fifo=$(mktemp -u)
         mkfifo "$fifo"
-        chlorum update-progress "$P" downloading "$version" < "$fifo" &
+        chlorum update-progress "$P" "downloading" "$version" < "$fifo" &
         local writer=$!
         if out=$(nix build --no-link --print-out-paths --log-format internal-json \
               "$source_flake#nixosConfigurations.$attr.config.system.build.toplevel" 2>"$fifo"); then
@@ -68,14 +68,14 @@ let
         rm -f "$fifo"
         if [ "$ok" != 1 ] || [ -z "$out" ]; then
           trap - ERR
-          chlorum update-progress "$P" failed "$version" "$(jq -r '.message // ""' "$P" 2>/dev/null)"
+          chlorum update-progress "$P" "failed" "$version" "$(jq -r '.message // ""' "$P" 2>/dev/null)"
           return 1
         fi
-        chlorum update-progress "$P" installing "$version"
+        chlorum update-progress "$P" "installing" "$version"
         nix-env -p /nix/var/nix/profiles/system --set "$out"
         "$out/bin/switch-to-configuration" boot
         trap - ERR
-        chlorum update-progress "$P" done "$version"
+        chlorum update-progress "$P" "done" "$version"
       }
 
       case "''${1:-}" in
