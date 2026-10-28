@@ -101,7 +101,7 @@ pub type Choices = HashMap<String, HashMap<Perm, bool>>;
 /// Typewriter (with its terminal) are where the system is looked after and
 /// programs are made, and they start other apps, which then ask for
 /// themselves.
-pub const SYSTEM: &[&str] = &["chlorum-library", "com.system76.CosmicTerm", "chlorum-typewriter"];
+pub const SYSTEM: &[&str] = &["chlorum-library", "chlorum-gallery", "com.system76.CosmicTerm", "chlorum-typewriter"];
 
 /// What an app asks for the first time it starts. Apps may say it in their
 /// .desktop entry (`X-Chlorum-Permissions=network;sound;`); for the ones

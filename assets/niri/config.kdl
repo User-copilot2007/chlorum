@@ -116,6 +116,8 @@ binds {
     Super+bracketleft { spawn "chlorum" "msg" "shrink"; }
     Super+bracketright { spawn "chlorum" "msg" "grow"; }
     Super+X repeat=false { spawn "chlorum" "msg" "swap"; }
+    Super+F repeat=false { fullscreen-window; }
+    Super+Q repeat=false { close-window; }
     Super+Return repeat=false { spawn "chlorum" "msg" "template"; }
     Super+H repeat=false { spawn "chlorum" "msg" "home"; }
     Super+L repeat=false allow-when-locked=true { spawn "chlorum" "lock"; }
@@ -144,6 +146,15 @@ binds {
     XF86AudioRaiseVolume allow-when-locked=true { spawn "wpctl" "set-volume" "-l" "1" "@DEFAULT_AUDIO_SINK@" "5%+"; }
     XF86AudioLowerVolume allow-when-locked=true { spawn "wpctl" "set-volume" "@DEFAULT_AUDIO_SINK@" "5%-"; }
     XF86AudioMute allow-when-locked=true { spawn "wpctl" "set-mute" "@DEFAULT_AUDIO_SINK@" "toggle"; }
+    XF86AudioMicMute allow-when-locked=true { spawn "wpctl" "set-mute" "@DEFAULT_AUDIO_SOURCE@" "toggle"; }
+    XF86AudioPlay allow-when-locked=true { spawn "playerctl" "play-pause"; }
+    XF86AudioPause allow-when-locked=true { spawn "playerctl" "pause"; }
+    XF86AudioNext allow-when-locked=true { spawn "playerctl" "next"; }
+    XF86AudioPrev allow-when-locked=true { spawn "playerctl" "previous"; }
+    XF86AudioStop allow-when-locked=true { spawn "playerctl" "stop"; }
+
+    // every shortcut, on screen
+    Super+Slash repeat=false { show-hotkey-overlay; }
     XF86MonBrightnessUp allow-when-locked=true { spawn "brightnessctl" "set" "5%+"; }
     XF86MonBrightnessDown allow-when-locked=true { spawn "brightnessctl" "set" "5%-"; }
 

@@ -137,11 +137,34 @@ pub fn sleeps() -> impl Stream<Item = ()> {
                 .member("PrepareForSleep")?
                 .build();
             let mut stream = zbus::MessageStream::for_match_rule(rule, &conn, Some(16)).await?;
+            // logind waits (up to its InhibitDelayMaxSec) while we hold this,
+            // so the lock screen is up before the computer sleeps
+            let inhibit = |conn: zbus::Connection| async move {
+                let m = conn
+                    .call_method(
+                        Some("org.freedesktop.login1"),
+                        "/org/freedesktop/login1",
+                        Some("org.freedesktop.login1.Manager"),
+                        "Inhibit",
+                        &("sleep", "Chlorum", "Locking the screen first", "delay"),
+                    )
+                    .await
+                    .ok()?;
+                m.body().deserialize::<zbus::zvariant::OwnedFd>().ok()
+            };
+            let mut held = inhibit(conn.clone()).await;
             while let Some(Ok(msg)) = stream.next().await {
                 if msg.body().deserialize::<bool>().unwrap_or(false) {
                     let _ = out.send(()).await;
+                    // the lock screen needs a moment to show on every screen
+                    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+                    held = None;
+                } else if held.is_none() {
+                    // woke up: ready for the next time
+                    held = inhibit(conn.clone()).await;
                 }
             }
+            drop(held);
             Ok::<(), zbus::Error>(())
         };
         if let Err(e) = run.await {

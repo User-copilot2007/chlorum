@@ -134,6 +134,166 @@ pub async fn toggle_mute() -> Sound {
     sound().await
 }
 
+/// A speaker, headphones, a monitor's sound, a microphone…
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioDev {
+    /// PipeWire's id (for wpctl)
+    pub id: u32,
+    pub name: String,
+    pub default: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Devices {
+    pub outputs: Vec<AudioDev>,
+    pub inputs: Vec<AudioDev>,
+    pub mic_volume: f32,
+    pub mic_muted: bool,
+    pub mic_present: bool,
+}
+
+/// Every sound output and input PipeWire knows, which ones are used, and
+/// the microphone's level.
+pub async fn devices() -> Devices {
+    let mut d = match output("pw-dump", &[]).await {
+        Ok(s) => parse_devices(&s),
+        Err(_) => Devices::default(),
+    };
+    if let Ok(s) = output("wpctl", &["get-volume", "@DEFAULT_AUDIO_SOURCE@"]).await {
+        d.mic_volume = s.split_whitespace().nth(1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        d.mic_muted = s.contains("MUTED");
+        d.mic_present = !d.inputs.is_empty();
+    }
+    d
+}
+
+fn parse_devices(json: &str) -> Devices {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let Some(objs) = v.as_array() else { return Devices::default() };
+    // the names of the ones in use
+    let mut default_sink = String::new();
+    let mut default_source = String::new();
+    for o in objs {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Metadata") {
+            continue;
+        }
+        if o.pointer("/props/metadata.name").and_then(|n| n.as_str()) != Some("default") {
+            continue;
+        }
+        for m in o.get("metadata").and_then(|m| m.as_array()).into_iter().flatten() {
+            let name = m.pointer("/value/name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+            match m.get("key").and_then(|k| k.as_str()) {
+                Some("default.audio.sink") => default_sink = name,
+                Some("default.audio.source") => default_source = name,
+                _ => {}
+            }
+        }
+    }
+    let mut d = Devices::default();
+    for o in objs {
+        if o.get("type").and_then(|t| t.as_str()) != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let Some(props) = o.pointer("/info/props") else { continue };
+        let class = props.get("media.class").and_then(|c| c.as_str()).unwrap_or("");
+        let id = o.get("id").and_then(|i| i.as_u64()).unwrap_or(0) as u32;
+        let node = props.get("node.name").and_then(|c| c.as_str()).unwrap_or("");
+        let name = props
+            .get("node.description")
+            .or_else(|| props.get("node.nick"))
+            .and_then(|c| c.as_str())
+            .unwrap_or(node)
+            .to_string();
+        match class {
+            "Audio/Sink" => d.outputs.push(AudioDev { id, name, default: node == default_sink }),
+            "Audio/Source" => d.inputs.push(AudioDev { id, name, default: node == default_source }),
+            _ => {}
+        }
+    }
+    d.outputs.sort_by(|a, b| b.default.cmp(&a.default).then(a.name.cmp(&b.name)));
+    d.inputs.sort_by(|a, b| b.default.cmp(&a.default).then(a.name.cmp(&b.name)));
+    d
+}
+
+pub async fn set_default_device(id: u32) -> Devices {
+    let _ = output("wpctl", &["set-default", &id.to_string()]).await;
+    devices().await
+}
+
+pub async fn set_mic_volume(v: f32) -> Devices {
+    let v = v.clamp(0.0, 1.0);
+    let _ = output("wpctl", &["set-volume", "@DEFAULT_AUDIO_SOURCE@", &format!("{v:.2}")]).await;
+    let _ = output("wpctl", &["set-mute", "@DEFAULT_AUDIO_SOURCE@", "0"]).await;
+    devices().await
+}
+
+pub async fn toggle_mic() -> Devices {
+    let _ = output("wpctl", &["set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle"]).await;
+    devices().await
+}
+
+/// A short chime on the output in use: is sound coming out, and where?
+pub async fn test_sound() -> Result<(), String> {
+    let path = std::env::temp_dir().join("chlorum-test-sound.wav");
+    std::fs::write(&path, chime()).map_err(|e| e.to_string())?;
+    output("pw-play", &[path.to_string_lossy().as_ref()]).await.map(|_| ())
+}
+
+/// Two soft notes (A5, E6), 16-bit mono WAV.
+fn chime() -> Vec<u8> {
+    const RATE: u32 = 48000;
+    let mut samples: Vec<i16> = vec![];
+    for (freq, secs) in [(880.0f32, 0.35f32), (1318.5, 0.5)] {
+        let n = (RATE as f32 * secs) as usize;
+        for i in 0..n {
+            let t = i as f32 / RATE as f32;
+            // quick rise, slow fall
+            let env = (t * 60.0).min(1.0) * (-t * 6.0).exp();
+            samples.push((f32::sin(2.0 * std::f32::consts::PI * freq * t) * env * 0.35 * i16::MAX as f32) as i16);
+        }
+    }
+    let data_len = (samples.len() * 2) as u32;
+    let mut w = Vec::with_capacity(44 + data_len as usize);
+    w.extend(b"RIFF");
+    w.extend((36 + data_len).to_le_bytes());
+    w.extend(b"WAVEfmt ");
+    w.extend(16u32.to_le_bytes());
+    w.extend(1u16.to_le_bytes());
+    w.extend(1u16.to_le_bytes());
+    w.extend(RATE.to_le_bytes());
+    w.extend((RATE * 2).to_le_bytes());
+    w.extend(2u16.to_le_bytes());
+    w.extend(16u16.to_le_bytes());
+    w.extend(b"data");
+    w.extend(data_len.to_le_bytes());
+    for s in samples {
+        w.extend(s.to_le_bytes());
+    }
+    w
+}
+
+#[cfg(test)]
+mod sound_tests {
+    #[test]
+    fn devices_from_pw_dump() {
+        let j = r#"[
+          {"id":40,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Audio/Sink","node.name":"alsa_output.hdmi","node.description":"AD104 HDMI / DisplayPort 1 Output"}}},
+          {"id":41,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Audio/Sink","node.name":"alsa_output.analog","node.description":"Built-in Audio Analog Stereo"}}},
+          {"id":42,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Audio/Source","node.name":"alsa_input.analog","node.description":"Built-in Audio Analog Stereo"}}},
+          {"id":43,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"firefox"}}},
+          {"id":30,"type":"PipeWire:Interface:Metadata","props":{"metadata.name":"default"},"metadata":[
+            {"subject":0,"key":"default.audio.sink","type":"Spa:String:JSON","value":{"name":"alsa_output.hdmi"}},
+            {"subject":0,"key":"default.audio.source","type":"Spa:String:JSON","value":{"name":"alsa_input.analog"}}]}
+        ]"#;
+        let d = super::parse_devices(j);
+        assert_eq!(d.outputs.len(), 2);
+        assert!(d.outputs[0].default && d.outputs[0].id == 40);
+        assert_eq!(d.inputs.len(), 1);
+        assert!(d.inputs[0].default);
+        assert_eq!(&super::chime()[..4], b"RIFF");
+    }
+}
+
 // ---------------------------------------------------------------- network
 
 pub async fn network() -> String {
@@ -358,6 +518,37 @@ pub async fn wifi_list() -> Vec<Wifi> {
         Ok(s) => parse_wifi(&s),
         Err(_) => vec![],
     }
+}
+
+/// Is the Wi-Fi radio on? (None: there is no Wi-Fi here)
+pub async fn wifi_on() -> Option<bool> {
+    let s = output("nmcli", &["-t", "-f", "WIFI-HW,WIFI", "radio"]).await.ok()?;
+    let line = s.lines().next()?;
+    let (hw, on) = line.split_once(':')?;
+    if hw.trim() == "missing" {
+        return None;
+    }
+    Some(on.trim() == "enabled")
+}
+
+pub async fn set_wifi(on: bool) -> Result<(), String> {
+    output("nmcli", &["radio", "wifi", if on { "on" } else { "off" }]).await.map(|_| ()).map_err(|e| {
+        let why = e.lines().last().unwrap_or("").trim().trim_start_matches("Error:").trim().to_string();
+        if why.is_empty() { "Could not switch Wi-Fi.".to_string() } else { why }
+    })
+}
+
+/// Leaves the Wi-Fi network it is on (it is not forgotten).
+pub async fn wifi_disconnect(_ssid: String) -> Result<(), String> {
+    // the Wi-Fi device itself (a saved network's name may differ from it)
+    let devs = output("nmcli", &["-t", "-f", "DEVICE,TYPE", "device"]).await.unwrap_or_default();
+    let Some(dev) = devs.lines().find_map(|l| l.strip_suffix(":wifi")).map(|d| d.replace("\\:", ":")) else {
+        return Err("There is no Wi-Fi here.".into());
+    };
+    output("nmcli", &["device", "disconnect", dev.as_str()]).await.map(|_| ()).map_err(|e| {
+        let why = e.lines().last().unwrap_or("").trim().trim_start_matches("Error:").trim().to_string();
+        if why.is_empty() { "Could not disconnect.".to_string() } else { why }
+    })
 }
 
 pub async fn wifi_connect(ssid: String, password: String) -> Result<(), String> {

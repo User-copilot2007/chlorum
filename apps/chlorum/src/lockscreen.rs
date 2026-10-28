@@ -107,7 +107,13 @@ impl Application for Lock {
         };
         // screens are announced right after start; lock once they are known
         let go = Task::perform(tokio::time::sleep(Duration::from_millis(300)), |_| cosmic::Action::App(Message::Go));
-        (l, go)
+        // the password is typed in the first layout (English): a lock
+        // started while Ukrainian was on would turn it into other letters
+        let latin = Task::perform(
+            crate::niri::run(vec![niri_ipc::Action::SwitchLayout { layout: niri_ipc::LayoutSwitchTarget::Index(0) }]),
+            |_| cosmic::Action::App(Message::Tick),
+        );
+        (l, Task::batch([go, latin]))
     }
 
     fn subscription(&self) -> Subscription<Message> {

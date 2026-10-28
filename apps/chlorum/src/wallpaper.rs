@@ -2,6 +2,13 @@
 //! of every screen. Settings come from ~/.config/chlorum/wallpaper and are
 //! picked up while running. Drawing stops while an app covers the screen
 //! (the shell creates $XDG_RUNTIME_DIR/chlorum/wallpaper-paused).
+//!
+//! Drawing a shader live costs the graphics card all the time. So each
+//! style (with its settings) is drawn once, in the background, into a video
+//! of the screen's real size at 60 frames a second that loops without a
+//! seam (`chlorum wallpaper-render`), kept in ~/.cache/chlorum/wallpaper.
+//! From then on the wallpaper is that video, played by the graphics card
+//! (mpvpaper); the live drawing is only shown until the video is ready.
 
 use std::{
     collections::HashMap,
@@ -203,6 +210,11 @@ impl Gl {
         Gl { egl, display, config, context, gl, program: None, style: String::new() }
     }
 
+    /// Which graphics the drawing runs on ("NVIDIA GeForce RTX 4070/PCIe/SSE2").
+    fn renderer(&self) -> String {
+        unsafe { self.gl.get_parameter_string(glow::RENDERER) }
+    }
+
     fn use_style(&mut self, style: &str) {
         if self.style == style {
             return;
@@ -244,6 +256,7 @@ impl Gl {
 
 struct Screen {
     layer: LayerSurface,
+    output: wl_output::WlOutput,
     size: (u32, u32),
     egl_window: Option<wayland_egl::WlEglSurface>,
     egl_surface: Option<egl::Surface>,
@@ -398,7 +411,7 @@ impl OutputHandler for App {
         layer.commit();
         self.screens.insert(
             output.id().protocol_id(),
-            Screen { layer, size: (0, 0), egl_window: None, egl_surface: None, waiting: false, viewport, drawn: (0, 0), last_draw: None },
+            Screen { layer, output: output.clone(), size: (0, 0), egl_window: None, egl_surface: None, waiting: false, viewport, drawn: (0, 0), last_draw: None },
         );
     }
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
@@ -425,15 +438,17 @@ impl LayerShellHandler for App {
     ) {
         let Some(id) = self.id_of(layer.wl_surface()) else { return };
         let (w, h) = (configure.new_size.0.max(1), configure.new_size.1.max(1));
+        // the screen's real pixels: a 4K screen at 200% is 1920 x 1080 to
+        // the layout but 3840 x 2160 to look at
+        let sf = self.screens.get(&id).and_then(|s| self.outputs.info(&s.output)).map(|i| i.scale_factor.max(1)).unwrap_or(1) as f64;
         let g = &self.gl;
         let screen = self.screens.get_mut(&id).unwrap();
-        if screen.size != (w, h) || screen.egl_window.is_none() {
+        if screen.size != (w, h) || screen.egl_window.is_none() || screen.drawn.0 != ((w as f64) * sf * RENDER_SCALE).round() as u32 {
             screen.size = (w, h);
-            // drawn smaller, shown full size
             let (dw, dh) = match &screen.viewport {
                 Some(vp) => {
                     vp.set_destination(w as i32, h as i32);
-                    (((w as f64) * RENDER_SCALE).round().max(1.0) as u32, ((h as f64) * RENDER_SCALE).round().max(1.0) as u32)
+                    (((w as f64) * sf * RENDER_SCALE).round().max(1.0) as u32, ((h as f64) * sf * RENDER_SCALE).round().max(1.0) as u32)
                 }
                 None => (w, h),
             };
@@ -472,6 +487,18 @@ delegate_noop!(App: ignore WpViewporter);
 delegate_noop!(App: ignore WpViewport);
 
 pub fn run() {
+    // the video, when it is made for these settings and this screen
+    let settings = load_settings();
+    let (w, h) = screen_size();
+    // the player did not work this time: only the live drawing
+    let live_only = std::env::var_os("CHLORUM_WALLPAPER_LIVE").is_some();
+    if shader_source(&settings.style).is_some() && !live_only {
+        let video = video_path(&settings, w, h);
+        if video.exists() {
+            play(&video, &settings);
+        }
+        start_render(w, h);
+    }
     let conn = Connection::connect_to_env().expect("not in a Wayland session");
     let (globals, queue) = registry_queue_init::<App>(&conn).expect("Wayland registry");
     let qh = queue.handle();
@@ -496,6 +523,9 @@ pub fn run() {
         viewporter: globals.bind(&qh, 1..=1, ()).ok(),
     };
     app.reload();
+    eprintln!("chlorum-wallpaper: drawing live with {}", app.gl.renderer());
+    let (vw, vh) = (w, h);
+    let mut rendering_for = app.settings.clone();
 
     // Twice a second: notice new settings and pause or resume.
     let qh2 = qh.clone();
@@ -504,6 +534,17 @@ pub fn run() {
         .insert_source(Timer::from_duration(Duration::from_millis(500)), move |_, _, app| {
             let was = app.paused;
             app.reload();
+            // the video is ready: from now on it is the wallpaper
+            if !live_only && shader_source(&app.settings.style).is_some() && video_path(&app.settings, vw, vh).exists() {
+                restart();
+            }
+            // new settings: their video is made (the old one is stopped by itself)
+            if !live_only && app.settings != rendering_for {
+                rendering_for = app.settings.clone();
+                if shader_source(&app.settings.style).is_some() {
+                    start_render(vw, vh);
+                }
+            }
             if app.paused {
                 // hidden: a good moment to restart the clock unseen
                 if app.clock > CLOCK_WRAP {
@@ -541,4 +582,296 @@ pub fn run() {
     loop {
         event_loop.dispatch(None, &mut app).unwrap();
     }
+}
+
+
+// ------------------------------------------------------------ the video
+
+/// Seconds in the loop, and of the blend from its end into its start.
+const LOOP: u32 = 30;
+const BLEND: u32 = 2;
+
+fn cache_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"));
+    base.join("chlorum/wallpaper")
+}
+
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| "/tmp".into()).join("chlorum")
+}
+
+/// The video of these settings at this size.
+fn video_path(s: &Settings, w: u32, h: u32) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut hs = std::collections::hash_map::DefaultHasher::new();
+    s.style.hash(&mut hs);
+    for v in [s.speed, s.brightness, s.amount, s.color[0], s.color[1], s.color[2]] {
+        ((v * 1000.0).round() as i64).hash(&mut hs);
+    }
+    // a new version of a shader makes a new video
+    shader_source(&s.style).unwrap_or("").hash(&mut hs);
+    COMMON.hash(&mut hs);
+    cache_dir().join(format!("{}-{:012x}-{w}x{h}.mp4", s.style, hs.finish() & 0xffff_ffff_ffff))
+}
+
+/// The biggest screen's real size (what the video is made at).
+fn screen_size() -> (u32, u32) {
+    let Ok(mut sock) = niri_ipc::socket::Socket::connect() else { return (3840, 2160) };
+    let Ok(Ok(niri_ipc::Response::Outputs(outs))) = sock.send(niri_ipc::Request::Outputs) else { return (3840, 2160) };
+    outs.values()
+        .filter_map(|o| {
+            let m = o.modes.get(o.current_mode?)?;
+            // turned a quarter: drawn upright, shown turned
+            let turned = matches!(o.logical.as_ref().map(|l| l.transform), Some(niri_ipc::Transform::_90 | niri_ipc::Transform::_270 | niri_ipc::Transform::Flipped90 | niri_ipc::Transform::Flipped270));
+            Some(if turned { (m.height as u32, m.width as u32) } else { (m.width as u32, m.height as u32) })
+        })
+        .max_by_key(|(w, h)| w * h)
+        .unwrap_or((3840, 2160))
+}
+
+/// Starts making the video in the background, if it is not being made.
+fn start_render(w: u32, h: u32) {
+    let Ok(me) = std::env::current_exe() else { return };
+    let _ = std::process::Command::new(me)
+        .args(["wallpaper-render", &w.to_string(), &h.to_string()])
+        .stdin(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Starts the wallpaper again (now as the video).
+fn restart() -> ! {
+    use std::os::unix::process::CommandExt;
+    let me = std::env::current_exe().unwrap_or_else(|_| "chlorum".into());
+    let e = std::process::Command::new(me).arg("wallpaper").exec();
+    eprintln!("chlorum-wallpaper: {e}");
+    std::process::exit(1)
+}
+
+/// Shows the video until the settings change; pauses it while an app
+/// covers the screen.
+fn play(video: &std::path::Path, settings: &Settings) -> ! {
+    let sock = runtime_dir().join("wallpaper-mpv.sock");
+    let _ = std::fs::create_dir_all(runtime_dir());
+    let _ = std::fs::remove_file(&sock);
+    let opts = format!(
+        "no-audio loop-file=inf hwdec=auto-safe panscan=1.0 keepaspect=yes input-ipc-server={} osc=no osd-level=0 really-quiet",
+        sock.display()
+    );
+    let mut child = match std::process::Command::new("mpvpaper").args(["-o", &opts, "*"]).arg(video).stdin(std::process::Stdio::null()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("chlorum-wallpaper: no mpvpaper ({e}); drawing live");
+            live_after_all();
+        }
+    };
+    eprintln!("chlorum-wallpaper: playing {}", video.display());
+    let mut paused = false;
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Ok(Some(st)) = child.try_wait() {
+            eprintln!("chlorum-wallpaper: the player stopped ({st}); drawing live");
+            live_after_all();
+        }
+        // new settings: the video of those (or the live drawing meanwhile)
+        if load_settings() != *settings {
+            let _ = child.kill();
+            let _ = child.wait();
+            restart();
+        }
+        let now = paused_path().exists();
+        if now != paused {
+            paused = now;
+            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
+                use std::io::Write;
+                let _ = writeln!(s, "{{\"command\":[\"set_property\",\"pause\",{}]}}", if paused { "true" } else { "false" });
+            }
+        }
+    }
+}
+
+/// The video could not be played: live drawing, and no new tries this run.
+fn live_after_all() -> ! {
+    use std::os::unix::process::CommandExt;
+    let me = std::env::current_exe().unwrap_or_else(|_| "chlorum".into());
+    let e = std::process::Command::new(me).arg("wallpaper").env("CHLORUM_WALLPAPER_LIVE", "1").exec();
+    eprintln!("chlorum-wallpaper: {e}");
+    std::process::exit(1)
+}
+
+/// `chlorum wallpaper-render W H`: draws the wallpaper's loop on the
+/// graphics card, frame by frame, into the video (two runs of ffmpeg: the
+/// frames, then the end blended into the start). Progress is in
+/// $XDG_RUNTIME_DIR/chlorum/wallpaper-render ("37").
+pub fn render_cli(args: &[String]) -> Result<(), String> {
+    let w: u32 = args.first().and_then(|a| a.parse().ok()).unwrap_or(3840);
+    let h: u32 = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(2160);
+    // one at a time: a later one waits, then makes the video of whatever
+    // the settings are by then (a slider moved many times makes one)
+    let _ = std::fs::create_dir_all(runtime_dir());
+    let lock = runtime_dir().join("wallpaper-render.lock");
+    let lock_file = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock).map_err(|e| e.to_string())?;
+    if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&lock_file), libc::LOCK_EX) } != 0 {
+        return Ok(());
+    }
+    loop {
+        match render_once(w, h) {
+            Err(e) if e.contains("the settings changed") => continue,
+            r => return r,
+        }
+    }
+}
+
+fn render_once(w: u32, h: u32) -> Result<(), String> {
+    let settings = load_settings();
+    if shader_source(&settings.style).is_none() {
+        return Ok(());
+    }
+    let out = video_path(&settings, w, h);
+    if out.exists() {
+        return Ok(());
+    }
+    let dir = cache_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // old videos go (each is a few hundred megabytes)
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            if e.path() != out {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let progress = runtime_dir().join("wallpaper-render");
+    let say = |pct: u32| {
+        let _ = std::fs::write(&progress, pct.to_string());
+    };
+    say(0);
+    let frames_path = dir.join("frames.mkv");
+    let r = (|| -> Result<(), String> {
+        let conn = Connection::connect_to_env().map_err(|e| e.to_string())?;
+        let mut gl = Gl::new(&conn);
+        let renderer = gl.renderer();
+        eprintln!("chlorum-wallpaper: making the {w}x{h} video of {} with {renderer}", settings.style);
+        // without a graphics card (software drawing) a 4K video would take
+        // hours: then it is made at 1080p and scaled up when shown
+        let soft = renderer.to_lowercase().contains("llvmpipe") || renderer.to_lowercase().contains("softpipe");
+        let (w, h) = if soft { (w.min(1920), h.min(1080)) } else { (w, h) };
+        gl.use_style(&settings.style);
+        let Some(program) = gl.program else { return Err("the shader did not compile".into()) };
+        let g = &gl.gl;
+        let fps = 60u32;
+        let total = (LOOP + BLEND) * fps;
+        unsafe {
+            let tex = g.create_texture()?;
+            g.active_texture(glow::TEXTURE2);
+            g.bind_texture(glow::TEXTURE_2D, Some(tex));
+            g.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA as i32, w as i32, h as i32, 0, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(None));
+            let fbo = g.create_framebuffer()?;
+            g.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
+            g.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(tex), 0);
+            if g.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+                return Err("no offscreen frame".into());
+            }
+        }
+        let nvenc = nvenc_works();
+        let mut ff = ffmpeg_frames(w, h, fps, &frames_path, nvenc)?;
+        let mut stdin = ff.stdin.take().ok_or("no ffmpeg input")?;
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let rate = 0.08 + 1.6 * settings.speed as f64;
+        for k in 0..total {
+            let clock = (k as f64 / fps as f64) * rate;
+            unsafe {
+                g.viewport(0, 0, w as i32, h as i32);
+                g.use_program(Some(program));
+                g.uniform_1_f32(g.get_uniform_location(program, "t").as_ref(), clock as f32);
+                g.uniform_2_f32(g.get_uniform_location(program, "res").as_ref(), w as f32, h as f32);
+                g.uniform_1_f32(g.get_uniform_location(program, "bright").as_ref(), settings.brightness);
+                g.uniform_1_f32(g.get_uniform_location(program, "amount").as_ref(), settings.amount);
+                g.uniform_3_f32(g.get_uniform_location(program, "col").as_ref(), settings.color[0], settings.color[1], settings.color[2]);
+                g.enable_vertex_attrib_array(0);
+                g.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+                g.draw_arrays(glow::TRIANGLES, 0, 3);
+                g.read_pixels(0, 0, w as i32, h as i32, glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelPackData::Slice(Some(&mut buf)));
+            }
+            use std::io::Write;
+            stdin.write_all(&buf).map_err(|e| format!("ffmpeg stopped taking frames: {e}"))?;
+            if k % 30 == 0 {
+                say(k * 80 / total);
+            }
+            // settings changed meanwhile: this video is not wanted any more
+            if k % 120 == 0 && load_settings() != settings {
+                return Err("the settings changed".into());
+            }
+        }
+        drop(stdin);
+        let st = ff.wait().map_err(|e| e.to_string())?;
+        if !st.success() {
+            return Err("ffmpeg could not make the frames".into());
+        }
+        say(85);
+        // the loop: from BLEND seconds in to the end, the last BLEND
+        // seconds blended into the first ones, so its end is its start
+        let tmp = out.with_extension("part.mp4");
+        let filter = format!(
+            "[0:v]trim=start={b}:end={e},setpts=PTS-STARTPTS[a];[0:v]trim=start=0:end={b},setpts=PTS-STARTPTS[s];[a][s]xfade=transition=fade:duration={b}:offset={o},format=yuv420p[v]",
+            b = BLEND,
+            e = LOOP + BLEND,
+            o = LOOP - BLEND
+        );
+        let ok = (nvenc && encode(&frames_path, &filter, &tmp, true)) || encode(&frames_path, &filter, &tmp, false);
+        let _ = std::fs::remove_file(&frames_path);
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+            return Err("ffmpeg could not make the loop".into());
+        }
+        std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&progress);
+    let _ = std::fs::remove_file(&frames_path);
+    match r {
+        Ok(()) => {
+            eprintln!("chlorum-wallpaper: the video is ready: {}", out.display());
+            Ok(())
+        }
+        Err(e) => Err(format!("wallpaper video: {e}")),
+    }
+}
+
+/// Can ffmpeg use the graphics card's encoder (NVIDIA)? One small test
+/// frame tells.
+fn nvenc_works() -> bool {
+    std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "quiet", "-f", "lavfi", "-i", "color=c=black:s=256x256", "-frames:v", "1", "-c:v", "hevc_nvenc", "-f", "null", "-"])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// ffmpeg taking raw frames: nearly lossless, fast (the graphics card's
+/// encoder when there is one).
+fn ffmpeg_frames(w: u32, h: u32, fps: u32, out: &std::path::Path, nvenc: bool) -> Result<std::process::Child, String> {
+    let size = format!("{w}x{h}");
+    let rate = fps.to_string();
+    let mut c = std::process::Command::new("ffmpeg");
+    c.args(["-nostdin", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgba", "-s", &size, "-r", &rate, "-i", "-", "-vf", "vflip"]);
+    if nvenc {
+        c.args(["-c:v", "hevc_nvenc", "-preset", "p4", "-rc", "constqp", "-qp", "12"]);
+    } else {
+        c.args(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "10"]);
+    }
+    c.args(["-pix_fmt", "yuv420p"]).arg(out).stdin(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit()).spawn().map_err(|e| format!("no ffmpeg: {e}"))
+}
+
+fn encode(input: &std::path::Path, filter: &str, out: &std::path::Path, nvenc: bool) -> bool {
+    let mut c = std::process::Command::new("ffmpeg");
+    c.args(["-nostdin", "-loglevel", "error", "-y", "-i"]).arg(input).args(["-filter_complex", filter, "-map", "[v]", "-an"]);
+    if nvenc {
+        c.args(["-c:v", "hevc_nvenc", "-preset", "p6", "-rc", "vbr", "-cq", "20", "-tag:v", "hvc1"]);
+    } else {
+        c.args(["-c:v", "libx264", "-preset", "medium", "-crf", "20"]);
+    }
+    c.args(["-movflags", "+faststart"]).arg(out).stdin(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
 }

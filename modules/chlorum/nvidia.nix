@@ -17,6 +17,9 @@
       open = true;
       modesetting.enable = true;
       nvidiaSettings = false;
+      # video memory is saved before sleeping and put back after, so the
+      # screen comes back after sleep
+      powerManagement.enable = true;
       package = config.boot.kernelPackages.nvidiaPackages.stable;
     };
 

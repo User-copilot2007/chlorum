@@ -14,6 +14,8 @@ pub struct App {
     pub wm_class: Option<String>,
     /// what it says it wants (X-Chlorum-Permissions=network;sound;)
     pub permissions: Option<String>,
+    /// the kinds of files it opens (MimeType=)
+    pub mime: Vec<String>,
 }
 
 impl App {
@@ -35,9 +37,62 @@ impl App {
 }
 
 /// Apps on Home when the owner has not chosen their own list.
-pub const DEFAULT_PINNED: &[&str] = &["librewolf", "chlorum-library", "chlorum-typewriter", "com.system76.CosmicTerm"];
+pub const DEFAULT_PINNED: &[&str] = &["librewolf", "chlorum-library", "chlorum-gallery", "chlorum-typewriter", "com.system76.CosmicTerm"];
 /// Apps never shown on Home or in the app list.
-pub const HIDDEN: &[&str] = &["nixos-manual", "com.system76.CosmicEdit", "chlorum-shell"];
+pub const HIDDEN: &[&str] = &[
+    "nixos-manual",
+    "com.system76.CosmicEdit",
+    "chlorum-shell",
+    // the parts of an app that only start it in another way
+    "foot-server",
+    "footclient",
+    // players and viewers that only show a file they are given: Library
+    // and Gallery open them with one
+    "mpv",
+    "umpv",
+    "imv",
+    "imv-dir",
+    "org.pwmt.zathura",
+    "display-im6.q16",
+    "display-im7.q16",
+    "texdoctk",
+    "xterm",
+    "nvim",
+    "cups",
+];
+
+/// Apps that are one program started in different ways (LibreOffice's
+/// Writer, Calc…) share a family: the program's file name.
+pub fn family(a: &App) -> String {
+    // the program itself: past "env VAR=x", not a shell or a launcher
+    let words: Vec<&str> = a.exec.split_whitespace().collect();
+    let mut prog = "";
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        let base = Path::new(w).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        if base == "env" || (w.contains('=') && !w.starts_with('/')) || w.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        prog = w;
+        break;
+    }
+    let base = Path::new(prog).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+    let base = base.trim_start_matches('.').trim_end_matches("-wrapped").to_string();
+    match base.as_str() {
+        "footclient" => "foot".into(),
+        "soffice" | "libreoffice" | "loffice" | "lowriter" | "localc" | "loimpress" | "lodraw" | "lomath" | "lobase" => "libreoffice".into(),
+        // a shell, a launcher or nothing says nothing: the app is its own
+        "" | "sh" | "bash" | "true" | "flatpak" | "steam" | "wine" | "java" | "python3" | "python" | "chlorum" | "xdg-open" | "gtk-launch" => format!("id:{}", a.id),
+        _ => base,
+    }
+}
+
+/// Hidden by what it is called (ids differ between versions).
+pub fn hidden_by_name(a: &App) -> bool {
+    a.name.starts_with("ImageMagick")
+}
 /// Apps opened side by side when a session starts, unless the owner chose others.
 pub const DEFAULT_STARTUP: &[&str] = &["librewolf", "com.system76.CosmicTerm"];
 
@@ -69,6 +124,16 @@ pub fn id_list(name: &str, default: &[&str]) -> Vec<String> {
 }
 
 pub fn installed() -> HashMap<String, App> {
+    scan(false)
+}
+
+/// Every app that can open files, also the ones that keep out of menus
+/// (an image viewer's "open the folder" entry…); not terminal ones.
+pub fn handlers() -> HashMap<String, App> {
+    scan(true)
+}
+
+fn scan(with_hidden: bool) -> HashMap<String, App> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(h) = std::env::var_os("XDG_DATA_HOME") {
         dirs.push(PathBuf::from(h).join("applications"));
@@ -90,7 +155,7 @@ pub fn installed() -> HashMap<String, App> {
             if out.contains_key(id) {
                 continue;
             }
-            if let Some(app) = parse(id, &e.path()) {
+            if let Some(app) = parse(id, &e.path(), with_hidden) {
                 out.insert(id.to_string(), app);
             }
         }
@@ -98,10 +163,11 @@ pub fn installed() -> HashMap<String, App> {
     out
 }
 
-fn parse(id: &str, path: &Path) -> Option<App> {
+fn parse(id: &str, path: &Path, with_hidden: bool) -> Option<App> {
     let text = std::fs::read_to_string(path).ok()?;
-    let (mut name, mut icon, mut exec, mut wm, mut perms) = (None, None, None, None, None);
+    let (mut name, mut icon, mut exec, mut wm, mut perms, mut mime) = (None, None, None, None, None, None);
     let mut hidden = false;
+    let mut not_an_app = false;
     let mut in_main = false;
     for line in text.lines() {
         let line = line.trim();
@@ -122,11 +188,15 @@ fn parse(id: &str, path: &Path) -> Option<App> {
             perms.get_or_insert(v.to_string());
         } else if let Some(v) = line.strip_prefix("StartupWMClass=") {
             wm.get_or_insert(v.to_string());
-        } else if line == "NoDisplay=true" || line == "Hidden=true" || line == "Terminal=true" {
+        } else if let Some(v) = line.strip_prefix("MimeType=") {
+            mime.get_or_insert(v.split(';').filter(|m| !m.is_empty()).map(str::to_string).collect::<Vec<_>>());
+        } else if line == "NoDisplay=true" {
             hidden = true;
+        } else if line == "Hidden=true" || line == "Terminal=true" {
+            not_an_app = true;
         } else if let Some(v) = line.strip_prefix("Type=") {
             if v != "Application" {
-                hidden = true;
+                not_an_app = true;
             }
         }
     }
@@ -135,7 +205,7 @@ fn parse(id: &str, path: &Path) -> Option<App> {
         .filter(|a| !(a.len() == 2 && a.starts_with('%')))
         .collect::<Vec<_>>()
         .join(" ");
-    if hidden && id != "chlorum-library" {
+    if not_an_app || (hidden && !with_hidden && id != "chlorum-library") {
         return None;
     }
     Some(App {
@@ -145,12 +215,29 @@ fn parse(id: &str, path: &Path) -> Option<App> {
         exec,
         wm_class: wm,
         permissions: perms,
+        mime: mime.unwrap_or_default(),
     })
 }
 
 
 #[cfg(test)]
 mod launch_tests {
+    use super::*;
+
+    fn app(id: &str, exec: &str) -> App {
+        App { id: id.into(), name: id.into(), icon: String::new(), exec: exec.into(), wm_class: None, permissions: None, mime: vec![] }
+    }
+
+    #[test]
+    fn families() {
+        assert_eq!(family(&app("writer", "libreoffice --writer")), "libreoffice");
+        assert_eq!(family(&app("calc", "/nix/store/x-libreoffice/bin/libreoffice --calc")), "libreoffice");
+        assert_eq!(family(&app("foot", "foot")), family(&app("footclient", "footclient")));
+        assert_eq!(family(&app("a", "env GDK_BACKEND=x11 /nix/store/y/bin/gimp")), "gimp");
+        assert_ne!(family(&app("lib", "chlorum library")), family(&app("tw", "chlorum typewriter")));
+        assert_ne!(family(&app("x", "sh -c 'a'")), family(&app("y", "sh -c 'b'")));
+    }
+
     #[test]
     fn quoting() {
         assert_eq!(super::quote("it's"), "'it'\\''s'");

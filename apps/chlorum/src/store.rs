@@ -85,6 +85,105 @@ pub fn listed() -> Vec<&'static Entry> {
     v
 }
 
+/// The catalogue's apps that match what was typed, best first: the name
+/// starts with it, a word of it does, then it is anywhere in the name, the
+/// description, the kind or the package name.
+pub fn find(q: &str) -> Vec<&'static Entry> {
+    let q = q.trim().to_lowercase();
+    if q.is_empty() {
+        return listed();
+    }
+    let mut v: Vec<(u8, &Entry)> = listed()
+        .into_iter()
+        .filter_map(|e| {
+            let name = e.name.to_lowercase();
+            let rank = if name.starts_with(&q) {
+                0
+            } else if name.split(|c: char| !c.is_alphanumeric()).any(|w| w.starts_with(&q)) {
+                1
+            } else if name.contains(&q) || e.attr.contains(&q) {
+                2
+            } else if e.about.to_lowercase().contains(&q) || e.kind.to_lowercase() == q {
+                3
+            } else {
+                return None;
+            };
+            Some((rank, e))
+        })
+        .collect();
+    v.sort_by_key(|(r, e)| (*r, e.name.to_lowercase()));
+    v.into_iter().map(|(_, e)| e).collect()
+}
+
+/// A package found in the whole package set (not in the catalogue).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Found {
+    pub attr: String,
+    pub name: String,
+    pub about: String,
+}
+
+/// Looks through every package of the system's package set (`nix search`,
+/// slow the first time: it reads the whole set, then it is remembered).
+pub async fn search_all(q: String) -> Result<Vec<Found>, String> {
+    let q = q.trim().to_lowercase();
+    if q.chars().count() < 2 {
+        return Err("Type at least two letters.".into());
+    }
+    // what was typed is looked for as it is, not as a pattern
+    let pattern: String = q.chars().map(|c| if c.is_alphanumeric() || c == ' ' { c.to_string() } else { format!("\\{c}") }).collect();
+    let out = tokio::process::Command::new(nix())
+        .args(["search", "nixpkgs", "--json", "--quiet", "--", &pattern])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("Could not start Nix: {e}"))?;
+    if !out.status.success() && out.stdout.is_empty() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("no results") {
+            return Ok(vec![]);
+        }
+        return Err(crate::progress::first_error(&err).unwrap_or_else(|| "The search did not work.".into()));
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    Ok(rank_found(&q, &v))
+}
+
+fn rank_found(q: &str, v: &serde_json::Value) -> Vec<Found> {
+    let Some(m) = v.as_object() else { return vec![] };
+    let mut found: Vec<(u8, Found)> = m
+        .iter()
+        .filter_map(|(path, info)| {
+            // legacyPackages.x86_64-linux.<attr>
+            let attr = path.splitn(3, '.').nth(2)?.to_string();
+            // the catalogue shows its own
+            if entry(&attr).is_some() {
+                return None;
+            }
+            let name = info.get("pname").and_then(|x| x.as_str()).unwrap_or(&attr).to_string();
+            let about = info.get("description").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let n = name.to_lowercase();
+            let rank = if n == q || attr == q {
+                0
+            } else if n.starts_with(q) {
+                1
+            } else if n.contains(q) {
+                2
+            } else {
+                3
+            };
+            // libraries and parts of other packages are not apps
+            let part = attr.contains("Packages.") && !attr.starts_with("kdePackages.") || attr.starts_with("lib") && rank > 1;
+            if part {
+                return None;
+            }
+            Some((rank, Found { attr, name, about }))
+        })
+        .collect();
+    found.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.attr.len().cmp(&b.1.attr.len())).then(a.1.attr.cmp(&b.1.attr)));
+    found.into_iter().take(40).map(|(_, f)| f).collect()
+}
+
 fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
 }
@@ -151,10 +250,9 @@ pub async fn installed() -> BTreeSet<String> {
     if let Some(els) = v.get("elements").and_then(|e| e.as_object()) {
         for el in els.values() {
             let path = el.get("attrPath").and_then(|a| a.as_str()).unwrap_or("");
-            for e in CATALOG {
-                if path.ends_with(&format!(".{}", e.attr)) {
-                    set.insert(e.attr.to_string());
-                }
+            // legacyPackages.x86_64-linux.<attr>
+            if let Some(attr) = path.splitn(3, '.').nth(2) {
+                set.insert(attr.to_string());
             }
         }
     }
@@ -166,7 +264,8 @@ async fn element(attr: &str) -> Option<String> {
     let out = tokio::process::Command::new(nix()).args(["profile", "list", "--json"]).output().await.ok()?;
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
     let els = v.get("elements")?.as_object()?;
-    els.iter().find(|(_, el)| el.get("attrPath").and_then(|a| a.as_str()).is_some_and(|p| p.ends_with(&format!(".{attr}")))).map(|(k, _)| k.clone())
+    // legacyPackages.<system>.<attr>: the whole name, not its end
+    els.iter().find(|(_, el)| el.get("attrPath").and_then(|a| a.as_str()).and_then(|p| p.splitn(3, '.').nth(2)) == Some(attr)).map(|(k, _)| k.clone())
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +278,9 @@ pub enum Event {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Job {
     Install,
+    /// a package that is not free software, installed because the owner
+    /// said yes when told
+    InstallUnfree,
     Remove,
     /// every installed app to the version that fits the system now
     Update,
@@ -198,10 +300,13 @@ async fn work(job: Job, attr: &str, out: &mut Sender<Event>) -> Result<String, S
     let before = desktop_ids();
     let mut cmd = tokio::process::Command::new(nix());
     match job {
-        Job::Install => {
-            let e = entry(attr).ok_or("Unknown app.")?;
+        Job::Install | Job::InstallUnfree => {
+            // a package name only: letters, digits and . _ + -
+            if attr.is_empty() || !attr.chars().all(|c| c.is_ascii_alphanumeric() || "._+-".contains(c)) {
+                return Err("Unknown app.".into());
+            }
             cmd.args(["profile", "add", "--log-format", "internal-json"]);
-            if e.unfree {
+            if job == Job::InstallUnfree || entry(attr).is_some_and(|e| e.unfree) {
                 // asked for by name: the owner chose this non-free app
                 cmd.arg("--impure").env("NIXPKGS_ALLOW_UNFREE", "1");
             }
@@ -234,12 +339,17 @@ async fn work(job: Job, attr: &str, out: &mut Sender<Event>) -> Result<String, S
     }
     let status = child.wait().await.map_err(|e| e.to_string())?;
     if !status.success() {
+        // not free software, found by a search of every package: said, and
+        // Enter again installs it
+        if job == Job::Install && tally.error.contains("unfree") {
+            return Err(format!("UNFREE:{name} is not free software (its makers keep the code closed). Press Enter again to install it anyway."));
+        }
         return Err(if tally.error.is_empty() { format!("{name}: it did not work.") } else { tally.error.clone() });
     }
     // remember which desktop entries it brought
     let mut r = records();
     match job {
-        Job::Install => {
+        Job::Install | Job::InstallUnfree => {
             let added: Vec<String> = desktop_ids().difference(&before).cloned().collect();
             r.insert(attr.to_string(), added);
         }
@@ -250,7 +360,7 @@ async fn work(job: Job, attr: &str, out: &mut Sender<Event>) -> Result<String, S
     }
     save_records(&r);
     Ok(match job {
-        Job::Install => format!("{name} is installed. It is on Home's list of apps."),
+        Job::Install | Job::InstallUnfree => format!("{name} is installed. It is on Home's list of apps."),
         Job::Remove => format!("{name} is removed."),
         Job::Update => "Your apps are up to date.".into(),
     })
