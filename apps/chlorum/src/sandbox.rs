@@ -342,6 +342,11 @@ pub fn bwrap_args(app: &str, off: &[Perm], runtime: &Path, home: &Path, devices:
             a.extend(["--ro-bind".into(), s(&p), s(&p)]);
         }
     }
+    // the security-key helper refuses sandboxed apps anyway; they do not
+    // even see it
+    if Path::new("/run/chlorum-keyd").is_dir() {
+        a.extend(["--tmpfs".into(), "/run/chlorum-keyd".into()]);
+    }
 
     if off.contains(&Perm::Network) {
         a.push("--unshare-net".into());

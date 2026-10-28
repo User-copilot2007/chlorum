@@ -190,6 +190,13 @@ let
     EOF
     fi
 
+    # Neovim comes set up as LazyVim, for a profile without its own setup
+    if [ ! -e "$HOME/.config/nvim" ]; then
+      mkdir -p "$HOME/.config"
+      cp -r --no-preserve=mode ${../../assets/lazyvim} "$HOME/.config/nvim"
+      rm -f "$HOME/.config/nvim/README.chlorum"
+    fi
+
     export XDG_CURRENT_DESKTOP=niri
     export XCURSOR_THEME=Adwaita
     export XCURSOR_SIZE=24
@@ -451,6 +458,21 @@ in
       };
     };
 
+    # Opens encrypted flash drives with a security key (YubiKey): root,
+    # asked by Library; only removable LUKS2 drives, never from app sandboxes.
+    systemd.services.chlorum-keyd = {
+      description = "Chlorum security keys for drives";
+      wantedBy = [ "multi-user.target" ];
+      path = [ config.systemd.package pkgs.cryptsetup pkgs.util-linux pkgs.libfido2 ];
+      environment.CHLORUM_SYSTEMD_CRYPTSETUP = "${config.systemd.package}/lib/systemd/systemd-cryptsetup";
+      serviceConfig = {
+        ExecStart = "${chlorum}/bin/chlorum keyd";
+        Restart = "on-failure";
+        RuntimeDirectory = "chlorum-keyd";
+        RuntimeDirectoryMode = "0755";
+      };
+    };
+
     # The lock screen checks the profile password through PAM (homed)
     security.pam.services.chlorum-lock = { };
 
@@ -484,7 +506,27 @@ in
       pkgs.brightnessctl
       pkgs.git
       pkgs.gh
+      # Neovim with LazyVim (set up at login, see the session) and what it
+      # uses: search, a git window, a C compiler and the tree-sitter tool
+      # for syntax, and what language servers are installed with
+      pkgs.neovim
+      pkgs.ripgrep
+      pkgs.fd
+      pkgs.lazygit
+      pkgs.gcc
+      pkgs.gnumake
+      pkgs.tree-sitter
+      pkgs.unzip
+      pkgs.curl
+      pkgs.nodejs
     ];
+    environment.variables = {
+      EDITOR = "nvim";
+      VISUAL = "nvim";
+    };
+    # Language servers that LazyVim (Mason) downloads are built for other
+    # Linux systems: nix-ld lets them run here.
+    programs.nix-ld.enable = true;
     xdg.mime.defaultApplications = {
       "text/html" = "librewolf.desktop";
       "x-scheme-handler/http" = "librewolf.desktop";
@@ -493,7 +535,8 @@ in
       "text/plain" = "chlorum-typewriter.desktop";
       "text/markdown" = "chlorum-typewriter.desktop";
     };
-    fonts.packages = [ pkgs.ibm-plex pkgs.noto-fonts pkgs.noto-fonts-color-emoji ];
+    # BlexMono is IBM Plex Mono with the Nerd Font icons LazyVim shows
+    fonts.packages = [ pkgs.ibm-plex pkgs.nerd-fonts.blex-mono pkgs.noto-fonts pkgs.noto-fonts-color-emoji ];
     fonts.fontconfig.defaultFonts = {
       sansSerif = [ "IBM Plex Sans" ];
       monospace = [ "IBM Plex Mono" ];

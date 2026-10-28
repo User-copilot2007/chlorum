@@ -32,6 +32,8 @@ pub struct Drive {
     pub encrypted: bool,
     pub size: u64,
     pub state: State,
+    /// the partition as a device file (/dev/sdb1), for the security-key helper
+    pub device: String,
     drive: String,
     /// the unlocked partition, when an encrypted one is open
     clear: Option<String>,
@@ -149,6 +151,7 @@ fn pick(objs: &Objects) -> Vec<Drive> {
             encrypted,
             size: t(block, "Size"),
             state,
+            device: bytes(block, "Device"),
             drive: drive_path,
             clear,
         });
@@ -233,8 +236,20 @@ pub async fn eject(d: Drive) -> Result<(), String> {
             continue;
         }
         if let Some(c) = ifaces.get(CRYPT) {
-            if o(c, "CleartextDevice").len() > 1 {
-                conn.call_method(Some(UDISKS), path.as_str(), Some(CRYPT), "Lock", &(no_opts(),)).await.map_err(why)?;
+            let clear = o(c, "CleartextDevice");
+            if clear.len() > 1 {
+                // opened with a security key (by chlorum keyd, as root):
+                // closed by the same helper
+                let by_key = objs
+                    .iter()
+                    .find(|(p, _)| p.as_str() == clear)
+                    .and_then(|(_, i)| i.get(BLOCK))
+                    .is_some_and(|b| bytes(b, "PreferredDevice").contains("chlorum-key-") || s(b, "Id").contains("chlorum-key-"));
+                if by_key {
+                    crate::keyd::lock(bytes(block, "Device")).await?;
+                } else {
+                    conn.call_method(Some(UDISKS), path.as_str(), Some(CRYPT), "Lock", &(no_opts(),)).await.map_err(why)?;
+                }
             }
         }
     }

@@ -1,0 +1,4 @@
+The LazyVim starter configuration (https://github.com/LazyVim/starter,
+commit 803bc181d7c0d6d5eeba9274d9be49b287294d99, Apache-2.0, see LICENSE).
+Chlorum copies it to ~/.config/nvim for a profile that has no Neovim
+configuration yet; from then on it is the owner's to change.

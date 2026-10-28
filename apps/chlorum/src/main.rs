@@ -21,6 +21,7 @@ mod atom;
 mod drives;
 mod greeter;
 mod idle;
+mod keyd;
 mod layout;
 mod library;
 mod lock;
@@ -77,6 +78,7 @@ fn main() {
             Ok(())
         }
         "setupd" => setupd::run_daemon(),
+        "keyd" => keyd::run_daemon(),
         "lock" => lockscreen::run().map_err(|e| e.to_string()),
         "msg" => shell::msg(args.get(2).map(String::as_str).unwrap_or("super")).map_err(|e| e.to_string()),
         other => Err(format!("unknown command: {other}")),

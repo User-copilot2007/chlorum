@@ -167,6 +167,65 @@ impl Kind {
     }
 }
 
+/// The order files are shown in (S changes it, everywhere but Recent).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Sort {
+    Newest,
+    Oldest,
+    Name,
+    Size,
+    Kind,
+}
+
+impl Sort {
+    const ALL: [Sort; 5] = [Sort::Newest, Sort::Oldest, Sort::Name, Sort::Size, Sort::Kind];
+    fn key(self) -> &'static str {
+        match self {
+            Sort::Newest => "newest",
+            Sort::Oldest => "oldest",
+            Sort::Name => "name",
+            Sort::Size => "size",
+            Sort::Kind => "kind",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Sort::Newest => "Newest first",
+            Sort::Oldest => "Oldest first",
+            Sort::Name => "By name",
+            Sort::Size => "Largest first",
+            Sort::Kind => "By kind",
+        }
+    }
+    fn next(self) -> Sort {
+        let i = Sort::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Sort::ALL[(i + 1) % Sort::ALL.len()]
+    }
+    fn path() -> PathBuf {
+        crate::apps::config_dir().join("chlorum/library-sort")
+    }
+    fn load() -> Sort {
+        let k = std::fs::read_to_string(Sort::path()).unwrap_or_default();
+        Sort::ALL.into_iter().find(|s| s.key() == k.trim()).unwrap_or(Sort::Newest)
+    }
+    fn save(self) {
+        let p = Sort::path();
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, self.key());
+    }
+    fn apply(self, items: &mut [Item]) {
+        match self {
+            Sort::Newest => items.sort_by(|a, b| b.modified.cmp(&a.modified)),
+            Sort::Oldest => items.sort_by(|a, b| a.modified.cmp(&b.modified)),
+            Sort::Name => items.sort_by_cached_key(|i| i.name.to_lowercase()),
+            Sort::Size => items.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))),
+            Sort::Kind => items.sort_by(|a, b| a.kind.label().cmp(b.kind.label()).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Item {
     path: PathBuf,
@@ -175,6 +234,8 @@ struct Item {
     /// collection it is filed in; None while it waits for an answer
     collection: Option<String>,
     modified: SystemTime,
+    /// bytes (0 for a folder)
+    size: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -210,6 +271,11 @@ enum Focus {
     SaveName,
     /// typing the password of an encrypted drive
     DrivePassword,
+    /// opening an encrypted drive with a security key: typing the key's PIN
+    KeyPin,
+    /// adding a security key to a drive: its password, then the key's PIN
+    AddPassword,
+    AddPin,
     /// naming a new Workshop project; the number is the language
     NewProject(usize),
 }
@@ -226,6 +292,11 @@ pub enum Message {
     DriveOpened(String, Result<PathBuf, String>),
     DrivePassword(String),
     DriveSubmit,
+    KeyPin(String),
+    KeySubmit,
+    AddNext,
+    AddSubmit,
+    KeyAdded(String, Result<(), String>),
     ProjectName(String),
     ProjectSubmit,
     Ejected(String, Result<(), String>),
@@ -243,6 +314,8 @@ pub struct Library {
     always: bool,
     new_name: String,
     input_id: widget::Id,
+    /// the file grid, so it can scroll to follow the selection
+    grid_id: widget::Id,
     note: Option<String>,
     mode: Mode,
     /// picker: files marked so far (several at once)
@@ -254,8 +327,11 @@ pub struct Library {
     /// the files on the drive being looked at
     drive_items: Vec<Item>,
     drive_pw: String,
+    /// the security key's PIN, only while it is being typed
+    key_pin: String,
     drive_busy: bool,
     project_name: String,
+    sort: Sort,
 }
 
 fn home() -> PathBuf {
@@ -311,6 +387,7 @@ impl Application for Library {
             always: false,
             new_name: String::new(),
             input_id: widget::Id::unique(),
+            grid_id: widget::Id::unique(),
             note: None,
             save_name: match &mode {
                 Mode::Save { name, .. } => name.clone(),
@@ -322,8 +399,10 @@ impl Application for Library {
             drives: vec![],
             drive_items: vec![],
             drive_pw: String::new(),
+            key_pin: String::new(),
             drive_busy: false,
             project_name: String::new(),
+            sort: Sort::load(),
         };
         l.scan();
         l.view = if l.picking() { 0 } else if l.inbox().is_empty() { 1 } else { 0 };
@@ -343,7 +422,7 @@ impl Application for Library {
     fn update(&mut self, m: Message) -> Task<Message> {
         match m {
             Message::Rescan => {
-                if !matches!(self.focus, Focus::NewName | Focus::SaveName | Focus::DrivePassword | Focus::NewProject(_)) {
+                if !matches!(self.focus, Focus::NewName | Focus::SaveName | Focus::DrivePassword | Focus::KeyPin | Focus::AddPassword | Focus::AddPin | Focus::NewProject(_)) {
                     self.scan();
                 }
                 return Task::perform(crate::drives::list(), |d| cosmic::Action::App(Message::Drives(d)));
@@ -358,9 +437,30 @@ impl Application for Library {
             Message::ProjectName(s) => self.project_name = s,
             Message::ProjectSubmit => return self.make_project(),
             Message::DriveSubmit => return self.open_drive(),
+            Message::KeyPin(s) => self.key_pin = s,
+            Message::KeySubmit => return self.open_with_key(),
+            Message::AddNext => {
+                if !self.drive_pw.is_empty() {
+                    self.focus = Focus::AddPin;
+                    self.key_pin.clear();
+                    return text_input::focus(self.input_id.clone());
+                }
+            }
+            Message::AddSubmit => return self.add_key(),
+            Message::KeyAdded(name, r) => {
+                self.drive_busy = false;
+                self.drive_pw.clear();
+                self.key_pin.clear();
+                self.focus = Focus::Side;
+                self.note = Some(match r {
+                    Ok(()) => format!("{name} now also opens with your security key: press K."),
+                    Err(e) => e,
+                });
+            }
             Message::DriveOpened(name, r) => {
                 self.drive_busy = false;
                 self.drive_pw.clear();
+                self.key_pin.clear();
                 match r {
                     Ok(_) => {
                         self.note = Some(format!("{name} is open."));
@@ -368,7 +468,7 @@ impl Application for Library {
                     }
                     Err(e) => {
                         self.note = Some(e);
-                        if self.focus == Focus::DrivePassword {
+                        if matches!(self.focus, Focus::DrivePassword | Focus::KeyPin) {
                             return text_input::focus(self.input_id.clone());
                         }
                     }
@@ -391,7 +491,14 @@ impl Application for Library {
             Message::SaveSubmit => return self.save_here(),
             Message::NewName(s) => self.new_name = s,
             Message::NewSubmit => return self.create_and_file(),
-            Message::Key(k, status) => return self.key(k, status),
+            Message::Key(k, status) => {
+                let before = (self.view, self.sel);
+                let t = self.key(k, status);
+                if (self.view, self.sel) != before {
+                    return Task::batch([t, self.follow()]);
+                }
+                return t;
+            }
         }
         Task::none()
     }
@@ -491,10 +598,13 @@ impl Application for Library {
             };
             grid = grid.push(text(msg, SANS, 22.0, TEXT_2));
         }
+        let order = if view == View::Recent { "Newest first".to_string() } else { self.sort.label().to_string() };
         let main = widget::Column::new()
             .push(text(self.view_label(&view), SANS_BOLD, 44.0, TEXT))
-            .push(space(1.0, 26.0))
-            .push(widget::scrollable(grid).height(Length::Fill))
+            .push(space(1.0, 6.0))
+            .push(text(format!("{} · S", order.to_uppercase()), MONO, 14.0, TEXT_2))
+            .push(space(1.0, 20.0))
+            .push(widget::scrollable(grid).id(self.grid_id.clone()).height(Length::Fill))
             .width(Length::Fill);
 
         let mut row = widget::Row::new().push(side).push(space(56.0, 1.0)).push(main).height(Length::Fill);
@@ -511,13 +621,23 @@ impl Application for Library {
         let on_drive = matches!(view, View::Drive(_));
         let mut h: Vec<(&str, &str, bool)> = match (&self.mode, self.focus) {
             (_, Focus::DrivePassword) => vec![("ENTER", "Unlock", true), ("ESC", "Back", false)],
+            (_, Focus::KeyPin) => vec![("ENTER", "Open with the key", true), ("ESC", "Back", false)],
+            (_, Focus::AddPassword) => vec![("ENTER", "Next", true), ("ESC", "Back", false)],
+            (_, Focus::AddPin) => vec![("ENTER", "Add the key", true), ("ESC", "Back", false)],
             (_, Focus::NewProject(_)) => vec![("↑ ↓", "Language", false), ("ENTER", "Create", true), ("ESC", "Back", false)],
             (Mode::Browse, Focus::Side | Focus::Grid) if matches!(&view, View::Collection(c) if c == "Projects") => {
                 vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open in Typewriter", true), ("N", "New project", false), ("DEL", "Delete", false)]
             }
-            (Mode::Browse, Focus::Side) if on_drive => vec![("↑ ↓", "View", false), ("→", "Open", true), ("E", "Take out", false)],
+            (Mode::Browse, Focus::Side) if on_drive => {
+                let luks_locked = matches!(&view, View::Drive(id) if self.drive(id).is_some_and(|d| d.kind == "LUKS" && d.state == crate::drives::State::Locked));
+                if luks_locked {
+                    vec![("↑ ↓", "View", false), ("→", "Password", true), ("K", "Security key", false), ("A", "Add a key", false), ("E", "Take out", false)]
+                } else {
+                    vec![("↑ ↓", "View", false), ("→", "Open", true), ("E", "Take out", false)]
+                }
+            }
             (Mode::Browse, Focus::Grid) if on_drive => {
-                vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("C", "Copy into Library", false), ("E", "Take out", false)]
+                vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("C", "Copy into Library", false), ("S", "Sort", false), ("E", "Take out", false)]
             }
             (Mode::Open { folders: true, .. }, Focus::Side) => vec![("↑ ↓", "Collection", false), ("ENTER", "Choose this one", true), ("ESC", "Cancel", false)],
             (Mode::Open { .. }, Focus::Side) => vec![("↑ ↓", "View", false), ("→", "Files", true), ("ESC", "Cancel", false)],
@@ -527,7 +647,7 @@ impl Application for Library {
             (Mode::Save { .. }, _) => vec![("ENTER", "Save", true), ("ESC", "Back", false)],
             (_, Focus::SaveName) => vec![("ENTER", "Save", true), ("ESC", "Back", false)],
             (_, Focus::Side) => vec![("↑ ↓", "View", false), ("→", "Files", true)],
-            (_, Focus::Grid) => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("M", "Move to…", false), ("DEL", "Delete", false)],
+            (_, Focus::Grid) => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("M", "Move to…", false), ("S", "Sort", false), ("DEL", "Delete", false)],
             (_, Focus::Ask(_)) => vec![("↑ ↓", "Choose", false), ("1–9", "Pick", false), ("ENTER", "File it", true), ("A", "Always", false), ("ESC", "Back", false)],
             (_, Focus::NewName) => vec![("ENTER", "Create", true), ("ESC", "Back", false)],
             (_, Focus::Confirm) => vec![("ENTER", "Delete", true), ("ESC", "Keep", false)],
@@ -545,6 +665,17 @@ impl Application for Library {
 }
 
 impl Library {
+    /// Scrolls the grid so the chosen file is on screen. Rows are all the
+    /// same height, so scrolling to (row / last row) of the way down always
+    /// shows that row, without knowing the window's size.
+    fn follow(&self) -> Task<Message> {
+        let view = self.views.get(self.view).cloned().unwrap_or(View::Recent);
+        let n = self.items_in(&view).len();
+        let rows = n.div_ceil(COLS);
+        let y = if rows <= 1 { 0.0 } else { (self.sel / COLS) as f32 / (rows - 1) as f32 };
+        cosmic::iced::widget::scrollable::snap_to(self.grid_id.clone(), cosmic::iced::widget::scrollable::RelativeOffset { x: None, y: Some(y.clamp(0.0, 1.0)) })
+    }
+
     fn scan(&mut self) {
         let mut items = Vec::new();
         let lib = library_dir();
@@ -644,6 +775,15 @@ impl Library {
     }
 
     fn items_in(&self, v: &View) -> Vec<Item> {
+        let mut items = self.unsorted_items_in(v);
+        // Recent is the newest files, whatever the order chosen
+        if *v != View::Recent {
+            self.sort.apply(&mut items);
+        }
+        items
+    }
+
+    fn unsorted_items_in(&self, v: &View) -> Vec<Item> {
         if let View::Drive(id) = v {
             let looking = matches!(self.views.get(self.view), Some(View::Drive(x)) if x == id);
             if !looking {
@@ -816,8 +956,19 @@ impl Library {
             self.project_name.clear();
             return text_input::focus(self.input_id.clone());
         }
+        if ch == "s" && matches!(self.focus, Focus::Side | Focus::Grid) {
+            if view == View::Recent {
+                self.note = Some("Recent is always newest first. S sorts the other views.".into());
+                return Task::none();
+            }
+            self.sort = self.sort.next();
+            self.sort.save();
+            self.sel = 0;
+            self.note = Some(format!("{}. S changes the order.", self.sort.label()));
+            return self.follow();
+        }
         match self.focus {
-            Focus::SaveName | Focus::DrivePassword | Focus::NewProject(_) => {}
+            Focus::SaveName | Focus::DrivePassword | Focus::KeyPin | Focus::AddPassword | Focus::AddPin | Focus::NewProject(_) => {}
             Focus::NewName => {
                 if named == Some(Named::Escape) {
                     self.focus = Focus::Ask(0);
@@ -1005,12 +1156,20 @@ impl Library {
         if self.drive_busy {
             return Some(Task::none());
         }
-        if self.focus == Focus::DrivePassword {
+        if matches!(self.focus, Focus::DrivePassword | Focus::KeyPin | Focus::AddPassword | Focus::AddPin) {
             if named == Some(Named::Escape) {
                 self.focus = Focus::Side;
                 self.drive_pw.clear();
+                self.key_pin.clear();
             }
             return Some(Task::none());
+        }
+        // LUKS drives can be opened with a security key, and get one added
+        if self.focus == Focus::Side && d.state == State::Locked && d.kind == "LUKS" && (ch == "k" || ch == "a") {
+            self.focus = if ch == "k" { Focus::KeyPin } else { Focus::AddPassword };
+            self.drive_pw.clear();
+            self.key_pin.clear();
+            return Some(text_input::focus(self.input_id.clone()));
         }
         if ch == "e" && !self.picking() {
             self.drive_busy = true;
@@ -1087,6 +1246,41 @@ impl Library {
         Task::perform(crate::drives::open(d, pw), move |r| cosmic::Action::App(Message::DriveOpened(name.clone(), r)))
     }
 
+    /// Opens the locked drive with the security key, then as usual.
+    fn open_with_key(&mut self) -> Task<Message> {
+        let Some(View::Drive(id)) = self.views.get(self.view).cloned() else { return Task::none() };
+        let Some(d) = self.drive(&id) else { return Task::none() };
+        self.drive_busy = true;
+        self.note = Some("Touch your security key when it blinks…".into());
+        let (name, pin) = (d.name.clone(), std::mem::take(&mut self.key_pin));
+        Task::perform(
+            async move {
+                crate::keyd::unlock(d.device.clone(), pin).await?;
+                // now an unlocked drive like any other: open it, once UDisks
+                // has noticed it is unlocked
+                for _ in 0..20 {
+                    let now = crate::drives::list().await.into_iter().find(|x| x.id == d.id).ok_or("The drive went away.")?;
+                    if now.state != crate::drives::State::Locked {
+                        return crate::drives::open(now, None).await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                Err("The drive is unlocked, but it did not appear. Press → to open it.".to_string())
+            },
+            move |r| cosmic::Action::App(Message::DriveOpened(name.clone(), r)),
+        )
+    }
+
+    /// Adds the security key to the drive (its password proves you may).
+    fn add_key(&mut self) -> Task<Message> {
+        let Some(View::Drive(id)) = self.views.get(self.view).cloned() else { return Task::none() };
+        let Some(d) = self.drive(&id) else { return Task::none() };
+        self.drive_busy = true;
+        self.note = Some("Touch your security key when it blinks (maybe twice)…".into());
+        let (name, pw, pin) = (d.name.clone(), std::mem::take(&mut self.drive_pw), std::mem::take(&mut self.key_pin));
+        Task::perform(crate::keyd::enroll(d.device.clone(), pw, pin), move |r| cosmic::Action::App(Message::KeyAdded(name.clone(), r)))
+    }
+
     fn drive_panel(&self, view: &View) -> Option<Element<'_, Message>> {
         use crate::drives::{State, size_label};
         let View::Drive(id) = view else { return None };
@@ -1110,6 +1304,32 @@ impl Library {
                         .size(21)
                         .padding([14, 18]),
                 );
+            }
+            State::Locked if matches!(self.focus, Focus::KeyPin | Focus::AddPassword | Focus::AddPin) => {
+                let (title, hint, value, msg): (&str, &str, &str, fn(String) -> Message) = match self.focus {
+                    Focus::KeyPin => ("Your security key's PIN", "PIN (leave empty if it has none)", self.key_pin.as_str(), Message::KeyPin),
+                    Focus::AddPassword => ("Add a security key: the drive's password", "Password", self.drive_pw.as_str(), Message::DrivePassword),
+                    _ => ("Your security key's PIN", "PIN (leave empty if it has none)", self.key_pin.as_str(), Message::KeyPin),
+                };
+                let submit = match self.focus {
+                    Focus::KeyPin => Message::KeySubmit,
+                    Focus::AddPassword => Message::AddNext,
+                    _ => Message::AddSubmit,
+                };
+                col = col.push(text(title, SANS_BOLD, 20.0, TEXT)).push(
+                    text_input::text_input(hint, value)
+                        .id(self.input_id.clone())
+                        .password()
+                        .on_input(msg)
+                        .on_submit(move |_| submit.clone())
+                        .style(field_style())
+                        .size(21)
+                        .padding([14, 18]),
+                );
+                col = col.push(text("Keep the key plugged in. Touch it when it blinks.", SANS, 17.0, TEXT_2));
+            }
+            State::Locked if d.kind == "LUKS" => {
+                col = col.push(text("Locked. → types its password. K opens it with your security key (YubiKey). A adds a security key to it.", SANS, 18.0, TEXT_2));
             }
             State::Locked => col = col.push(text("Locked. Press → to type its password.", SANS, 19.0, TEXT_2)),
             State::Closed => col = col.push(text("Press → to open it.", SANS, 19.0, TEXT_2)),
@@ -1337,6 +1557,7 @@ fn item(p: &Path, collection: Option<String>) -> Item {
         kind: if p.is_dir() { Kind::Project } else { Kind::of(p) },
         collection,
         modified: std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH),
+        size: std::fs::metadata(p).map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0),
     }
 }
 
