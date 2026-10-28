@@ -110,8 +110,14 @@ pub fn needs(app: &str, declared: Option<&str>) -> Vec<Perm> {
     if let Some(d) = declared {
         return d.split([';', ',', ' ']).filter_map(|k| Perm::from_key(k.trim())).collect();
     }
+    // installed from Center → Get apps: the catalog says
+    if let Some(n) = crate::store::needs_of(app) {
+        return n;
+    }
     match app {
         "librewolf" | "firefox" | "chromium" => vec![Perm::Network, Perm::Sound, Perm::Camera],
+        "mpv" => vec![Perm::Sound],
+        "org.gnome.SimpleScan" | "simple-scan" => vec![Perm::Network],
         _ => Perm::ALL.to_vec(),
     }
 }
