@@ -198,16 +198,31 @@ pub async fn open(d: Drive, password: Option<String>) -> Result<PathBuf, String>
                 let msg = conn
                     .call_method(Some(UDISKS), d.id.as_str(), Some(CRYPT), "Unlock", &(pw.as_str(), no_opts()))
                     .await
-                    .map_err(why)?;
+                    .map_err(|e| step("unlock", e))?;
                 msg.body().deserialize::<OwnedObjectPath>().map_err(|e| e.to_string())?.to_string()
             }
         }
     } else {
         d.id.clone()
     };
-    let msg = conn.call_method(Some(UDISKS), fs_path.as_str(), Some(FS), "Mount", &(no_opts(),)).await.map_err(why)?;
+    let msg = conn.call_method(Some(UDISKS), fs_path.as_str(), Some(FS), "Mount", &(no_opts(),)).await.map_err(|e| step("mount", e))?;
     let mount: String = msg.body().deserialize().map_err(|e| e.to_string())?;
     Ok(PathBuf::from(mount))
+}
+
+/// What went wrong, and at which step when the system said no (so a
+/// refusal can be told apart: unlocking or mounting).
+fn step(what: &str, e: zbus::Error) -> String {
+    let m = e.to_string();
+    if m.contains("NotAuthorized") {
+        eprintln!("chlorum: drives: {what}: {m}");
+        match what {
+            "unlock" => "Chlorum is not allowed to unlock this drive.".into(),
+            _ => "The drive is unlocked, but Chlorum is not allowed to open its files.".into(),
+        }
+    } else {
+        why(e)
+    }
 }
 
 /// Closes everything on the drive and switches it off, so it can be pulled

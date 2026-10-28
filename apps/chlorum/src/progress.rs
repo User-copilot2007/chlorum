@@ -69,6 +69,24 @@ pub struct Tally {
 }
 
 /// Without terminal colours.
+/// The cause in one of Nix's error messages. An evaluation error is a
+/// trace ("… while calling the 'head' builtin", "at /nix/store/…") ending
+/// in the real "error: …" line; other errors start with it.
+fn cause(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().map(|l| l.trim()).collect();
+    let traced = lines.iter().any(|l| l.starts_with('…') || l.starts_with("..."));
+    if traced {
+        if let Some(l) = lines.iter().rev().filter_map(|l| l.strip_prefix("error:")).map(|l| l.trim()).find(|l| !l.is_empty()) {
+            return Some(l.to_string());
+        }
+    }
+    lines
+        .iter()
+        .map(|l| l.trim_start_matches("error:").trim())
+        .find(|l| !l.is_empty() && !l.starts_with('…') && !l.starts_with("...") && !l.starts_with("at "))
+        .map(|l| l.to_string())
+}
+
 fn plain(m: &str) -> String {
     let mut out = String::new();
     let mut esc = false;
@@ -131,7 +149,7 @@ impl Tally {
                 if v.get("level").and_then(|l| l.as_u64()) == Some(0) && self.error.is_empty() {
                     // the first real line of the first error: the cause; later
                     // ones are often only "failed dependency"
-                    if let Some(l) = text.lines().map(|l| l.trim().trim_start_matches("error:").trim()).find(|l| !l.is_empty()) {
+                    if let Some(l) = cause(&text) {
                         self.error = l.chars().take(200).collect();
                     }
                 }
@@ -235,6 +253,14 @@ mod tests {
         let p = Progress { done: 11, expected: 44, ..Default::default() };
         assert_eq!(p.percent(), 25);
         assert_eq!(Progress::default().percent(), 0);
+    }
+
+    #[test]
+    fn finds_the_cause_under_a_trace() {
+        let t = "error:\n       … while calling the 'head' builtin\n         at /nix/store/x/lib.nix:12:3:\n\n       … while fetching the input 'git+https://github.com/x'\n\n       error: executing 'git': No such file or directory";
+        assert_eq!(cause(t).as_deref(), Some("executing 'git': No such file or directory"));
+        assert_eq!(cause("error: Build failed due to failed dependency").as_deref(), Some("Build failed due to failed dependency"));
+        assert_eq!(cause("error:\n       hash mismatch").as_deref(), Some("hash mismatch"));
     }
 
     #[test]

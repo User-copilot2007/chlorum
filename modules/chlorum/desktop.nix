@@ -379,6 +379,36 @@ in
       };
     };
     boot.supportedFilesystems = [ "vfat" "exfat" "ntfs" "btrfs" "xfs" "f2fs" ];
+    # A drive opened with a security key is unlocked by chlorum keyd (as
+    # root, after checking it is a removable or USB drive), so UDisks sees
+    # it as the system's and would not mount it for the person at the
+    # computer. These, and only these, they may mount like any flash drive.
+    # (Only root can create device-mapper devices, so the name is proof.)
+    security.polkit.extraConfig = let
+      isKeyDrive = pkgs.writeShellScript "chlorum-is-key-drive" ''
+        dev=''${1#/dev/}
+        case "$dev" in dm-[0-9]*) ;; *) exit 1 ;; esac
+        name=$(cat "/sys/block/$dev/dm/name" 2>/dev/null) || exit 1
+        case "$name" in chlorum-key-*) exit 0 ;; *) exit 1 ;; esac
+      '';
+    in ''
+      polkit.addRule(function(action, subject) {
+        if ((action.id == "org.freedesktop.udisks2.filesystem-mount-system" ||
+             action.id == "org.freedesktop.udisks2.filesystem-mount") &&
+            subject.local && subject.active) {
+          var dev = action.lookup("device") || "";
+          if (dev.indexOf("/dev/mapper/chlorum-key-") == 0) {
+            return polkit.Result.YES;
+          }
+          if (/^\/dev\/dm-[0-9]+$/.test(dev)) {
+            try {
+              polkit.spawn(["${isKeyDrive}", dev]);
+              return polkit.Result.YES;
+            } catch (e) {}
+          }
+        }
+      });
+    '';
 
     # the numpad is the mouse; niri sends it the keys
     systemd.user.services.chlorum-mouse = {
