@@ -18,6 +18,8 @@
 mod apps;
 mod ask;
 mod atom;
+mod bluetooth;
+mod display;
 mod drives;
 mod greeter;
 mod idle;
@@ -33,6 +35,7 @@ mod portal;
 mod progress;
 mod sandbox;
 mod setupd;
+mod store;
 mod shell;
 mod system;
 mod ui;
@@ -79,6 +82,7 @@ fn main() {
         }
         "setupd" => setupd::run_daemon(),
         "keyd" => keyd::run_daemon(),
+        "nightlight" => display::nightlight(),
         "lock" => lockscreen::run().map_err(|e| e.to_string()),
         "msg" => shell::msg(args.get(2).map(String::as_str).unwrap_or("super")).map_err(|e| e.to_string()),
         other => Err(format!("unknown command: {other}")),

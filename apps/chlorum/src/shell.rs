@@ -150,24 +150,28 @@ enum Page {
 enum Section {
     Wallpaper,
     Network,
+    Bluetooth,
     Sound,
     Keyboard,
     Screen,
     Home,
     Apps,
+    GetApps,
     Updates,
     About,
 }
 
 impl Section {
-    const ALL: [Section; 9] = [
+    const ALL: [Section; 11] = [
         Section::Wallpaper,
         Section::Network,
+        Section::Bluetooth,
         Section::Sound,
         Section::Keyboard,
         Section::Screen,
         Section::Home,
         Section::Apps,
+        Section::GetApps,
         Section::Updates,
         Section::About,
     ];
@@ -175,11 +179,13 @@ impl Section {
         match self {
             Section::Wallpaper => "Wallpaper",
             Section::Network => "Network",
+            Section::Bluetooth => "Bluetooth",
             Section::Sound => "Sound",
             Section::Keyboard => "Keyboard",
             Section::Screen => "Screen",
             Section::Home => "Home",
             Section::Apps => "Apps",
+            Section::GetApps => "Get apps",
             Section::Updates => "Updates",
             Section::About => "About",
         }
@@ -226,6 +232,13 @@ pub enum Message {
     WifiInput(String),
     WifiSubmit,
     Note(notify::Event),
+    /// the screens as niri drives them now
+    Screens(Vec<crate::display::Screen>),
+    Bt(crate::bluetooth::State),
+    BtDone(Result<String, String>),
+    BtAgent(crate::bluetooth::AgentEvent),
+    StoreInstalled(std::collections::BTreeSet<String>),
+    Store(crate::store::Event),
 }
 
 pub struct Shell {
@@ -237,6 +250,28 @@ pub struct Shell {
     perm_app: Option<String>,
     /// Center → Screen: when the screen turns off and locks by itself
     idle: crate::idle::Times,
+    /// Center → Screen: size, resolution, night light; and the screens
+    display: crate::display::Settings,
+    screens: Vec<crate::display::Screen>,
+    /// a new resolution waits to be kept (Enter): otherwise the old one
+    /// comes back at this moment
+    /// a new resolution not kept yet: the saved mode before it, the mode
+    /// the screen really had, and when it was changed
+    display_revert: Option<(Option<(u16, u16, u32)>, Option<(u16, u16, u32)>, Instant)>,
+    /// Bluetooth: a number to compare with the device, waiting for yes or no
+    bt_confirm: Option<String>,
+    /// Center → Bluetooth
+    bt: crate::bluetooth::State,
+    bt_busy: bool,
+    bt_note: Option<String>,
+    /// looking for devices until then (the list is refreshed meanwhile)
+    bt_scan_until: Option<Instant>,
+    /// Center → Get apps: what is installed, and the job under way
+    store_installed: std::collections::BTreeSet<String>,
+    store_job: Option<(crate::store::Job, String, u64, u64)>,
+    store_note: Option<String>,
+    /// All apps: what was typed to find one
+    search: String,
     /// notifications wait in the menu without popping up
     dnd: bool,
     pinned: Vec<String>,
@@ -327,6 +362,18 @@ impl Application for Shell {
             denied: crate::sandbox::load(),
             perm_app: None,
             idle: crate::idle::load(),
+            display: crate::display::load(),
+            screens: vec![],
+            display_revert: None,
+            bt_confirm: None,
+            bt: crate::bluetooth::State::default(),
+            bt_busy: false,
+            bt_note: None,
+            bt_scan_until: None,
+            store_installed: Default::default(),
+            store_job: None,
+            store_note: None,
+            search: String::new(),
             dnd: dnd_path().exists(),
             pinned: apps::id_list("home-apps", apps::DEFAULT_PINNED),
             home_count: load_home_count(),
@@ -385,6 +432,8 @@ impl Application for Shell {
             shell.open_home(),
             Task::perform(system::sound(), |s| cosmic::Action::App(Message::Sound(s))),
             Task::perform(system::network(), |s| cosmic::Action::App(Message::Network(s))),
+            // the screen as it was chosen in Center (scale, resolution)
+            shell.apply_display(),
             // a minute after start, look for a new version (then every 6 hours)
             Task::perform(tokio::time::sleep(Duration::from_secs(60)), |_| cosmic::Action::App(Message::Command("check-update".into()))),
         ]);
@@ -396,6 +445,7 @@ impl Application for Shell {
             Subscription::run(niri::events).map(Message::Niri),
             Subscription::run(commands),
             Subscription::run(notify::events).map(Message::Note),
+            Subscription::run(crate::bluetooth::agent).map(Message::BtAgent),
             Subscription::run(notify::sleeps).map(|_| Message::Command("lock".into())),
             Subscription::run(crate::drives::plugged).map(|name| {
                 Message::Note(notify::Event::Show(Note {
@@ -463,6 +513,41 @@ impl Shell {
         match message {
             Message::Frame => return self.step(),
             Message::Tick => {
+                // looking for Bluetooth devices: show new ones as they come
+                if let Some(until) = self.bt_scan_until {
+                    if Instant::now() > until {
+                        self.bt_scan_until = None;
+                        return Task::perform(
+                            async {
+                                let _ = crate::bluetooth::scan(false).await;
+                                crate::bluetooth::state().await
+                            },
+                            |st| cosmic::Action::App(Message::Bt(st)),
+                        );
+                    }
+                    if Local::now().timestamp_subsec_millis() < 250 {
+                        return Task::perform(crate::bluetooth::state(), |st| cosmic::Action::App(Message::Bt(st)));
+                    }
+                }
+                // a new resolution nobody kept: back to the one before
+                if let Some((saved, real, at)) = self.display_revert {
+                    if at.elapsed() > Duration::from_secs(15) {
+                        self.display_revert = None;
+                        self.display.mode = saved;
+                        let _ = crate::display::save(&self.display);
+                        self.toast("The screen is back to the resolution before.");
+                        // put back the mode the screen really had, saved or not
+                        let mut s = self.display.clone();
+                        s.mode = real.or(saved);
+                        return Task::perform(
+                            async move {
+                                crate::display::apply(&s).await;
+                                crate::display::screens().await
+                            },
+                            |v| cosmic::Action::App(Message::Screens(v)),
+                        );
+                    }
+                }
                 // an app is asking for permission: its window takes the keyboard
                 if crate::ask::asking() && (self.home.is_some() || self.menu.is_some()) {
                     self.close_home_now_if_open();
@@ -506,6 +591,55 @@ impl Shell {
                 }
             }
             Message::Sound(s) => self.sound = s,
+            Message::Screens(v) => self.screens = v,
+            Message::Bt(st) => {
+                self.bt = st;
+                let rows = self.rows(Section::Bluetooth);
+                if Section::ALL[self.section] == Section::Bluetooth {
+                    if let Some(r) = self.row {
+                        self.row = Some(r.min(rows.saturating_sub(1)));
+                    }
+                }
+            }
+            Message::BtDone(r) => {
+                self.bt_busy = false;
+                self.bt_confirm = None;
+                self.bt_note = Some(match r {
+                    Ok(m) => m,
+                    Err(e) => e,
+                });
+                return Task::perform(crate::bluetooth::state(), |st| cosmic::Action::App(Message::Bt(st)));
+            }
+            Message::StoreInstalled(v) => self.store_installed = v,
+            Message::Store(e) => match e {
+                crate::store::Event::Progress(d, x) => {
+                    if let Some(j) = self.store_job.as_mut() {
+                        j.2 = d;
+                        j.3 = x;
+                    }
+                }
+                crate::store::Event::Done(r) => {
+                    self.store_job = None;
+                    self.store_note = Some(match r {
+                        Ok(m) => m,
+                        Err(e) => e,
+                    });
+                    // new apps on Home and in the lists
+                    self.installed = apps::installed();
+                    return Task::perform(crate::store::installed(), |v| cosmic::Action::App(Message::StoreInstalled(v)));
+                }
+            },
+            Message::BtAgent(e) => {
+                use crate::bluetooth::AgentEvent;
+                match e {
+                    AgentEvent::Show(code) => self.bt_note = Some(format!("Type {code} on the device, then its Enter key.")),
+                    AgentEvent::Confirm(code) => {
+                        self.bt_note = None;
+                        self.bt_confirm = Some(code);
+                    }
+                    AgentEvent::Done => self.bt_confirm = None,
+                }
+            }
             Message::Network(n) => self.network = n,
             Message::Update(u) => {
                 let start = matches!(u, Update::Available(_)) && matches!(self.update, Update::Installing(_));
@@ -702,6 +836,7 @@ impl Shell {
         self.page = Page::Main;
         self.act = None;
         self.sel = 0;
+        self.search.clear();
         self.kick();
         system::pause_wallpaper(false);
         // slide the apps away: Home has its own empty workspace, so the live
@@ -1093,6 +1228,7 @@ impl Shell {
             (Tile::AllApps, _) => {
                 self.page = Page::AllApps;
                 self.all_sel = 0;
+                self.search.clear();
             }
             (Tile::Running { id, .. }, HomeAct::Open) => {
                 self.layout.bring(id);
@@ -1140,6 +1276,21 @@ impl Shell {
             keyboard::Key::Character(c) => c.to_lowercase(),
             _ => String::new(),
         };
+        // Bluetooth asks: does the device show the same number?
+        if self.bt_confirm.is_some() && self.page == Page::Center {
+            match named {
+                Some(Named::Enter) => {
+                    self.bt_confirm = None;
+                    crate::bluetooth::answer(true);
+                }
+                Some(Named::Escape) => {
+                    self.bt_confirm = None;
+                    crate::bluetooth::answer(false);
+                }
+                _ => {}
+            }
+            return Task::none();
+        }
         if self.wifi_entry.is_some() && self.page == Page::Center {
             if named == Some(keyboard::key::Named::Escape) && !self.wifi_busy {
                 self.wifi_entry = None;
@@ -1150,7 +1301,7 @@ impl Shell {
         let page = self.page;
         let t = match self.page {
             Page::Main => self.main_key(named, &ch),
-            Page::AllApps => self.all_key(named),
+            Page::AllApps => self.all_key(named, &ch),
             Page::Center => self.center_key(named),
         };
         if named == Some(Named::Escape) && page == Page::Main && self.act.is_none() {
@@ -1184,22 +1335,73 @@ impl Shell {
             _ => {}
         }
         match ch {
+            // on the row of what to do with the tile: shortcuts
             "s" if acts.contains(&HomeAct::Beside) => return self.do_act(tile, HomeAct::Beside),
             "x" if acts.contains(&HomeAct::Close) => return self.do_act(tile, HomeAct::Close),
+            // otherwise typing looks for an app
+            c if c.chars().count() == 1 && c.chars().all(|x| x.is_alphanumeric()) => {
+                self.search = c.to_string();
+                self.all_sel = 0;
+                self.page = Page::AllApps;
+            }
             _ => {}
         }
         Task::none()
     }
 
+    /// Every app, by name; with something typed, the ones that match, best
+    /// first: the name starts with it, then a word in it does, then it is
+    /// somewhere in the name or the app's id.
     fn all_apps(&self) -> Vec<App> {
-        let mut v: Vec<App> = self.installed.values().filter(|a| !apps::HIDDEN.contains(&a.id.as_str())).cloned().collect();
-        v.sort_by_key(|a| a.name.to_lowercase());
-        v
+        let q = self.search.to_lowercase();
+        let mut v: Vec<(u8, App)> = self
+            .installed
+            .values()
+            .filter(|a| !apps::HIDDEN.contains(&a.id.as_str()))
+            .filter_map(|a| {
+                if q.is_empty() {
+                    return Some((0, a.clone()));
+                }
+                let name = a.name.to_lowercase();
+                let rank = if name.starts_with(&q) {
+                    0
+                } else if name.split(|c: char| !c.is_alphanumeric()).any(|w| w.starts_with(&q)) {
+                    1
+                } else if name.contains(&q) || a.id.to_lowercase().contains(&q) {
+                    2
+                } else {
+                    return None;
+                };
+                Some((rank, a.clone()))
+            })
+            .collect();
+        v.sort_by_key(|(r, a)| (*r, a.name.to_lowercase()));
+        v.into_iter().map(|(_, a)| a).collect()
     }
 
-    fn all_key(&mut self, named: Option<keyboard::key::Named>) -> Task<Message> {
+    fn all_key(&mut self, named: Option<keyboard::key::Named>, ch: &str) -> Task<Message> {
         use keyboard::key::Named;
         const COLS: usize = 6;
+        // typing narrows the list; Backspace takes back; Esc clears first
+        if named.is_none() && ch.chars().count() == 1 && ch.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-') {
+            self.search.push_str(ch);
+            self.all_sel = 0;
+            return Task::none();
+        }
+        if named.is_none() && ch == " " {
+            self.search.push(' ');
+            return Task::none();
+        }
+        if named == Some(Named::Backspace) {
+            self.search.pop();
+            self.all_sel = 0;
+            return Task::none();
+        }
+        if named == Some(Named::Escape) && !self.search.is_empty() {
+            self.search.clear();
+            self.all_sel = 0;
+            return Task::none();
+        }
         let list = self.all_apps();
         let n = list.len().max(1);
         match named {
@@ -1211,6 +1413,7 @@ impl Shell {
             Some(Named::Enter) => {
                 if let Some(a) = list.get(self.all_sel) {
                     self.page = Page::Main;
+                    self.search.clear();
                     return self.do_act(Tile::App(a.clone()), HomeAct::Open);
                 }
             }
@@ -1231,6 +1434,14 @@ impl Shell {
                 Some(Named::Escape) => self.page = Page::Main,
                 _ => {}
             }
+            // opening Get apps shows what is installed
+            if Section::ALL[self.section] == Section::GetApps && matches!(named, Some(Named::ArrowDown) | Some(Named::ArrowUp)) {
+                return Task::perform(crate::store::installed(), |v| cosmic::Action::App(Message::StoreInstalled(v)));
+            }
+            // opening Bluetooth shows what is there
+            if Section::ALL[self.section] == Section::Bluetooth && matches!(named, Some(Named::ArrowDown) | Some(Named::ArrowUp)) {
+                return Task::perform(crate::bluetooth::state(), |st| cosmic::Action::App(Message::Bt(st)));
+            }
             // opening Network looks for Wi-Fi right away
             if Section::ALL[self.section] == Section::Network && self.wifi.is_empty() && !self.wifi_busy {
                 self.wifi_busy = true;
@@ -1238,7 +1449,19 @@ impl Shell {
             }
             return Task::none();
         };
-        let flat = matches!(section, Section::Network | Section::Keyboard) || (section == Section::Apps && self.perm_app.is_none());
+        let flat = matches!(section, Section::Network | Section::Keyboard | Section::Bluetooth | Section::GetApps) || (section == Section::Apps && self.perm_app.is_none());
+        // Delete removes an installed app
+        if section == Section::GetApps && named == Some(Named::Delete) {
+            return self.store_key(row, 0, true);
+        }
+        // Delete forgets a paired Bluetooth device
+        if section == Section::Bluetooth && named == Some(Named::Delete) && !self.bt_busy {
+            if let Some(d) = row.checked_sub(2).and_then(|i| self.bt.devices.get(i)).filter(|d| d.paired).cloned() {
+                self.bt_busy = true;
+                self.bt_note = Some(format!("Forgetting {}…", d.name));
+                return Task::perform(crate::bluetooth::forget(d.path), |r| cosmic::Action::App(Message::BtDone(r)));
+            }
+        }
         if section == Section::Apps && named == Some(Named::Escape) {
             if let Some(app) = self.perm_app.take() {
                 // back to the list, on the same app
@@ -1253,6 +1476,7 @@ impl Shell {
             Some(Named::ArrowUp) => self.row = Some(row.saturating_sub(1)),
             Some(Named::ArrowLeft) => return self.change(section, row, -1),
             Some(Named::ArrowRight) => return self.change(section, row, 1),
+            Some(Named::Enter) if section == Section::Screen && self.display_revert.is_some() => self.keep_resolution(),
             Some(Named::Enter) => return self.change(section, row, 0),
             _ => {}
         }
@@ -1296,6 +1520,8 @@ impl Shell {
                     return self.update_action();
                 }
             }
+            Section::Bluetooth => return self.bluetooth_key(row, dir),
+            Section::GetApps => return self.store_key(row, dir, false),
             Section::Network => {
                 if dir != 0 {
                     return Task::none();
@@ -1337,6 +1563,7 @@ impl Shell {
                     }
                 }
             }
+            Section::Screen if row >= 2 => return self.screen_key(row, dir),
             Section::Screen => {
                 if dir != 0 {
                     let mut t = self.idle;
@@ -1392,6 +1619,212 @@ impl Shell {
         Task::none()
     }
 
+    /// Center → Get apps: row 0 brings every installed app up to date, then
+    /// the catalog (Enter installs, Delete removes). One job at a time.
+    fn store_key(&mut self, row: usize, dir: i32, remove: bool) -> Task<Message> {
+        use crate::store::Job;
+        if dir != 0 || self.store_job.is_some() {
+            return Task::none();
+        }
+        let (job, attr) = if row == 0 {
+            if remove {
+                return Task::none();
+            }
+            (Job::Update, String::new())
+        } else {
+            let Some(e) = crate::store::listed().get(row - 1).copied() else { return Task::none() };
+            let have = self.store_installed.contains(e.attr);
+            match (remove, have) {
+                (true, true) => (Job::Remove, e.attr.to_string()),
+                (false, false) => (Job::Install, e.attr.to_string()),
+                (false, true) => {
+                    self.store_note = Some(format!("{} is installed already. Delete removes it.", e.name));
+                    return Task::none();
+                }
+                (true, false) => return Task::none(),
+            }
+        };
+        self.store_note = None;
+        self.store_job = Some((job, attr.clone(), 0, 0));
+        Task::run(crate::store::run(job, attr), |e| cosmic::Action::App(Message::Store(e)))
+    }
+
+    fn store_view(&self, f: f32) -> Element<'_, Message> {
+        use crate::store::Job;
+        let mut col = widget::Column::new().spacing(8);
+        col = col.push(text("Installed for you alone, ready-built for this Chlorum. Each app asks for what it may use when it first starts.", SANS, 19.0, alpha(TEXT_2, f))).push(space(1.0, 8.0));
+        if let Some((job, attr, done, expected)) = &self.store_job {
+            let name = crate::store::entry(attr).map(|e| e.name).unwrap_or("Your apps");
+            let what = match job {
+                Job::Install => format!("Installing {name}"),
+                Job::Remove => format!("Removing {name}"),
+                Job::Update => "Updating your apps".to_string(),
+            };
+            let pct = if *expected > 0 { (*done * 100 / *expected).min(100) } else { 0 };
+            col = col
+                .push(text(if *expected > 0 { format!("{what} · {pct}%") } else { format!("{what}…") }, SANS_BOLD, 20.0, alpha(YELLOW, f)))
+                .push(progress_line(if *expected > 0 { *done as f32 / *expected as f32 } else { 0.02 }, 900.0, f))
+                .push(space(1.0, 6.0));
+        }
+        if let Some(n) = &self.store_note {
+            col = col.push(text(n.clone(), SANS_BOLD, 19.0, alpha(YELLOW, f))).push(space(1.0, 6.0));
+        }
+        col = col.push(self.list_row(0, "Update the apps installed here".into(), format!("{} INSTALLED", self.store_installed.len()), f));
+        let list = crate::store::listed();
+        let range = self.window(1, list.len(), 8);
+        for (i, e) in list.iter().enumerate().filter(|(i, _)| range.contains(i)) {
+            let state = if self.store_installed.contains(e.attr) {
+                "INSTALLED · DEL REMOVES".to_string()
+            } else if e.unfree {
+                format!("{} · NOT FREE SOFTWARE", e.kind.to_uppercase())
+            } else {
+                e.kind.to_uppercase()
+            };
+            col = col.push(self.list_row(i + 1, format!("{}  ·  {}", e.name, e.about), state, f));
+        }
+        col = col.push(text(format!("{} apps", list.len()), MONO, 14.0, alpha(TEXT_2, f)));
+        col.into()
+    }
+
+    /// Center → Bluetooth: row 0 switches it on or off, row 1 looks for
+    /// devices, then the devices (Enter connects, pairing first when
+    /// needed, or disconnects).
+    fn bluetooth_key(&mut self, row: usize, dir: i32) -> Task<Message> {
+        if dir != 0 || self.bt_busy {
+            return Task::none();
+        }
+        self.bt_note = None;
+        let done = |r| cosmic::Action::App(Message::BtDone(r));
+        match row {
+            0 => {
+                let on = !self.bt.powered;
+                self.bt_busy = true;
+                Task::perform(
+                    async move { crate::bluetooth::set_powered(on).await.map(|()| if on { "Bluetooth is on.".to_string() } else { "Bluetooth is off.".to_string() }) },
+                    done,
+                )
+            }
+            1 => {
+                self.bt_scan_until = Some(Instant::now() + Duration::from_secs(30));
+                self.bt_note = Some("Looking for devices for 30 seconds. Put yours in pairing mode.".into());
+                Task::perform(crate::bluetooth::scan(true), |r| cosmic::Action::App(Message::BtDone(r.map(|()| "Looking for devices…".to_string()))))
+            }
+            r => {
+                let Some(d) = self.bt.devices.get(r - 2).cloned() else { return Task::none() };
+                self.bt_busy = true;
+                if d.connected {
+                    self.bt_note = Some(format!("Disconnecting {}…", d.name));
+                    Task::perform(crate::bluetooth::disconnect(d.path), done)
+                } else {
+                    self.bt_note = Some(if d.paired { format!("Connecting {}…", d.name) } else { format!("Pairing with {}…", d.name) });
+                    Task::perform(crate::bluetooth::connect(d.path), done)
+                }
+            }
+        }
+    }
+
+    /// Enter while a new resolution waits: it stays, and is saved.
+    fn keep_resolution(&mut self) {
+        if self.display_revert.take().is_some() {
+            match crate::display::save(&self.display) {
+                Ok(()) => self.toast("Resolution kept."),
+                Err(e) => self.toast(&format!("Could not save: {e}")),
+            }
+        }
+    }
+
+    /// Puts the chosen scale and resolution on the screens, then looks at
+    /// them again.
+    fn apply_display(&self) -> Task<Message> {
+        let s = self.display.clone();
+        Task::perform(
+            async move {
+                crate::display::apply(&s).await;
+                crate::display::screens().await
+            },
+            |v| cosmic::Action::App(Message::Screens(v)),
+        )
+    }
+
+    /// Center → Screen, below the two idle rows: scale, resolution, refresh
+    /// rate (when there is a screen to ask), night light, warmth.
+    fn screen_key(&mut self, row: usize, dir: i32) -> Task<Message> {
+        use crate::display::{Night, SCALES, WARMTH};
+        let step = |len: usize, i: usize, dir: i32| (i as i32 + dir).clamp(0, len as i32 - 1) as usize;
+        // without a screen to ask, the rows start at the night light
+        let row = match self.screens.first() {
+            None => row + 3,
+            // a screen whose mode is not known: no resolution rows
+            Some(sc) if row >= 3 && self.display.mode.filter(|m| sc.modes.contains(m)).or(sc.current).is_none() => row + 2,
+            Some(_) => row,
+        };
+        // Enter keeps a new resolution
+        if dir == 0 {
+            self.keep_resolution();
+            return Task::none();
+        }
+        let sc = self.screens.first().cloned();
+        match row {
+            2 => {
+                let now = self.display.scale.or(sc.as_ref().map(|s| s.scale)).unwrap_or(1.0);
+                let i = SCALES.iter().position(|x| (x - now).abs() < 0.01).unwrap_or_else(|| SCALES.iter().position(|x| *x > now).unwrap_or(0));
+                self.display.scale = Some(SCALES[step(SCALES.len(), i, dir)]);
+            }
+            3 | 4 => {
+                let Some(sc) = sc else { return Task::none() };
+                let now = self.display.mode.filter(|m| sc.modes.contains(m)).or(sc.current);
+                let Some((w, h, r)) = now else { return Task::none() };
+                let new = if row == 3 {
+                    let sizes = sc.sizes();
+                    let i = sizes.iter().position(|x| *x == (w, h)).unwrap_or(0);
+                    let size = sizes[step(sizes.len(), i, dir)];
+                    // the same rate if it has it, otherwise its fastest
+                    let rates = sc.rates(size);
+                    let rate = if rates.contains(&r) { r } else { rates.first().copied().unwrap_or(r) };
+                    (size.0, size.1, rate)
+                } else {
+                    let rates = sc.rates((w, h));
+                    // ← slower, → faster: the list is fastest first
+                    let i = rates.iter().position(|x| *x == r).unwrap_or(0);
+                    (w, h, rates[step(rates.len(), i, -dir)])
+                };
+                if Some(new) == now {
+                    return Task::none();
+                }
+                if self.display_revert.is_none() {
+                    self.display_revert = Some((self.display.mode, sc.current, Instant::now()));
+                } else if let Some((_, _, at)) = self.display_revert.as_mut() {
+                    *at = Instant::now();
+                }
+                self.display.mode = Some(new);
+                self.toast("Press Enter to keep this resolution. Otherwise it goes back in 15 seconds.");
+            }
+            5 => {
+                let i = Night::ALL.iter().position(|n| *n == self.display.night).unwrap_or(0);
+                self.display.night = Night::ALL[step(Night::ALL.len(), i, dir)];
+            }
+            6 => {
+                let i = WARMTH.iter().position(|w| w.0 == self.display.warmth).unwrap_or(1);
+                self.display.warmth = WARMTH[step(WARMTH.len(), i, dir)].0;
+            }
+            _ => return Task::none(),
+        }
+        // a resolution not kept yet is not saved: a screen that stays black
+        // must not come back like that at the next login
+        let mut on_disk = self.display.clone();
+        if let Some((saved, _, _)) = self.display_revert {
+            on_disk.mode = saved;
+        }
+        if let Err(e) = crate::display::save(&on_disk) {
+            self.toast(&format!("Could not save: {e}"));
+        }
+        if row >= 5 {
+            crate::display::restart_nightlight();
+            return Task::none();
+        }
+        self.apply_display()
+    }
+
     /// Apps people open, by name.
     fn app_list(&self) -> Vec<App> {
         let mut v: Vec<App> = self.installed.values().filter(|a| !a.id.starts_with("chlorum")).cloned().collect();
@@ -1403,11 +1836,17 @@ impl Shell {
         match s {
             Section::Wallpaper => 5,
             Section::Network => 1 + self.wifi.len(),
+            Section::Bluetooth => if !self.bt.present { 0 } else if self.bt.powered { 2 + self.bt.devices.len() } else { 1 },
             Section::Sound => if self.sound.present { 2 } else { 0 },
             Section::Keyboard => crate::setupd::LAYOUTS.len(),
-            Section::Screen => 2,
+            Section::Screen => match self.screens.first() {
+                None => 4,
+                Some(sc) if self.display.mode.filter(|m| sc.modes.contains(m)).or(sc.current).is_none() => 5,
+                Some(_) => 7,
+            },
             Section::Home => 1,
             Section::Apps => if self.perm_app.is_some() { crate::sandbox::Perm::ALL.len() } else { self.app_list().len() },
+            Section::GetApps => 1 + crate::store::CATALOG.len(),
             Section::Updates => 1,
             Section::About => 0,
         }
@@ -1532,6 +1971,7 @@ impl Shell {
             h.push(("S", "Open beside", false));
             h.push(("ESC", "Back to app", false));
         }
+        h.push(("TYPE", "Find an app", false));
         h.push(("SUPER", "System menu", false));
         col.push(hints(&h, f)).padding([48, 72]).into()
     }
@@ -1559,7 +1999,11 @@ impl Shell {
     fn all_view(&self, f: f32) -> Element<'_, Message> {
         let list = self.all_apps();
         let mut grid = widget::Column::new().spacing(24);
-        for (r, chunk) in list.chunks(6).enumerate() {
+        // the rows around the chosen app, so it is always on screen
+        const ROWS: usize = 4;
+        let rows = list.len().div_ceil(6);
+        let first = (self.all_sel / 6).saturating_sub(ROWS / 2).min(rows.saturating_sub(ROWS));
+        for (r, chunk) in list.chunks(6).enumerate().skip(first).take(ROWS) {
             let mut row = widget::Row::new().spacing(24);
             for (c, a) in chunk.iter().enumerate() {
                 let i = r * 6 + c;
@@ -1580,14 +2024,19 @@ impl Shell {
             }
             grid = grid.push(row);
         }
-        // keep the chosen row in view
-        let scroll = widget::scrollable(grid).height(Length::Fill);
+        if list.is_empty() {
+            grid = grid.push(text("No app is called like that. Backspace takes a letter back; Get apps in Center has more.", SANS, 22.0, alpha(TEXT_2, f)));
+        }
+        let title = if self.search.is_empty() { "All apps".to_string() } else { format!("{}▏", self.search) };
+        let more = if rows > ROWS { format!("{} of {} apps", (self.all_sel + 1).min(list.len()), list.len()) } else { String::new() };
         widget::Column::new()
-            .push(text("All apps", SANS_BOLD, 52.0, alpha(TEXT, f)))
-            .push(space(1.0, 30.0))
-            .push(scroll)
-            .push(space(1.0, 20.0))
-            .push(hints(&[("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("ESC", "Back", false)], f))
+            .push(text(title, SANS_BOLD, 52.0, alpha(if self.search.is_empty() { TEXT } else { YELLOW }, f)))
+            .push(text(if self.search.is_empty() { "Type to find an app".to_string() } else { more.clone() }, MONO, 16.0, alpha(TEXT_2, f)))
+            .push(space(1.0, 24.0))
+            .push(widget::container(grid).height(Length::Fill))
+            .push(text(if self.search.is_empty() { more } else { String::new() }, MONO, 14.0, alpha(TEXT_2, f)))
+            .push(space(1.0, 12.0))
+            .push(hints(&[("TYPE", "Find", false), ("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("ESC", if self.search.is_empty() { "Back" } else { "Clear" }, false)], f))
             .padding([48, 72])
             .into()
     }
@@ -1608,11 +2057,13 @@ impl Shell {
         let content = match Section::ALL[self.section] {
             Section::Wallpaper => self.wallpaper_view(f),
             Section::Network => self.network_view(f),
+            Section::Bluetooth => self.bluetooth_view(f),
             Section::Sound => self.sound_view(f),
             Section::Keyboard => self.keyboard_view(f),
             Section::Screen => self.screen_view(f),
             Section::Home => self.home_settings_view(f),
             Section::Apps => self.apps_view(f),
+            Section::GetApps => self.store_view(f),
             Section::Updates => self.updates_view(f),
             Section::About => self.about_view(f),
         };
@@ -1624,6 +2075,12 @@ impl Shell {
             &[("↑ ↓", "App", false), ("ENTER", "What it may use", true), ("ESC", "Sections", false)]
         } else if sec == Section::Apps && self.row.is_some() {
             &[("↑ ↓", "Choose", false), ("← →", "Off · On", true), ("ENTER", "Switch", false), ("ESC", "Apps", false)]
+        } else if sec == Section::GetApps && self.row.is_some() {
+            &[("↑ ↓", "Choose", false), ("ENTER", "Install", true), ("DEL", "Remove", false), ("ESC", "Sections", false)]
+        } else if sec == Section::Bluetooth && self.row.is_some() {
+            &[("↑ ↓", "Choose", false), ("ENTER", "Connect · Disconnect", true), ("DEL", "Forget", false), ("ESC", "Sections", false)]
+        } else if sec == Section::Screen && self.display_revert.is_some() {
+            &[("ENTER", "Keep this resolution", true), ("← →", "Change", false), ("ESC", "Sections", false)]
         } else if self.row.is_none() {
             &[("↑ ↓", "Section", false), ("→", "Change", true), ("ESC", "Home", false)]
         } else if flat {
@@ -1696,6 +2153,59 @@ impl Shell {
         .into()
     }
 
+    /// Which rows of a long list to show: a window around the chosen one,
+    /// so the selection never goes off screen.
+    fn window(&self, first: usize, len: usize, shown: usize) -> std::ops::Range<usize> {
+        let sel = self.row.unwrap_or(0).saturating_sub(first);
+        let start = sel.saturating_sub(shown / 2).min(len.saturating_sub(shown));
+        start..(start + shown).min(len)
+    }
+
+    fn bluetooth_view(&self, f: f32) -> Element<'_, Message> {
+        let mut col = widget::Column::new().spacing(8);
+        if !self.bt.present {
+            return col.push(text("There is no Bluetooth on this computer (or it is switched off in its settings).", SANS, 20.0, alpha(TEXT_2, f))).into();
+        }
+        col = col.push(self.list_row(0, if self.bt.powered { "Bluetooth is on".into() } else { "Bluetooth is off".into() }, if self.bt.powered { "ENTER TURNS OFF".into() } else { "ENTER TURNS ON".into() }, f));
+        if self.bt.powered {
+            let looking = self.bt_scan_until.is_some();
+            col = col.push(self.list_row(1, if looking { "Looking for devices…".into() } else { "Look for devices to pair".into() }, "ENTER".into(), f)).push(space(1.0, 10.0));
+            let n = self.bt.devices.len();
+            let range = self.window(2, n, 8);
+            for i in range.clone() {
+                let d = &self.bt.devices[i];
+                let state = if d.connected {
+                    format!("CONNECTED{}", d.battery.map(|b| format!(" · {b}%")).unwrap_or_default())
+                } else if d.paired {
+                    "PAIRED · ENTER CONNECTS".into()
+                } else {
+                    "NEARBY · ENTER PAIRS".into()
+                };
+                col = col.push(self.list_row(i + 2, format!("{}  ·  {}", d.name, d.kind()), state, f));
+            }
+            if n > range.len() {
+                col = col.push(text(format!("{} of {}", self.row.unwrap_or(2).saturating_sub(1).clamp(1, n), n), MONO, 14.0, alpha(TEXT_2, f)));
+            }
+            if n == 0 && !looking {
+                col = col.push(text("No devices yet. Look for devices, with yours in pairing mode.", SANS, 18.0, alpha(TEXT_2, f)));
+            }
+        }
+        if self.bt_busy {
+            col = col.push(crate::atom::Atom::view(64.0, self.started_at));
+        }
+        if let Some(n) = &self.bt_note {
+            col = col.push(text(n.clone(), SANS_BOLD, 20.0, alpha(YELLOW, f)));
+        }
+        if let Some(code) = &self.bt_confirm {
+            col = col
+                .push(space(1.0, 10.0))
+                .push(text("Does the device show this number?", SANS_BOLD, 24.0, alpha(TEXT, f)))
+                .push(text(code.clone(), MONO_BOLD, 48.0, alpha(YELLOW, f)))
+                .push(hints(&[("ENTER", "Yes, the same", true), ("ESC", "No", false)], f));
+        }
+        col.into()
+    }
+
     fn network_view(&self, f: f32) -> Element<'_, Message> {
         let mut col = widget::Column::new().spacing(8);
         col = col
@@ -1703,7 +2213,8 @@ impl Shell {
             .push(space(1.0, 14.0));
         let search = if self.wifi_busy && self.wifi_entry.is_none() { "Searching…" } else { "Search for Wi-Fi again" };
         col = col.push(self.list_row(0, search.into(), "ENTER".into(), f));
-        for (i, w) in self.wifi.iter().enumerate() {
+        let range = self.window(1, self.wifi.len(), 9);
+        for (i, w) in self.wifi.iter().enumerate().filter(|(i, _)| range.contains(i)) {
             let detail = if w.active {
                 "CONNECTED".to_string()
             } else {
@@ -1765,12 +2276,48 @@ impl Shell {
             }
             r.into()
         };
-        widget::Column::new()
+        use crate::display::{Night, SCALES, WARMTH, rate_label, scale_label, size_label};
+        // one chip per choice, the chosen one yellow
+        let chips = |items: Vec<String>, chosen: Option<usize>, on: bool| -> Element<'_, Message> {
+            let mut r = widget::Row::new().spacing(10);
+            for (i, t) in items.into_iter().enumerate() {
+                let sel = Some(i) == chosen;
+                r = r.push(
+                    fill(text(t, SANS_BOLD, 16.0, alpha(if sel { BLACK } else if on { TEXT } else { TEXT_2 }, f)), alpha(if sel { YELLOW } else { PANEL_2 }, f))
+                        .padding([12, 14]),
+                );
+            }
+            r.into()
+        };
+        let mut col = widget::Column::new()
             .push(text("When nobody uses the computer. A video or a call keeps it awake.", SANS, 20.0, alpha(TEXT_2, f)))
             .push(self.row_box(0, "Turn the screen off after", label(self.idle.screen_off), choice(SCREEN_OFF, self.idle.screen_off, self.row == Some(0)), f))
             .push(self.row_box(1, "Lock after", label(self.idle.lock), choice(LOCK, self.idle.lock, self.row == Some(1)), f))
-            .spacing(26)
-            .into()
+            .spacing(26);
+        let mut next = 2;
+        if let Some(sc) = self.screens.first() {
+            let scale = self.display.scale.unwrap_or(sc.scale);
+            let si = SCALES.iter().position(|x| (x - scale).abs() < 0.01);
+            col = col.push(self.row_box(2, "Size of everything", scale_label(scale), chips(SCALES.iter().map(|x| scale_label(*x)).collect(), si, self.row == Some(2)), f));
+            if let Some((w, h, r)) = self.display.mode.filter(|m| sc.modes.contains(m)).or(sc.current) {
+                let sizes = sc.sizes();
+                let i = sizes.iter().position(|x| *x == (w, h)).unwrap_or(0);
+                // a window of sizes around the chosen one: some screens offer many
+                let from = i.saturating_sub(2).min(sizes.len().saturating_sub(5));
+                let shown: Vec<String> = sizes.iter().skip(from).take(5).map(|s| size_label(s.0, s.1)).collect();
+                let keep = if self.display_revert.is_some() { "  ·  ENTER KEEPS IT" } else { "" };
+                col = col.push(self.row_box(3, "Resolution", format!("{}{keep}", size_label(w, h)), chips(shown, Some(i - from), self.row == Some(3)), f));
+                let rates = sc.rates((w, h));
+                let ri = rates.iter().position(|x| *x == r);
+                col = col.push(self.row_box(4, "Refresh rate", rate_label(r), chips(rates.iter().map(|x| rate_label(*x)).collect(), ri, self.row == Some(4)), f));
+            }
+            next = 5;
+        }
+        let ni = Night::ALL.iter().position(|n| *n == self.display.night);
+        col = col.push(self.row_box(next, "Night light", self.display.night.label().to_string(), chips(Night::ALL.iter().map(|n| n.label().to_string()).collect(), ni, self.row == Some(next)), f));
+        let wi = WARMTH.iter().position(|w| w.0 == self.display.warmth);
+        col = col.push(self.row_box(next + 1, "Warmth at night", format!("{} K", self.display.warmth), chips(WARMTH.iter().map(|w| w.1.to_string()).collect(), wi, self.row == Some(next + 1)), f));
+        col.into()
     }
 
     fn apps_view(&self, f: f32) -> Element<'_, Message> {

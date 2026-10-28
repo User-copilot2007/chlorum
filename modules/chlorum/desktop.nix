@@ -291,6 +291,8 @@ in
       useNautilus = false;            # the plain file picker; Library is the file manager
     };
     hardware.graphics.enable = true;
+    # 32-bit graphics too: Steam and most games need it
+    hardware.graphics.enable32Bit = true;
     services.pipewire = {
       enable = true;
       alsa.enable = true;
@@ -299,6 +301,36 @@ in
     security.rtkit.enable = true;
     hardware.bluetooth.enable = lib.mkDefault true;
     services.upower.enable = true;
+
+    # ---- Printing and scanning ----------------------------------------------
+    # Printers on the network show up by themselves (driverless IPP, found
+    # over mDNS); USB printers that speak IPP over USB too (ipp-usb); older
+    # Brother and other lasers through their drivers.
+    services.printing = {
+      enable = true;
+      drivers = [ pkgs.brlaser pkgs.gutenprint ];
+    };
+    services.avahi = {
+      enable = true;
+      nssmdns4 = true;
+      openFirewall = true;
+    };
+    services.ipp-usb.enable = true;
+    hardware.sane = {
+      enable = true;
+      extraBackends = [ pkgs.sane-airscan ];
+    };
+    # a scanner plugged in belongs to whoever sits at the computer (before
+    # 73-seat-late.rules, which is where "uaccess" takes effect)
+    services.udev.packages = [
+      (pkgs.writeTextDir "lib/udev/rules.d/70-chlorum-scanner.rules" ''
+        ENV{libsane_matched}=="yes", TAG+="uaccess"
+      '')
+    ];
+
+    # firmware updates for the PC and devices (fwupdmgr), checked by
+    # Chlorum's Updates page
+    services.fwupd.enable = true;
     security.polkit.enable = true;
 
     systemd.user.services.chlorum-shell = {
@@ -372,6 +404,25 @@ in
 
     # screen off and lock when nobody is there (times in Center → Screen;
     # it starts over by itself when they change)
+    # The night light (Center → Screen): wlsunset, or nothing when it is off
+    systemd.user.services.chlorum-nightlight = {
+      description = "Chlorum: night light";
+      wantedBy = [ "graphical-session.target" ];
+      partOf = [ "graphical-session.target" ];
+      after = [ "graphical-session.target" ];
+      unitConfig = {
+        ConditionEnvironment = "WAYLAND_DISPLAY";
+        StartLimitIntervalSec = 120;
+        StartLimitBurst = 30;
+      };
+      path = [ pkgs.wlsunset ];
+      serviceConfig = {
+        ExecStart = "${chlorum}/bin/chlorum nightlight";
+        Restart = "on-failure";
+        RestartSec = 2;
+      };
+    };
+
     systemd.user.services.chlorum-idle = {
       description = "Chlorum: screen off and lock when idle";
       wantedBy = [ "graphical-session.target" ];
@@ -509,6 +560,11 @@ in
       # Neovim with LazyVim (set up at login, see the session) and what it
       # uses: search, a git window, a C compiler and the tree-sitter tool
       # for syntax, and what language servers are installed with
+      # videos and music: mpv, played with the keyboard (space, arrows,
+      # f for full screen, q to quit)
+      pkgs.mpv
+      # scanning documents
+      pkgs.simple-scan
       pkgs.neovim
       pkgs.ripgrep
       pkgs.fd
@@ -534,6 +590,16 @@ in
       "inode/directory" = "chlorum-library.desktop";
       "text/plain" = "chlorum-typewriter.desktop";
       "text/markdown" = "chlorum-typewriter.desktop";
+      "video/mp4" = "mpv.desktop";
+      "video/x-matroska" = "mpv.desktop";
+      "video/webm" = "mpv.desktop";
+      "video/quicktime" = "mpv.desktop";
+      "video/x-msvideo" = "mpv.desktop";
+      "audio/mpeg" = "mpv.desktop";
+      "audio/flac" = "mpv.desktop";
+      "audio/ogg" = "mpv.desktop";
+      "audio/x-wav" = "mpv.desktop";
+      "audio/mp4" = "mpv.desktop";
     };
     # BlexMono is IBM Plex Mono with the Nerd Font icons LazyVim shows
     fonts.packages = [ pkgs.ibm-plex pkgs.nerd-fonts.blex-mono pkgs.noto-fonts pkgs.noto-fonts-color-emoji ];

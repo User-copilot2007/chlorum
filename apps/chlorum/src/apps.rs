@@ -75,6 +75,9 @@ pub fn installed() -> HashMap<String, App> {
     } else if let Ok(h) = std::env::var("HOME") {
         dirs.push(PathBuf::from(h).join(".local/share/applications"));
     }
+    // apps installed for this profile (Center → Get apps), whatever the
+    // session's search path says
+    dirs.extend(crate::store::profile_dirs());
     let data = std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/run/current-system/sw/share:/usr/share".into());
     dirs.extend(data.split(':').filter(|d| !d.is_empty()).map(|d| PathBuf::from(d).join("applications")));
 
