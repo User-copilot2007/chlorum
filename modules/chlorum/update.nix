@@ -11,7 +11,10 @@ let
   progress = "/run/chlorum-update/update.json";
   chlorum-update = pkgs.writeShellApplication {
     name = "chlorum-update";
-    runtimeInputs = [ config.systemd.package config.nix.package pkgs.jq pkgs.coreutils config.chlorum.package ];
+    # git: Nix fetches some of Chlorum's building blocks (Rust crates from
+    # git) with it while reading the system; without it the update stops
+    # before it starts
+    runtimeInputs = [ config.systemd.package config.nix.package pkgs.git pkgs.jq pkgs.coreutils config.chlorum.package ];
     text = ''
       source_flake="${lib.head (lib.splitString "#" cfg.source)}"
       attr="${lib.last (lib.splitString "#" cfg.source)}"

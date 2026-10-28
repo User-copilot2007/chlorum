@@ -202,6 +202,13 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     // everything Nix said, readable without root (journalctl needs it)
     let text: Vec<&str> = tally.log.iter().map(String::as_str).collect();
     let _ = std::fs::write(path.with_extension("log"), text.join("\n") + "\n");
+    // and the reason in the journal too, for a failed update
+    if !tally.error.is_empty() {
+        eprintln!("chlorum-update: {}", tally.error);
+        for l in text.iter().rev().take(30).rev() {
+            eprintln!("  {l}");
+        }
+    }
     Ok(())
 }
 
