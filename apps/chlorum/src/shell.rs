@@ -228,6 +228,13 @@ pub enum Message {
     Network(String),
     Update(Update),
     WifiList(Vec<Wifi>),
+    /// a window asked to close is still there after a while
+    NotClosing(u64),
+    Devices(system::Devices),
+    SoundNote(Option<String>),
+    /// is the Wi-Fi radio on (None: no Wi-Fi)
+    WifiOn(Option<bool>),
+    WifiSwitched(Result<String, String>, Option<bool>, Vec<Wifi>, String),
     WifiDone(Result<(), String>),
     WifiInput(String),
     WifiSubmit,
@@ -237,6 +244,7 @@ pub enum Message {
     Bt(crate::bluetooth::State),
     BtDone(Result<String, String>),
     BtAgent(crate::bluetooth::AgentEvent),
+    StoreFound(String, Result<Vec<crate::store::Found>, String>),
     StoreInstalled(std::collections::BTreeSet<String>),
     Store(crate::store::Event),
 }
@@ -270,6 +278,11 @@ pub struct Shell {
     store_installed: std::collections::BTreeSet<String>,
     store_job: Option<(crate::store::Job, String, u64, u64)>,
     store_note: Option<String>,
+    /// Get apps: what was typed, and what the whole package set had for it
+    store_search: String,
+    store_found: Vec<crate::store::Found>,
+    /// a search of every package is running (for this text)
+    store_looking: Option<String>,
     /// All apps: what was typed to find one
     search: String,
     /// notifications wait in the menu without popping up
@@ -299,6 +312,8 @@ pub struct Shell {
     act: Option<usize>,
     grow: HashMap<String, f32>,
     all_sel: usize,
+    /// All apps: a family of apps opened to choose one of them
+    all_group: Option<String>,
     section: usize,
     row: Option<usize>,
 
@@ -329,6 +344,15 @@ pub struct Shell {
 
     wifi: Vec<Wifi>,
     wifi_busy: bool,
+    /// keyboard layouts (niri's names) and the one in use
+    kb_layouts: Vec<String>,
+    kb_now: usize,
+    /// a window that did not close when asked: X again forces it
+    not_closing: Option<u64>,
+    /// sound outputs and inputs, and the microphone
+    audio: system::Devices,
+    sound_note: Option<String>,
+    wifi_on: Option<bool>,
     wifi_entry: Option<String>,
     wifi_pw: String,
     wifi_note: Option<String>,
@@ -373,6 +397,9 @@ impl Application for Shell {
             store_installed: Default::default(),
             store_job: None,
             store_note: None,
+            store_search: String::new(),
+            store_found: vec![],
+            store_looking: None,
             search: String::new(),
             dnd: dnd_path().exists(),
             pinned: apps::id_list("home-apps", apps::DEFAULT_PINNED),
@@ -389,6 +416,7 @@ impl Application for Shell {
             act: None,
             grow: HashMap::new(),
             all_sel: 0,
+            all_group: None,
             section: 0,
             row: None,
             menu: None,
@@ -413,6 +441,12 @@ impl Application for Shell {
             last_frame: Instant::now(),
             wifi: vec![],
             wifi_busy: false,
+            kb_layouts: vec![],
+            kb_now: 0,
+            not_closing: None,
+            audio: system::Devices::default(),
+            sound_note: None,
+            wifi_on: None,
             wifi_entry: None,
             wifi_pw: String::new(),
             wifi_note: None,
@@ -431,7 +465,9 @@ impl Application for Shell {
             made,
             shell.open_home(),
             Task::perform(system::sound(), |s| cosmic::Action::App(Message::Sound(s))),
+            Task::perform(system::devices(), |d| cosmic::Action::App(Message::Devices(d))),
             Task::perform(system::network(), |s| cosmic::Action::App(Message::Network(s))),
+            Task::perform(system::wifi_on(), |on| cosmic::Action::App(Message::WifiOn(on))),
             // the screen as it was chosen in Center (scale, resolution)
             shell.apply_display(),
             // a minute after start, look for a new version (then every 6 hours)
@@ -591,6 +627,16 @@ impl Shell {
                 }
             }
             Message::Sound(s) => self.sound = s,
+            Message::NotClosing(id) => {
+                self.not_closing = Some(id);
+                self.toast("It is not responding. Press X again to force it closed (unsaved work is lost).");
+            }
+            Message::Devices(d) => {
+                self.audio = d;
+                // the volume shown is the new output's
+                return Task::perform(system::sound(), |s| cosmic::Action::App(Message::Sound(s)));
+            }
+            Message::SoundNote(n) => self.sound_note = n,
             Message::Screens(v) => self.screens = v,
             Message::Bt(st) => {
                 self.bt = st;
@@ -611,6 +657,20 @@ impl Shell {
                 return Task::perform(crate::bluetooth::state(), |st| cosmic::Action::App(Message::Bt(st)));
             }
             Message::StoreInstalled(v) => self.store_installed = v,
+            Message::StoreFound(q, r) => {
+                if self.store_looking.as_deref() == Some(q.as_str()) {
+                    self.store_looking = None;
+                }
+                if q == self.store_search {
+                    match r {
+                        Ok(v) => {
+                            self.store_note = Some(if v.is_empty() { format!("Nothing else is called “{q}”.") } else { format!("{} more found. They are not checked for Chlorum, but most work.", v.len()) });
+                            self.store_found = v;
+                        }
+                        Err(e) => self.store_note = Some(e),
+                    }
+                }
+            }
             Message::Store(e) => match e {
                 crate::store::Event::Progress(d, x) => {
                     if let Some(j) = self.store_job.as_mut() {
@@ -667,6 +727,22 @@ impl Shell {
                 }
                 if seq == self.super_seq {
                     return self.toggle_menu();
+                }
+            }
+            Message::WifiSwitched(r, on, list, net) => {
+                self.wifi_busy = false;
+                self.wifi_on = on;
+                self.wifi = if on == Some(true) { list } else { vec![] };
+                self.network = net;
+                self.wifi_note = Some(match r {
+                    Ok(m) => m,
+                    Err(e) => e,
+                });
+            }
+            Message::WifiOn(on) => {
+                self.wifi_on = on;
+                if on == Some(false) {
+                    self.wifi.clear();
                 }
             }
             Message::WifiList(v) => {
@@ -825,7 +901,47 @@ fn layer(id: window::Id, layer: Layer, keyboard: KeyboardInteractivity, namespac
     }
 }
 
+/// A row of Center → Get apps.
+#[derive(Clone)]
+enum StoreRow {
+    Update,
+    Entry(&'static crate::store::Entry),
+    SearchAll,
+    Found(crate::store::Found),
+}
+
 impl Shell {
+    /// Asks a window to close. If it is still there 4 seconds later, the
+    /// app hangs (or asks something): X again ends it for good.
+    fn close_window(&mut self, id: u64) -> Task<Message> {
+        if self.not_closing == Some(id) {
+            self.not_closing = None;
+            self.toast("Forced closed.");
+            return Task::perform(
+                async move {
+                    if let Ok(niri_ipc::Response::Windows(ws)) = niri::send(niri_ipc::Request::Windows).await {
+                        if let Some(pid) = ws.iter().find(|w| w.id == id).and_then(|w| w.pid) {
+                            // the app's process (the sandbox ends with it)
+                            let _ = tokio::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().await;
+                        }
+                    }
+                },
+                |_| cosmic::Action::App(Message::Tick),
+            );
+        }
+        Task::perform(
+            async move {
+                let _ = niri::run(vec![Action::CloseWindow { id: Some(id) }]).await;
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                match niri::send(niri_ipc::Request::Windows).await {
+                    Ok(niri_ipc::Response::Windows(ws)) => ws.iter().any(|w| w.id == id),
+                    _ => false,
+                }
+            },
+            move |still| cosmic::Action::App(if still { Message::NotClosing(id) } else { Message::Tick }),
+        )
+    }
+
     // ================================================================ surfaces
 
     fn open_home(&mut self) -> Task<Message> {
@@ -837,6 +953,7 @@ impl Shell {
         self.act = None;
         self.sel = 0;
         self.search.clear();
+        self.all_group = None;
         self.kick();
         system::pause_wallpaper(false);
         // slide the apps away: Home has its own empty workspace, so the live
@@ -1009,6 +1126,15 @@ impl Shell {
                 }
             }
             Event::WindowLayoutsChanged { changes } => self.layout.layouts_changed(changes),
+            Event::KeyboardLayoutsChanged { keyboard_layouts } => {
+                self.kb_layouts = keyboard_layouts.names;
+                self.kb_now = keyboard_layouts.current_idx as usize;
+                return Task::none();
+            }
+            Event::KeyboardLayoutSwitched { idx } => {
+                self.kb_now = idx as usize;
+                return Task::none();
+            }
             Event::WindowFocusChanged { id } => {
                 self.layout.set_focused(id);
                 // the focus moves the shell makes itself are not choices
@@ -1229,6 +1355,7 @@ impl Shell {
                 self.page = Page::AllApps;
                 self.all_sel = 0;
                 self.search.clear();
+                self.all_group = None;
             }
             (Tile::Running { id, .. }, HomeAct::Open) => {
                 self.layout.bring(id);
@@ -1241,9 +1368,7 @@ impl Shell {
                 return self.arrange();
             }
             (Tile::Running { id, .. }, HomeAct::Close) => {
-                return Task::perform(niri::run(vec![Action::CloseWindow { id: Some(id) }]), |_| {
-                    cosmic::Action::App(Message::Tick)
-                });
+                return self.close_window(id);
             }
             (Tile::App(a), act) => {
                 self.layout.beside_next = act == HomeAct::Beside;
@@ -1302,7 +1427,7 @@ impl Shell {
         let t = match self.page {
             Page::Main => self.main_key(named, &ch),
             Page::AllApps => self.all_key(named, &ch),
-            Page::Center => self.center_key(named),
+            Page::Center => self.center_key(named, &ch),
         };
         if named == Some(Named::Escape) && page == Page::Main && self.act.is_none() {
             self.close_home();
@@ -1352,12 +1477,76 @@ impl Shell {
     /// Every app, by name; with something typed, the ones that match, best
     /// first: the name starts with it, then a word in it does, then it is
     /// somewhere in the name or the app's id.
+    /// All apps: one tile for each app, and one for each family of apps
+    /// (Enter on it shows its members); with something typed, every app
+    /// that matches, families or not.
     fn all_apps(&self) -> Vec<App> {
+        self.apps_in(self.all_group.as_deref())
+    }
+
+    fn apps_in(&self, group: Option<&str>) -> Vec<App> {
+        let list = self.all_apps_flat();
+        if !self.search.is_empty() {
+            return list;
+        }
+        let mut groups: std::collections::BTreeMap<String, Vec<App>> = std::collections::BTreeMap::new();
+        for a in &list {
+            groups.entry(apps::family(a)).or_default().push(a.clone());
+        }
+        // apps of different programs with the same name (two "Terminal"s)
+        // are one family too
+        let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+        for (fam, members) in &groups {
+            if members.len() == 1 {
+                by_name.entry(members[0].name.to_lowercase()).or_default().push(fam.clone());
+            }
+        }
+        for (name, fams) in by_name {
+            if fams.len() > 1 {
+                let mut merged = vec![];
+                for f in &fams {
+                    merged.extend(groups.remove(f).unwrap_or_default());
+                }
+                groups.insert(format!("name:{name}"), merged);
+            }
+        }
+        if let Some(g) = group {
+            let mut members = groups.remove(g).unwrap_or_default();
+            members.sort_by_key(|a| a.name.to_lowercase());
+            return members;
+        }
+        let mut out: Vec<App> = groups
+            .into_iter()
+            .map(|(key, members)| {
+                if members.len() == 1 {
+                    return members.into_iter().next().unwrap();
+                }
+                // the family's own name: its shortest (LibreOffice, not LibreOffice Writer)
+                let lead = members.iter().min_by_key(|a| (a.name.len(), a.name.clone())).cloned().unwrap();
+                App { id: format!("group:{key}"), name: lead.name.clone(), exec: String::new(), wm_class: None, permissions: None, mime: vec![], ..lead }
+            })
+            .collect();
+        out.sort_by_key(|a| a.name.to_lowercase());
+        out
+    }
+
+    /// How many apps a family tile stands for.
+    fn group_size(&self, id: &str) -> usize {
+        let Some(key) = id.strip_prefix("group:") else { return 1 };
+        let list = self.all_apps_flat();
+        if let Some(name) = key.strip_prefix("name:") {
+            list.iter().filter(|a| a.name.to_lowercase() == name).count()
+        } else {
+            list.iter().filter(|a| apps::family(a) == key).count()
+        }
+    }
+
+    fn all_apps_flat(&self) -> Vec<App> {
         let q = self.search.to_lowercase();
         let mut v: Vec<(u8, App)> = self
             .installed
             .values()
-            .filter(|a| !apps::HIDDEN.contains(&a.id.as_str()))
+            .filter(|a| !apps::HIDDEN.contains(&a.id.as_str()) && !apps::hidden_by_name(a))
             .filter_map(|a| {
                 if q.is_empty() {
                     return Some((0, a.clone()));
@@ -1386,7 +1575,16 @@ impl Shell {
         if named.is_none() && ch.chars().count() == 1 && ch.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-') {
             self.search.push_str(ch);
             self.all_sel = 0;
+            self.all_group = None;
             return Task::none();
+        }
+        // out of a family: back on its tile
+        if named == Some(Named::Escape) && self.search.is_empty() {
+            if let Some(g) = self.all_group.take() {
+                let id = format!("group:{g}");
+                self.all_sel = self.all_apps().iter().position(|a| a.id == id).unwrap_or(0);
+                return Task::none();
+            }
         }
         if named.is_none() && ch == " " {
             self.search.push(' ');
@@ -1412,7 +1610,13 @@ impl Shell {
             Some(Named::Escape) => self.page = Page::Main,
             Some(Named::Enter) => {
                 if let Some(a) = list.get(self.all_sel) {
+                    if let Some(key) = a.id.strip_prefix("group:") {
+                        self.all_group = Some(key.to_string());
+                        self.all_sel = 0;
+                        return Task::none();
+                    }
                     self.page = Page::Main;
+                    self.all_group = None;
                     self.search.clear();
                     return self.do_act(Tile::App(a.clone()), HomeAct::Open);
                 }
@@ -1422,9 +1626,25 @@ impl Shell {
         Task::none()
     }
 
-    fn center_key(&mut self, named: Option<keyboard::key::Named>) -> Task<Message> {
+    fn center_key(&mut self, named: Option<keyboard::key::Named>, ch: &str) -> Task<Message> {
         use keyboard::key::Named;
         let section = Section::ALL[self.section];
+        // Get apps: typing looks for an app
+        if section == Section::GetApps && self.store_job.is_none() {
+            let typed = named.is_none() && ch.chars().count() == 1 && ch.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-' || c == '+' || c == '.');
+            if typed && !(ch == " " && self.store_search.is_empty()) {
+                self.store_search.push_str(ch);
+                return self.store_searched();
+            }
+            if named == Some(Named::Backspace) && !self.store_search.is_empty() {
+                self.store_search.pop();
+                return self.store_searched();
+            }
+            if named == Some(Named::Escape) && !self.store_search.is_empty() {
+                self.store_search.clear();
+                return self.store_searched();
+            }
+        }
         let rows = self.rows(section);
         let Some(row) = self.row else {
             match named {
@@ -1438,14 +1658,26 @@ impl Shell {
             if Section::ALL[self.section] == Section::GetApps && matches!(named, Some(Named::ArrowDown) | Some(Named::ArrowUp)) {
                 return Task::perform(crate::store::installed(), |v| cosmic::Action::App(Message::StoreInstalled(v)));
             }
+            // opening Sound shows the outputs and inputs
+            if Section::ALL[self.section] == Section::Sound && matches!(named, Some(Named::ArrowDown) | Some(Named::ArrowUp)) {
+                return Task::batch([
+                    Task::perform(system::devices(), |d| cosmic::Action::App(Message::Devices(d))),
+                    Task::perform(system::sound(), |s| cosmic::Action::App(Message::Sound(s))),
+                ]);
+            }
             // opening Bluetooth shows what is there
             if Section::ALL[self.section] == Section::Bluetooth && matches!(named, Some(Named::ArrowDown) | Some(Named::ArrowUp)) {
                 return Task::perform(crate::bluetooth::state(), |st| cosmic::Action::App(Message::Bt(st)));
             }
             // opening Network looks for Wi-Fi right away
-            if Section::ALL[self.section] == Section::Network && self.wifi.is_empty() && !self.wifi_busy {
-                self.wifi_busy = true;
-                return Task::perform(system::wifi_list(), |v| cosmic::Action::App(Message::WifiList(v)));
+            if Section::ALL[self.section] == Section::Network && matches!(named, Some(Named::ArrowDown) | Some(Named::ArrowUp)) {
+                let list = if self.wifi.is_empty() && !self.wifi_busy {
+                    self.wifi_busy = true;
+                    Task::perform(system::wifi_list(), |v| cosmic::Action::App(Message::WifiList(v)))
+                } else {
+                    Task::none()
+                };
+                return Task::batch([Task::perform(system::wifi_on(), |on| cosmic::Action::App(Message::WifiOn(on))), list]);
             }
             return Task::none();
         };
@@ -1507,12 +1739,41 @@ impl Shell {
                 self.wallpaper.save();
             }
             Section::Sound => {
-                if row == 0 && dir != 0 {
-                    let v = ((self.sound.volume + d * 0.05) * 20.0).round() / 20.0;
-                    return Task::perform(system::set_volume(v), |s| cosmic::Action::App(Message::Sound(s)));
-                }
-                if row == 1 {
-                    return Task::perform(system::toggle_mute(), |s| cosmic::Action::App(Message::Sound(s)));
+                let outs = self.audio.outputs.len();
+                let devs = |d| cosmic::Action::App(Message::Devices(d));
+                match row {
+                    0 if dir != 0 => {
+                        let v = ((self.sound.volume + d * 0.05) * 20.0).round() / 20.0;
+                        return Task::perform(system::set_volume(v), |s| cosmic::Action::App(Message::Sound(s)));
+                    }
+                    1 if dir == 0 => return Task::perform(system::toggle_mute(), |s| cosmic::Action::App(Message::Sound(s))),
+                    2 if dir == 0 => {
+                        let out = self.audio.outputs.iter().find(|o| o.default).map(|o| o.name.clone()).unwrap_or_else(|| "the speakers".into());
+                        self.sound_note = Some(format!("Playing a chime on {out}…"));
+                        return Task::perform(system::test_sound(), move |r| {
+                            cosmic::Action::App(Message::SoundNote(Some(match r {
+                                Ok(()) => format!("Played on {out}. Nothing heard? Choose another output below."),
+                                Err(e) => format!("Could not play: {e}"),
+                            })))
+                        });
+                    }
+                    r if (3..3 + outs).contains(&r) && dir == 0 => {
+                        let id = self.audio.outputs[r - 3].id;
+                        self.sound_note = Some(format!("Sound now comes out of {}.", self.audio.outputs[r - 3].name));
+                        return Task::perform(system::set_default_device(id), devs);
+                    }
+                    r if r == 3 + outs && dir != 0 => {
+                        let v = ((self.audio.mic_volume + d * 0.05) * 20.0).round() / 20.0;
+                        return Task::perform(system::set_mic_volume(v), devs);
+                    }
+                    r if r == 4 + outs && dir == 0 => return Task::perform(system::toggle_mic(), devs),
+                    r if r >= 5 + outs && dir == 0 => {
+                        if let Some(dev) = self.audio.inputs.get(r - 5 - outs) {
+                            self.sound_note = Some(format!("Listening with {}.", dev.name));
+                            return Task::perform(system::set_default_device(dev.id), devs);
+                        }
+                    }
+                    _ => {}
                 }
             }
             Section::Updates => {
@@ -1526,14 +1787,42 @@ impl Shell {
                 if dir != 0 {
                     return Task::none();
                 }
+                // row 0: Wi-Fi on or off
                 if row == 0 {
+                    let Some(on) = self.wifi_on else { return Task::none() };
+                    self.wifi_busy = true;
+                    self.wifi_note = Some(if on { "Switching Wi-Fi off…".into() } else { "Switching Wi-Fi on…".into() });
+                    return Task::perform(
+                        async move {
+                            let r = system::set_wifi(!on).await;
+                            if !on {
+                                // the radio needs a moment before it sees networks
+                                tokio::time::sleep(Duration::from_secs(3)).await;
+                            }
+                            (r, system::wifi_on().await, system::wifi_list().await, system::network().await)
+                        },
+                        |(r, on, list, net)| {
+                            cosmic::Action::App(Message::WifiSwitched(r.map(|()| if on == Some(true) { "Wi-Fi is on.".into() } else { "Wi-Fi is off.".into() }), on, list, net))
+                        },
+                    );
+                }
+                if self.wifi_on != Some(true) {
+                    return Task::none();
+                }
+                if row == 1 {
                     self.wifi_busy = true;
                     self.wifi_note = None;
                     return Task::perform(system::wifi_list(), |v| cosmic::Action::App(Message::WifiList(v)));
                 }
-                if let Some(w) = self.wifi.get(row - 1).cloned() {
+                if let Some(w) = self.wifi.get(row - 2).cloned() {
+                    // the one it is on: Enter leaves it
                     if w.active {
-                        return Task::none();
+                        self.wifi_busy = true;
+                        self.wifi_note = Some(format!("Leaving {}…", w.ssid));
+                        return Task::perform(
+                            async move { (system::wifi_disconnect(w.ssid).await.map(|()| "Disconnected.".to_string()), system::wifi_on().await, system::wifi_list().await, system::network().await) },
+                            |(r, on, list, net)| cosmic::Action::App(Message::WifiSwitched(r, on, list, net)),
+                        );
                     }
                     self.wifi_note = None;
                     self.wifi_pw.clear();
@@ -1621,29 +1910,65 @@ impl Shell {
 
     /// Center → Get apps: row 0 brings every installed app up to date, then
     /// the catalog (Enter installs, Delete removes). One job at a time.
+    /// What Get apps lists: updating, the catalogue's apps (those that
+    /// match what was typed), then looking through every package and what
+    /// that found.
+    fn store_rows(&self) -> Vec<StoreRow> {
+        let mut v = vec![StoreRow::Update];
+        v.extend(crate::store::find(&self.store_search).into_iter().map(StoreRow::Entry));
+        if self.store_search.trim().chars().count() >= 2 {
+            v.push(StoreRow::SearchAll);
+            v.extend(self.store_found.iter().cloned().map(StoreRow::Found));
+        }
+        v
+    }
+
+    /// After a letter typed or taken back: the first match is chosen.
+    fn store_searched(&mut self) -> Task<Message> {
+        self.store_found.clear();
+        self.store_note = None;
+        self.row = Some(if self.store_search.is_empty() { 0 } else { 1 });
+        Task::none()
+    }
+
     fn store_key(&mut self, row: usize, dir: i32, remove: bool) -> Task<Message> {
         use crate::store::Job;
         if dir != 0 || self.store_job.is_some() {
             return Task::none();
         }
-        let (job, attr) = if row == 0 {
-            if remove {
-                return Task::none();
+        let rows = self.store_rows();
+        let Some(r) = rows.get(row) else { return Task::none() };
+        let (job, attr, name) = match r {
+            StoreRow::Update if !remove => (Job::Update, String::new(), String::new()),
+            StoreRow::Update => return Task::none(),
+            StoreRow::SearchAll => {
+                if remove || self.store_looking.is_some() {
+                    return Task::none();
+                }
+                let q = self.store_search.trim().to_string();
+                self.store_looking = Some(q.clone());
+                self.store_note = Some(format!("Looking through every package for “{q}”… The first time takes a minute or two."));
+                return Task::perform(crate::store::search_all(q.clone()), move |r| cosmic::Action::App(Message::StoreFound(q.clone(), r)));
             }
-            (Job::Update, String::new())
-        } else {
-            let Some(e) = crate::store::listed().get(row - 1).copied() else { return Task::none() };
-            let have = self.store_installed.contains(e.attr);
+            StoreRow::Entry(e) => (Job::Install, e.attr.to_string(), e.name.to_string()),
+            StoreRow::Found(f) => (Job::Install, f.attr.clone(), f.name.clone()),
+        };
+        if job == Job::Install {
+            let have = self.store_installed.contains(&attr);
             match (remove, have) {
-                (true, true) => (Job::Remove, e.attr.to_string()),
-                (false, false) => (Job::Install, e.attr.to_string()),
+                (true, true) => return self.store_start(Job::Remove, attr),
+                (false, false) => {}
                 (false, true) => {
-                    self.store_note = Some(format!("{} is installed already. Delete removes it.", e.name));
+                    self.store_note = Some(format!("{name} is installed already. Delete removes it."));
                     return Task::none();
                 }
                 (true, false) => return Task::none(),
             }
-        };
+        }
+        self.store_start(job, attr)
+    }
+
+    fn store_start(&mut self, job: crate::store::Job, attr: String) -> Task<Message> {
         self.store_note = None;
         self.store_job = Some((job, attr.clone(), 0, 0));
         Task::run(crate::store::run(job, attr), |e| cosmic::Action::App(Message::Store(e)))
@@ -1669,20 +1994,39 @@ impl Shell {
         if let Some(n) = &self.store_note {
             col = col.push(text(n.clone(), SANS_BOLD, 19.0, alpha(YELLOW, f))).push(space(1.0, 6.0));
         }
-        col = col.push(self.list_row(0, "Update the apps installed here".into(), format!("{} INSTALLED", self.store_installed.len()), f));
-        let list = crate::store::listed();
-        let range = self.window(1, list.len(), 8);
-        for (i, e) in list.iter().enumerate().filter(|(i, _)| range.contains(i)) {
-            let state = if self.store_installed.contains(e.attr) {
-                "INSTALLED · DEL REMOVES".to_string()
-            } else if e.unfree {
-                format!("{} · NOT FREE SOFTWARE", e.kind.to_uppercase())
-            } else {
-                e.kind.to_uppercase()
+        let title = if self.store_search.is_empty() { "TYPE TO FIND AN APP".to_string() } else { format!("{}▏", self.store_search) };
+        col = col.push(text(title, if self.store_search.is_empty() { MONO } else { SANS_BOLD }, if self.store_search.is_empty() { 15.0 } else { 34.0 }, alpha(if self.store_search.is_empty() { TEXT_2 } else { YELLOW }, f)));
+        let rows = self.store_rows();
+        let range = self.window(0, rows.len(), 12);
+        for (i, r) in rows.iter().enumerate().filter(|(i, _)| range.contains(i)) {
+            let (label, state) = match r {
+                StoreRow::Update => ("Update the apps installed here".to_string(), format!("{} INSTALLED", self.store_installed.len())),
+                StoreRow::Entry(e) => (
+                    format!("{}  ·  {}", e.name, e.about),
+                    if self.store_installed.contains(e.attr) {
+                        "INSTALLED · DEL REMOVES".to_string()
+                    } else if e.unfree {
+                        format!("{} · NOT FREE SOFTWARE", e.kind.to_uppercase())
+                    } else {
+                        e.kind.to_uppercase()
+                    },
+                ),
+                StoreRow::SearchAll => (
+                    if self.store_looking.is_some() { "Looking through every package…".to_string() } else { format!("Look through every package for “{}”", self.store_search.trim()) },
+                    "ENTER · ABOUT 100 000".to_string(),
+                ),
+                StoreRow::Found(x) => (
+                    if x.about.is_empty() { x.name.clone() } else { format!("{}  ·  {}", x.name, x.about) },
+                    if self.store_installed.contains(&x.attr) { "INSTALLED · DEL REMOVES".to_string() } else { x.attr.to_uppercase() },
+                ),
             };
-            col = col.push(self.list_row(i + 1, format!("{}  ·  {}", e.name, e.about), state, f));
+            col = col.push(self.list_row(i, label, state, f));
         }
-        col = col.push(text(format!("{} apps", list.len()), MONO, 14.0, alpha(TEXT_2, f)));
+        let n = rows.iter().filter(|r| matches!(r, StoreRow::Entry(_) | StoreRow::Found(_))).count();
+        if n == 0 && !self.store_search.is_empty() {
+            col = col.push(text("None in the catalogue. Enter on the row above looks through every package.", SANS, 18.0, alpha(TEXT_2, f)));
+        }
+        col = col.push(text(format!("{} apps", n), MONO, 14.0, alpha(TEXT_2, f)));
         col.into()
     }
 
@@ -1835,9 +2179,16 @@ impl Shell {
     fn rows(&self, s: Section) -> usize {
         match s {
             Section::Wallpaper => 5,
-            Section::Network => 1 + self.wifi.len(),
+            Section::Network => match self.wifi_on {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2 + self.wifi.len(),
+            },
             Section::Bluetooth => if !self.bt.present { 0 } else if self.bt.powered { 2 + self.bt.devices.len() } else { 1 },
-            Section::Sound => if self.sound.present { 2 } else { 0 },
+            Section::Sound => {
+                let mic = if self.audio.inputs.is_empty() { 0 } else { 2 + self.audio.inputs.len() };
+                if self.sound.present || !self.audio.outputs.is_empty() { 3 + self.audio.outputs.len() + mic } else { 0 }
+            }
             Section::Keyboard => crate::setupd::LAYOUTS.len(),
             Section::Screen => match self.screens.first() {
                 None => 4,
@@ -1846,7 +2197,7 @@ impl Shell {
             },
             Section::Home => 1,
             Section::Apps => if self.perm_app.is_some() { crate::sandbox::Perm::ALL.len() } else { self.app_list().len() },
-            Section::GetApps => 1 + crate::store::CATALOG.len(),
+            Section::GetApps => self.store_rows().len(),
             Section::Updates => 1,
             Section::About => 0,
         }
@@ -1892,6 +2243,11 @@ impl Shell {
                 .into()
         };
         let mut chips = widget::Row::new().spacing(12);
+        if self.kb_layouts.len() > 1 {
+            if let Some(name) = self.kb_layouts.get(self.kb_now) {
+                chips = chips.push(chip(format!("{} · ALT+SHIFT", layout_short(name)), false));
+            }
+        }
         chips = chips.push(chip(format!("NET · {}", self.network.to_uppercase()), false));
         if self.sound.present {
             let v = if self.sound.muted { "MUTED".to_string() } else { format!("VOL {:.0}", self.sound.volume * 100.0) };
@@ -2008,12 +2364,16 @@ impl Shell {
             for (c, a) in chunk.iter().enumerate() {
                 let i = r * 6 + c;
                 let on = i == self.all_sel;
+                let mut inner = widget::Column::new()
+                    .push(widget::icon::from_name(a.icon.clone()).size(72))
+                    .push(text(a.name.clone(), SANS_BOLD, 19.0, alpha(if on { BLACK } else { TEXT }, f)))
+                    .spacing(16)
+                    .align_x(Alignment::Center);
+                if a.id.starts_with("group:") {
+                    inner = inner.push(text(format!("{} APPS · ENTER", self.group_size(&a.id)), MONO, 13.0, alpha(if on { BLACK } else { TEXT_2 }, f)));
+                }
                 let card = fill(
-                    widget::Column::new()
-                        .push(widget::icon::from_name(a.icon.clone()).size(72))
-                        .push(text(a.name.clone(), SANS_BOLD, 19.0, alpha(if on { BLACK } else { TEXT }, f)))
-                        .spacing(16)
-                        .align_x(Alignment::Center),
+                    inner,
                     alpha(if on { YELLOW } else { PANEL }, f),
                 )
                 .width(Length::Fixed(240.0))
@@ -2027,7 +2387,17 @@ impl Shell {
         if list.is_empty() {
             grid = grid.push(text("No app is called like that. Backspace takes a letter back; Get apps in Center has more.", SANS, 22.0, alpha(TEXT_2, f)));
         }
-        let title = if self.search.is_empty() { "All apps".to_string() } else { format!("{}▏", self.search) };
+        let group_name = self.all_group.as_ref().and_then(|g| {
+            let id = format!("group:{g}");
+            self.apps_in(None).into_iter().find(|a| a.id == id).map(|a| a.name)
+        });
+        let title = if !self.search.is_empty() {
+            format!("{}▏", self.search)
+        } else if let Some(n) = &group_name {
+            n.clone()
+        } else {
+            "All apps".to_string()
+        };
         let more = if rows > ROWS { format!("{} of {} apps", (self.all_sel + 1).min(list.len()), list.len()) } else { String::new() };
         widget::Column::new()
             .push(text(title, SANS_BOLD, 52.0, alpha(if self.search.is_empty() { TEXT } else { YELLOW }, f)))
@@ -2036,7 +2406,7 @@ impl Shell {
             .push(widget::container(grid).height(Length::Fill))
             .push(text(if self.search.is_empty() { more } else { String::new() }, MONO, 14.0, alpha(TEXT_2, f)))
             .push(space(1.0, 12.0))
-            .push(hints(&[("TYPE", "Find", false), ("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("ESC", if self.search.is_empty() { "Back" } else { "Clear" }, false)], f))
+            .push(hints(&[("TYPE", "Find", false), ("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("ESC", if !self.search.is_empty() { "Clear" } else if self.all_group.is_some() { "All apps" } else { "Back" }, false)], f))
             .padding([48, 72])
             .into()
     }
@@ -2076,7 +2446,7 @@ impl Shell {
         } else if sec == Section::Apps && self.row.is_some() {
             &[("↑ ↓", "Choose", false), ("← →", "Off · On", true), ("ENTER", "Switch", false), ("ESC", "Apps", false)]
         } else if sec == Section::GetApps && self.row.is_some() {
-            &[("↑ ↓", "Choose", false), ("ENTER", "Install", true), ("DEL", "Remove", false), ("ESC", "Sections", false)]
+            &[("TYPE", "Find", false), ("↑ ↓", "Choose", false), ("ENTER", "Install", true), ("DEL", "Remove", false), ("ESC", "Clear / Sections", false)]
         } else if sec == Section::Bluetooth && self.row.is_some() {
             &[("↑ ↓", "Choose", false), ("ENTER", "Connect · Disconnect", true), ("DEL", "Forget", false), ("ESC", "Sections", false)]
         } else if sec == Section::Screen && self.display_revert.is_some() {
@@ -2091,7 +2461,14 @@ impl Shell {
         widget::Column::new()
             .push(text("Center", SANS_BOLD, 52.0, alpha(TEXT, f)))
             .push(space(1.0, 36.0))
-            .push(widget::Row::new().push(sections).push(space(70.0, 1.0)).push(content).height(Length::Fill))
+            .push(
+                widget::Row::new()
+                    .push(sections)
+                    .push(space(70.0, 1.0))
+                    // as wide as the screen allows, but lines stay readable
+                    .push(widget::container(content).width(Length::Fill).max_width(1600.0))
+                    .height(Length::Fill),
+            )
             .push(hints(h, f))
             .padding([48, 72])
             .into()
@@ -2103,7 +2480,7 @@ impl Shell {
             .push(text(label.to_string(), SANS_BOLD, 22.0, alpha(if on { TEXT } else { TEXT_2 }, f)))
             .push(hfill())
             .push(text(value, MONO_BOLD, 20.0, alpha(YELLOW, f)))
-            .width(Length::Fixed(900.0));
+            .width(Length::Fill);
         let col = widget::Column::new().push(head).push(body).spacing(16);
         bracket(fill(col, Color::TRANSPARENT).padding([10, 4]), if on { f } else { 0.0 }, 12.0)
     }
@@ -2133,6 +2510,7 @@ impl Shell {
             .push(self.row_box(2, "Brightness", format!("{:.0}%", w.brightness * 100.0), slider(w.brightness, 900.0, self.row == Some(2), f), f))
             .push(self.row_box(3, "Amount", format!("{:.0}", w.amount), slider((w.amount - 1.0) / 9.0, 900.0, self.row == Some(3), f), f))
             .push(self.row_box(4, "Colour", color_name, colors.into(), f))
+            .push(text(wallpaper_progress(), MONO, 15.0, alpha(TEXT_2, f)))
             .spacing(26)
             .into()
     }
@@ -2149,7 +2527,7 @@ impl Shell {
             alpha(if on { YELLOW } else { PANEL }, f),
         )
         .padding([14, 22])
-        .width(Length::Fixed(900.0))
+        .width(Length::Fill)
         .into()
     }
 
@@ -2211,16 +2589,24 @@ impl Shell {
         col = col
             .push(text(format!("Now: {}", if self.network.is_empty() { "Offline" } else { &self.network }), SANS_BOLD, 28.0, alpha(TEXT, f)))
             .push(space(1.0, 14.0));
-        let search = if self.wifi_busy && self.wifi_entry.is_none() { "Searching…" } else { "Search for Wi-Fi again" };
-        col = col.push(self.list_row(0, search.into(), "ENTER".into(), f));
-        let range = self.window(1, self.wifi.len(), 9);
-        for (i, w) in self.wifi.iter().enumerate().filter(|(i, _)| range.contains(i)) {
-            let detail = if w.active {
-                "CONNECTED".to_string()
-            } else {
-                format!("{}{}%", if w.secure { "LOCKED · " } else { "" }, w.signal)
-            };
-            col = col.push(self.list_row(i + 1, w.ssid.clone(), detail, f));
+        match self.wifi_on {
+            None => col = col.push(text("There is no Wi-Fi on this computer. A cable works by itself.", SANS, 20.0, alpha(TEXT_2, f))),
+            Some(on) => {
+                col = col.push(self.list_row(0, "Wi-Fi".into(), if on { "ON · ENTER SWITCHES OFF".into() } else { "OFF · ENTER SWITCHES ON".into() }, f));
+            }
+        }
+        if self.wifi_on == Some(true) {
+            let search = if self.wifi_busy && self.wifi_entry.is_none() { "Searching…" } else { "Search for Wi-Fi again" };
+            col = col.push(self.list_row(1, search.into(), "ENTER".into(), f));
+            let range = self.window(2, self.wifi.len(), 9);
+            for (i, w) in self.wifi.iter().enumerate().filter(|(i, _)| range.contains(i)) {
+                let detail = if w.active {
+                    "CONNECTED · ENTER LEAVES".to_string()
+                } else {
+                    format!("{}{}%", if w.secure { "LOCKED · " } else { "" }, w.signal)
+                };
+                col = col.push(self.list_row(i + 2, w.ssid.clone(), detail, f));
+            }
         }
         if let Some(ssid) = &self.wifi_entry {
             let input = text_input::text_input("Wi-Fi password", self.wifi_pw.as_str())
@@ -2394,19 +2780,34 @@ impl Shell {
     }
 
     fn sound_view(&self, f: f32) -> Element<'_, Message> {
-        if !self.sound.present {
-            return text("No speakers or headphones found.", SANS, 24.0, alpha(TEXT_2, f));
+        if !self.sound.present && self.audio.outputs.is_empty() {
+            return text("No speakers or headphones found. Plug them in, or connect Bluetooth headphones in Center → Bluetooth.", SANS, 22.0, alpha(TEXT_2, f));
         }
-        let mute = fill(
-            text(if self.sound.muted { "Sound is off" } else { "Sound is on" }, SANS_BOLD, 20.0, alpha(TEXT, f)),
-            alpha(PANEL_2, f),
-        )
-        .padding([16, 22]);
-        widget::Column::new()
+        let pill = |s: String| -> Element<'_, Message> { fill(text(s, SANS_BOLD, 20.0, alpha(TEXT, f)), alpha(PANEL_2, f)).padding([14, 22]).into() };
+        let outs = self.audio.outputs.len();
+        let mut col = widget::Column::new()
+            .spacing(14)
             .push(self.row_box(0, "Volume", format!("{:.0}%", self.sound.volume * 100.0), slider(self.sound.volume, 900.0, self.row == Some(0), f), f))
-            .push(self.row_box(1, "Mute", if self.sound.muted { "ON".into() } else { "OFF".into() }, mute.into(), f))
-            .spacing(26)
-            .into()
+            .push(self.row_box(1, "Mute", if self.sound.muted { "ON".into() } else { "OFF".into() }, pill(if self.sound.muted { "Sound is off · Enter".into() } else { "Sound is on · Enter".into() }), f))
+            .push(self.row_box(2, "Test", String::new(), pill("Play a chime · Enter".into()), f));
+        if let Some(n) = &self.sound_note {
+            col = col.push(text(n.clone(), SANS_BOLD, 19.0, alpha(YELLOW, f)));
+        }
+        col = col.push(space(1.0, 10.0)).push(text("SOUND COMES OUT OF", MONO, 15.0, alpha(TEXT_2, f)));
+        for (i, o) in self.audio.outputs.iter().enumerate() {
+            col = col.push(self.list_row(3 + i, o.name.clone(), if o.default { "IN USE".into() } else { "ENTER USES IT".into() }, f));
+        }
+        if !self.audio.inputs.is_empty() {
+            col = col
+                .push(space(1.0, 10.0))
+                .push(text("MICROPHONE", MONO, 15.0, alpha(TEXT_2, f)))
+                .push(self.row_box(3 + outs, "Microphone level", format!("{:.0}%", self.audio.mic_volume * 100.0), slider(self.audio.mic_volume, 900.0, self.row == Some(3 + outs), f), f))
+                .push(self.row_box(4 + outs, "Microphone", if self.audio.mic_muted { "OFF".into() } else { "ON".into() }, pill(if self.audio.mic_muted { "Muted · Enter".into() } else { "Listening · Enter mutes".into() }), f));
+            for (i, d) in self.audio.inputs.iter().enumerate() {
+                col = col.push(self.list_row(5 + outs + i, d.name.clone(), if d.default { "IN USE".into() } else { "ENTER USES IT".into() }, f));
+            }
+        }
+        widget::scrollable(col).height(Length::Fill).into()
     }
 
     fn updates_view(&self, f: f32) -> Element<'_, Message> {
@@ -2504,9 +2905,7 @@ impl Shell {
                         if i + 1 >= n {
                             self.sub = if n > 1 { Sub::Apps(i - 1) } else { Sub::None };
                         }
-                        return Task::perform(niri::run(vec![Action::CloseWindow { id: Some(id) }]), |_| {
-                            cosmic::Action::App(Message::Tick)
-                        });
+                        return self.close_window(id);
                     }
                 }
                 return Task::none();
@@ -2528,7 +2927,7 @@ impl Shell {
             Sub::Power(i) => {
                 match named {
                     Some(Named::ArrowRight) => {
-                        self.sub = Sub::Power((i + 1).min(4));
+                        self.sub = Sub::Power((i + 1).min(5));
                         self.power_armed = false;
                     }
                     Some(Named::ArrowLeft) => {
@@ -2541,7 +2940,21 @@ impl Shell {
                             self.close_menu();
                             return lock();
                         }
-                        let i = i - 1;
+                        // sleep: locked first, so it wakes up locked
+                        if i == 1 {
+                            self.close_menu();
+                            return Task::batch([
+                                lock(),
+                                Task::perform(
+                                    async {
+                                        tokio::time::sleep(Duration::from_millis(1200)).await;
+                                        let _ = tokio::process::Command::new("systemctl").arg("suspend").status().await;
+                                    },
+                                    |_| cosmic::Action::App(Message::Tick),
+                                ),
+                            ]);
+                        }
+                        let i = i - 2;
                         if i == 3 {
                             self.sub = Sub::None;
                         } else if self.power_armed {
@@ -2708,10 +3121,10 @@ impl Shell {
             }
             Sub::Power(sel) => {
                 let mut r = widget::Row::new().spacing(18);
-                let labels = ["Lock", "Log out", "Restart", "Shut down", "Cancel"];
+                let labels = ["Lock", "Sleep", "Log out", "Restart", "Shut down", "Cancel"];
                 for (i, l) in labels.iter().enumerate() {
                     let on = i == sel;
-                    let armed = on && self.power_armed && (1..=3).contains(&i);
+                    let armed = on && self.power_armed && (2..=4).contains(&i);
                     let label = if armed { format!("Press Enter to {}", l.to_lowercase()) } else { l.to_string() };
                     let bg = if armed { RED } else if on { YELLOW } else { PANEL_2 };
                     let b = fill(text(label, SANS_BOLD, 21.0, alpha(if on { BLACK } else { TEXT }, f)), alpha(bg, f)).padding([18, 28]);
@@ -2933,6 +3346,22 @@ fn lock() -> Task<Message> {
         return Task::none();
     }
     Task::perform(niri::run(vec![Action::SpawnSh { command: "chlorum lock".into() }]), |_| cosmic::Action::App(Message::Tick))
+}
+
+/// How far the wallpaper's video is (it is drawn once, then played).
+fn wallpaper_progress() -> String {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| "/tmp".into());
+    match std::fs::read_to_string(dir.join("chlorum/wallpaper-render")) {
+        Ok(p) => format!("MAKING THE 4K 60 FPS VIDEO OF THIS WALLPAPER · {}% · IT SHOWS BY ITSELF WHEN READY", p.trim()),
+        Err(_) => String::new(),
+    }
+}
+
+/// "English (US)" → "EN", "Ukrainian" → "UK", "French" → "FR".
+fn layout_short(name: &str) -> String {
+    let n = name.to_lowercase();
+    let known = [("english", "EN"), ("ukrainian", "UK"), ("french", "FR"), ("german", "DE"), ("spanish", "ES"), ("italian", "IT"), ("polish", "PL"), ("russian", "RU"), ("belgian", "BE"), ("swiss", "CH")];
+    known.iter().find(|(k, _)| n.starts_with(k)).map(|(_, v)| v.to_string()).unwrap_or_else(|| name.chars().take(2).collect::<String>().to_uppercase())
 }
 
 fn clip(s: &str, n: usize) -> String {

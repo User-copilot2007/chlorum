@@ -39,7 +39,60 @@ impl App {
 /// Apps on Home when the owner has not chosen their own list.
 pub const DEFAULT_PINNED: &[&str] = &["librewolf", "chlorum-library", "chlorum-typewriter", "com.system76.CosmicTerm"];
 /// Apps never shown on Home or in the app list.
-pub const HIDDEN: &[&str] = &["nixos-manual", "com.system76.CosmicEdit", "chlorum-shell"];
+pub const HIDDEN: &[&str] = &[
+    "nixos-manual",
+    "com.system76.CosmicEdit",
+    "chlorum-shell",
+    // the parts of an app that only start it in another way
+    "foot-server",
+    "footclient",
+    // players and viewers that only show a file they are given: Library
+    // and Gallery open them with one
+    "mpv",
+    "umpv",
+    "imv",
+    "imv-dir",
+    "org.pwmt.zathura",
+    "display-im6.q16",
+    "display-im7.q16",
+    "texdoctk",
+    "xterm",
+    "nvim",
+    "cups",
+];
+
+/// Apps that are one program started in different ways (LibreOffice's
+/// Writer, Calc…) share a family: the program's file name.
+pub fn family(a: &App) -> String {
+    // the program itself: past "env VAR=x", not a shell or a launcher
+    let words: Vec<&str> = a.exec.split_whitespace().collect();
+    let mut prog = "";
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        let base = Path::new(w).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        if base == "env" || (w.contains('=') && !w.starts_with('/')) || w.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        prog = w;
+        break;
+    }
+    let base = Path::new(prog).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+    let base = base.trim_start_matches('.').trim_end_matches("-wrapped").to_string();
+    match base.as_str() {
+        "footclient" => "foot".into(),
+        "soffice" | "libreoffice" | "loffice" | "lowriter" | "localc" | "loimpress" | "lodraw" | "lomath" | "lobase" => "libreoffice".into(),
+        // a shell, a launcher or nothing says nothing: the app is its own
+        "" | "sh" | "bash" | "true" | "flatpak" | "steam" | "wine" | "java" | "python3" | "python" | "chlorum" | "xdg-open" | "gtk-launch" => format!("id:{}", a.id),
+        _ => base,
+    }
+}
+
+/// Hidden by what it is called (ids differ between versions).
+pub fn hidden_by_name(a: &App) -> bool {
+    a.name.starts_with("ImageMagick")
+}
 /// Apps opened side by side when a session starts, unless the owner chose others.
 pub const DEFAULT_STARTUP: &[&str] = &["librewolf", "com.system76.CosmicTerm"];
 
@@ -169,6 +222,22 @@ fn parse(id: &str, path: &Path, with_hidden: bool) -> Option<App> {
 
 #[cfg(test)]
 mod launch_tests {
+    use super::*;
+
+    fn app(id: &str, exec: &str) -> App {
+        App { id: id.into(), name: id.into(), icon: String::new(), exec: exec.into(), wm_class: None, permissions: None, mime: vec![] }
+    }
+
+    #[test]
+    fn families() {
+        assert_eq!(family(&app("writer", "libreoffice --writer")), "libreoffice");
+        assert_eq!(family(&app("calc", "/nix/store/x-libreoffice/bin/libreoffice --calc")), "libreoffice");
+        assert_eq!(family(&app("foot", "foot")), family(&app("footclient", "footclient")));
+        assert_eq!(family(&app("a", "env GDK_BACKEND=x11 /nix/store/y/bin/gimp")), "gimp");
+        assert_ne!(family(&app("lib", "chlorum library")), family(&app("tw", "chlorum typewriter")));
+        assert_ne!(family(&app("x", "sh -c 'a'")), family(&app("y", "sh -c 'b'")));
+    }
+
     #[test]
     fn quoting() {
         assert_eq!(super::quote("it's"), "'it'\\''s'");

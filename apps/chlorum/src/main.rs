@@ -21,6 +21,7 @@ mod atom;
 mod bluetooth;
 mod display;
 mod drives;
+mod gallery;
 mod greeter;
 mod idle;
 mod keyd;
@@ -31,6 +32,7 @@ mod lockscreen;
 mod mime;
 mod niri;
 mod notify;
+mod phones;
 mod pointer;
 mod portal;
 mod progress;
@@ -39,6 +41,7 @@ mod setupd;
 mod store;
 mod shell;
 mod system;
+mod thumbs;
 mod ui;
 mod wallpaper;
 mod workshop;
@@ -68,6 +71,7 @@ fn main() {
         "shell" => shell::run().map_err(|e| e.to_string()),
         "greeter" => greeter::run().map_err(|e| e.to_string()),
         "library" => library::run().map_err(|e| e.to_string()),
+        "gallery" => gallery::run(&args[2..]),
         "pick" => library::pick_cli(&args[2..]),
         "portal" => portal::run(),
         "pointer" => pointer::run(),
@@ -81,6 +85,7 @@ fn main() {
             wallpaper::run();
             Ok(())
         }
+        "wallpaper-render" => wallpaper::render_cli(&args[2..]),
         "setupd" => setupd::run_daemon(),
         "keyd" => keyd::run_daemon(),
         "nightlight" => display::nightlight(),

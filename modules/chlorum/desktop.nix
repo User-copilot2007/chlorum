@@ -25,6 +25,17 @@ let
       ln -s chlorum $out/bin/work
       install -Dm644 ${../../assets/logo/chlorum-logo.svg} \
         $out/share/icons/hicolor/scalable/apps/com.chlorum.Logo.svg
+      install -Dm644 /dev/stdin $out/share/applications/chlorum-gallery.desktop <<EOF
+      [Desktop Entry]
+      Type=Application
+      Name=Gallery
+      Comment=Your photos and videos
+      Icon=multimedia-photo-viewer
+      Exec=$out/bin/chlorum gallery %f
+      StartupWMClass=chlorum-gallery
+      MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/tiff;image/heif;image/avif;image/jxl;
+      Categories=Graphics;Viewer;Photography;
+      EOF
       install -Dm644 /dev/stdin $out/share/applications/chlorum-library.desktop <<EOF
       [Desktop Entry]
       Type=Application
@@ -202,6 +213,11 @@ let
     export XCURSOR_SIZE=24
     export MOZ_ENABLE_WAYLAND=1
     export NIXOS_OZONE_WL=1
+    # every app opens and saves files through Chlorum's own window (the
+    # portal), never a desktop file dialog that cannot work here
+    export GTK_USE_PORTAL=1
+    export GDK_DEBUG=portals
+    export QT_QPA_PLATFORMTHEME=xdgdesktopportal
     exec ${config.programs.niri.package}/bin/niri-session
   '';
 
@@ -379,6 +395,10 @@ in
       };
     };
     boot.supportedFilesystems = [ "vfat" "exfat" "ntfs" "btrfs" "xfs" "f2fs" ];
+    # phones and cameras by USB: Android (MTP), iPhone, cameras (PTP),
+    # opened in Library with `gio mount`
+    services.gvfs.enable = true;
+    services.usbmuxd.enable = true;
     # A drive opened with a security key is unlocked by chlorum keyd (as
     # root, after checking it is a removable or USB drive), so UDisks sees
     # it as the system's and would not mount it for the person at the
@@ -481,6 +501,8 @@ in
       after = [ "graphical-session.target" ];
       unitConfig.ConditionEnvironment = "NIRI_SOCKET";
       enableDefaultPath = false;
+      # the video of the wallpaper: made with ffmpeg, played with mpvpaper
+      path = [ pkgs.ffmpeg-headless pkgs.mpvpaper ];
       serviceConfig = {
         ExecStart = "${chlorum}/bin/chlorum wallpaper";
         Restart = "on-failure";
@@ -592,11 +614,23 @@ in
       # for syntax, and what language servers are installed with
       # videos and music: mpv, played with the keyboard (space, arrows,
       # f for full screen, q to quit)
-      pkgs.mpv
+      # mpv answers the media keys (and shows in other apps' players)
+      (pkgs.mpv.override { scripts = [ pkgs.mpvScripts.mpris ]; })
+      pkgs.playerctl
       # scanning documents
       pkgs.simple-scan
       # pictures and PDFs, both moved around with the keyboard
       pkgs.imv
+      # the pictures of photos, videos and PDFs in Library and Gallery
+      pkgs.ffmpeg-headless
+      pkgs.poppler-utils
+      # `gio mount` for phones
+      pkgs.glib.bin
+      # spelling in LibreOffice and the browser: Ukrainian, English, French
+      pkgs.hunspell
+      pkgs.hunspellDicts.uk_UA
+      pkgs.hunspellDicts.en_US
+      pkgs.hunspellDicts.fr-any
       pkgs.zathura
       # what kind of file is this (for anything still asking xdg-mime)
       pkgs.file
@@ -618,6 +652,16 @@ in
     # Language servers that LazyVim (Mason) downloads are built for other
     # Linux systems: nix-ld lets them run here.
     programs.nix-ld.enable = true;
+    # mpv: full screen, played by the graphics card, and a video goes on
+    # where it was stopped
+    environment.etc."mpv/mpv.conf".text = ''
+      fullscreen=yes
+      hwdec=auto-safe
+      save-position-on-quit=yes
+      osd-on-seek=msg-bar
+      sub-auto=fuzzy
+      audio-file-auto=fuzzy
+    '';
     xdg.mime.defaultApplications = {
       "text/html" = "librewolf.desktop";
       "x-scheme-handler/http" = "librewolf.desktop";
@@ -635,15 +679,15 @@ in
       "audio/ogg" = "mpv.desktop";
       "audio/x-wav" = "mpv.desktop";
       "audio/mp4" = "mpv.desktop";
-      "image/png" = "imv.desktop";
-      "image/jpeg" = "imv.desktop";
-      "image/gif" = "imv.desktop";
-      "image/webp" = "imv.desktop";
-      "image/bmp" = "imv.desktop";
-      "image/tiff" = "imv.desktop";
+      "image/png" = "chlorum-gallery.desktop";
+      "image/jpeg" = "chlorum-gallery.desktop";
+      "image/gif" = "chlorum-gallery.desktop";
+      "image/webp" = "chlorum-gallery.desktop";
+      "image/bmp" = "chlorum-gallery.desktop";
+      "image/tiff" = "chlorum-gallery.desktop";
       "image/svg+xml" = "imv.desktop";
-      "image/heif" = "imv.desktop";
-      "image/avif" = "imv.desktop";
+      "image/heif" = "chlorum-gallery.desktop";
+      "image/avif" = "chlorum-gallery.desktop";
       "application/pdf" = "org.pwmt.zathura.desktop";
       "application/epub+zip" = "org.pwmt.zathura.desktop";
       "application/vnd.oasis.opendocument.text" = "writer.desktop";

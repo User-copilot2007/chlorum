@@ -68,7 +68,6 @@ pub struct Tally {
     pub log: std::collections::VecDeque<String>,
 }
 
-/// Without terminal colours.
 /// The cause in one of Nix's error messages. An evaluation error is a
 /// trace ("… while calling the 'head' builtin", "at /nix/store/…") ending
 /// in the real "error: …" line; other errors start with it.
@@ -87,6 +86,12 @@ fn cause(text: &str) -> Option<String> {
         .map(|l| l.to_string())
 }
 
+/// The cause in Nix's error output (stderr of a plain command).
+pub fn first_error(text: &str) -> Option<String> {
+    cause(&plain(text))
+}
+
+/// Without terminal colours.
 fn plain(m: &str) -> String {
     let mut out = String::new();
     let mut esc = false;

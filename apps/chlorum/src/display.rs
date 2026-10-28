@@ -156,10 +156,19 @@ pub async fn screens() -> Vec<Screen> {
     v
 }
 
+/// The size of everything for a screen nobody chose one for: Chlorum is
+/// drawn for about 1080 logical pixels of height, so a 4K screen gets 200%,
+/// a 1440p one 125%, a 1080p one 100%.
+pub fn auto_scale(height: u16) -> f64 {
+    let x = (height as f64 / 1080.0 * 4.0).round() / 4.0;
+    x.clamp(1.0, 2.5)
+}
+
 /// Puts the settings on every screen (a mode only where the screen has it).
 pub async fn apply(s: &Settings) {
     for sc in screens().await {
-        if let Some(x) = s.scale {
+        let auto = sc.current.map(|(_, h, _)| auto_scale(h));
+        if let Some(x) = s.scale.or(auto) {
             if (sc.scale - x).abs() > 0.001 {
                 let _ = niri::send(Request::Output { output: sc.name.clone(), action: OutputAction::Scale { scale: ScaleToSet::Specific(x) } }).await;
             }
@@ -249,5 +258,9 @@ mod tests {
         };
         assert_eq!(sc.sizes(), vec![(3840, 2160), (2560, 1440), (1920, 1080)]);
         assert_eq!(sc.rates((3840, 2160)), vec![60000, 30000]);
+        assert_eq!(auto_scale(2160), 2.0);
+        assert_eq!(auto_scale(1440), 1.25);
+        assert_eq!(auto_scale(1080), 1.0);
+        assert_eq!(auto_scale(768), 1.0);
     }
 }

@@ -12,7 +12,7 @@ use cosmic::widget::text_input;
 use cosmic::{Application, Element, widget};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 pub fn run() -> cosmic::iced::Result {
     let settings = Settings::default()
@@ -111,7 +111,6 @@ impl Application for Picker {
     }
 }
 
-const COLS: usize = 4;
 const DEFAULT_COLLECTIONS: &[&str] = &["Documents", "Photos", "Music", "Videos"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -237,10 +236,11 @@ enum Show {
     Text,
     Technical,
     Office,
+    Other,
 }
 
 impl Show {
-    const ALL: [Show; 7] = [Show::All, Show::Photos, Show::Videos, Show::Audio, Show::Text, Show::Technical, Show::Office];
+    const ALL: [Show; 8] = [Show::All, Show::Photos, Show::Videos, Show::Audio, Show::Text, Show::Technical, Show::Office, Show::Other];
     fn key(self) -> &'static str {
         match self {
             Show::All => "all",
@@ -250,6 +250,7 @@ impl Show {
             Show::Text => "text",
             Show::Technical => "technical",
             Show::Office => "office",
+            Show::Other => "other",
         }
     }
     fn label(self) -> &'static str {
@@ -261,25 +262,12 @@ impl Show {
             Show::Text => "Only text",
             Show::Technical => "Only technical files",
             Show::Office => "Only office files",
+            Show::Other => "Only other files",
         }
     }
     fn next(self) -> Show {
         let i = Show::ALL.iter().position(|s| *s == self).unwrap_or(0);
         Show::ALL[(i + 1) % Show::ALL.len()]
-    }
-    fn path() -> PathBuf {
-        crate::apps::config_dir().join("chlorum/library-show")
-    }
-    fn load() -> Show {
-        let k = std::fs::read_to_string(Show::path()).unwrap_or_default();
-        Show::ALL.into_iter().find(|s| s.key() == k.trim()).unwrap_or(Show::All)
-    }
-    fn save(self) {
-        let p = Show::path();
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let _ = std::fs::write(p, self.key());
     }
     /// Is this file of the kind shown? (Folders show only with All, except
     /// Workshop projects, which are technical.)
@@ -288,6 +276,7 @@ impl Show {
         let e = ext.as_str();
         match self {
             Show::All => true,
+            Show::Other => ![Show::Photos, Show::Videos, Show::Audio, Show::Text, Show::Technical, Show::Office].iter().any(|k| k.keeps(i)),
             Show::Photos => i.kind == Kind::Photo,
             Show::Videos => i.kind == Kind::Video,
             Show::Audio => i.kind == Kind::Music,
@@ -310,8 +299,147 @@ impl Show {
     }
 }
 
+/// When a file was last changed, for the filter.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum When {
+    Any,
+    Today,
+    Week,
+    Month,
+    Year,
+    LastYear,
+    Between,
+}
+
+impl When {
+    const ALL: [When; 7] = [When::Any, When::Today, When::Week, When::Month, When::Year, When::LastYear, When::Between];
+    fn key(self) -> &'static str {
+        match self {
+            When::Any => "any",
+            When::Today => "today",
+            When::Week => "week",
+            When::Month => "month",
+            When::Year => "year",
+            When::LastYear => "lastyear",
+            When::Between => "between",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            When::Any => "Any time",
+            When::Today => "Today",
+            When::Week => "Last 7 days",
+            When::Month => "Last 30 days",
+            When::Year => "This year",
+            When::LastYear => "Last year",
+            When::Between => "Between two dates",
+        }
+    }
+}
+
+/// What Library shows: some kinds of files (none chosen: all), from some
+/// time, in some order. Set in the filter panel (F); kept between uses.
+#[derive(Clone, Debug, PartialEq)]
+struct Filter {
+    kinds: Vec<Show>,
+    when: When,
+    /// YYYY-MM-DD, typed in the panel
+    from: String,
+    to: String,
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Filter { kinds: vec![], when: When::Any, from: String::new(), to: String::new() }
+    }
+}
+
+fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok()
+}
+
+impl Filter {
+    fn path() -> PathBuf {
+        crate::apps::config_dir().join("chlorum/library-filter")
+    }
+    fn load() -> Filter {
+        let mut f = Filter::default();
+        for l in std::fs::read_to_string(Filter::path()).unwrap_or_default().lines() {
+            let Some((k, v)) = l.split_once(' ') else { continue };
+            match k {
+                "kinds" => f.kinds = v.split(',').filter_map(|x| Show::ALL.into_iter().find(|s| s.key() == x && *s != Show::All)).collect(),
+                "when" => f.when = When::ALL.into_iter().find(|w| w.key() == v).unwrap_or(When::Any),
+                "from" => f.from = v.to_string(),
+                "to" => f.to = v.to_string(),
+                _ => {}
+            }
+        }
+        f
+    }
+    fn save(&self) {
+        let p = Filter::path();
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let kinds: Vec<&str> = self.kinds.iter().map(|k| k.key()).collect();
+        let _ = std::fs::write(p, format!("kinds {}\nwhen {}\nfrom {}\nto {}\n", kinds.join(","), self.when.key(), self.from, self.to));
+    }
+    fn is_all(&self) -> bool {
+        self.kinds.is_empty() && self.when == When::Any
+    }
+    fn keeps(&self, i: &Item) -> bool {
+        if !self.kinds.is_empty() && !self.kinds.iter().any(|k| k.keeps(i)) {
+            return false;
+        }
+        let dt: chrono::DateTime<chrono::Local> = i.modified.into();
+        let day = dt.date_naive();
+        let today = chrono::Local::now().date_naive();
+        use chrono::Datelike;
+        match self.when {
+            When::Any => true,
+            When::Today => day == today,
+            When::Week => (today - day).num_days() < 7,
+            When::Month => (today - day).num_days() < 30,
+            When::Year => day.year() == today.year(),
+            When::LastYear => day.year() == today.year() - 1,
+            When::Between => {
+                let from = parse_date(&self.from);
+                let to = parse_date(&self.to);
+                from.is_none_or(|f| day >= f) && to.is_none_or(|t| day <= t)
+            }
+        }
+    }
+    /// "Photos, Videos · Last 30 days"
+    fn summary(&self) -> String {
+        let kinds = if self.kinds.is_empty() {
+            "All kinds".to_string()
+        } else {
+            self.kinds.iter().map(|k| k.label().trim_start_matches("Only ").to_string()).map(|s| {
+                let mut c = s.chars();
+                c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+            }).collect::<Vec<_>>().join(", ")
+        };
+        let when = match self.when {
+            When::Between => format!("{} – {}", if self.from.is_empty() { "…" } else { &self.from }, if self.to.is_empty() { "…" } else { &self.to }),
+            w => w.label().to_string(),
+        };
+        format!("{kinds} · {when}")
+    }
+}
+
+/// A line of the filter panel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FilterRow {
+    Kind(Show),
+    When,
+    From,
+    To,
+    Order,
+    Clear,
+}
+
 #[derive(Clone, Debug)]
-struct Item {
+pub struct Item {
     path: PathBuf,
     name: String,
     kind: Kind,
@@ -330,6 +458,10 @@ enum View {
     Recent,
     Collection(String),
     Kind(Kind),
+    /// what was deleted, for 30 days
+    Bin,
+    /// a phone or camera plugged in by USB (its GVFS address)
+    Phone(String),
 }
 
 impl View {
@@ -340,6 +472,8 @@ impl View {
             View::Collection(c) => c.clone(),
             View::Kind(k) => k.label().into(),
             View::Drive(_) => "Drive".into(),
+            View::Bin => "Bin".into(),
+            View::Phone(_) => "Phone".into(),
         }
     }
 }
@@ -362,6 +496,14 @@ enum Focus {
     AddPin,
     /// naming a new Workshop project; the number is the language
     NewProject(usize),
+    /// the filter panel, on one of its lines
+    Filter(usize),
+    /// typing in the search field
+    Search,
+    /// typing a file's new name
+    Rename,
+    /// choosing the drive to copy files to
+    SendTo(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -384,10 +526,28 @@ pub enum Message {
     ProjectName(String),
     ProjectSubmit,
     Ejected(String, Result<(), String>),
+    Resized(iced::Size),
+    Query(String),
+    RenameInput(String),
+    /// files copied (to a drive, or from one into Library)
+    Copied(Result<String, String>),
+    /// a phone's photos and videos were read (its address, the files)
+    PhoneLoaded(String, Result<Vec<Item>, String>),
+    RenameSubmit,
+    QuerySubmit,
+    /// a file was clicked (twice quickly: opened)
+    Click(usize),
+    Scroll(f32),
+    /// a moment passed: new pictures of files may be ready
+    Frame,
 }
 
 pub struct Library {
     core: Core,
+    /// the window's size: how many files fit on a row and on the screen
+    size: iced::Size,
+    thumbs: crate::thumbs::Maker,
+    last_click: Option<(usize, Instant)>,
     items: Vec<Item>,
     collections: Vec<String>,
     rules: HashMap<String, String>, // extension -> collection
@@ -399,7 +559,6 @@ pub struct Library {
     new_name: String,
     input_id: widget::Id,
     /// the file grid, so it can scroll to follow the selection
-    grid_id: widget::Id,
     note: Option<String>,
     mode: Mode,
     /// picker: files marked so far (several at once)
@@ -416,7 +575,16 @@ pub struct Library {
     drive_busy: bool,
     project_name: String,
     sort: Sort,
-    show: Show,
+    filter: Filter,
+    /// what is in the bin (as files there)
+    bin_items: Vec<Item>,
+    phones: Vec<crate::phones::Phone>,
+    /// the phone being looked at and its files
+    phone_items: Option<(String, Vec<Item>)>,
+    rename: String,
+    /// typed in the search field (/): files from everywhere whose name has it
+    query: String,
+    search_id: widget::Id,
 }
 
 fn home() -> PathBuf {
@@ -462,6 +630,9 @@ impl Application for Library {
         let _ = std::fs::create_dir_all(lib.join("Projects"));
         let mut l = Library {
             core,
+            size: iced::Size::new(1600.0, 1000.0),
+            thumbs: crate::thumbs::Maker::new(),
+            last_click: None,
             items: vec![],
             collections: vec![],
             rules: load_rules(),
@@ -472,7 +643,6 @@ impl Application for Library {
             always: false,
             new_name: String::new(),
             input_id: widget::Id::unique(),
-            grid_id: widget::Id::unique(),
             note: None,
             save_name: match &mode {
                 Mode::Save { name, .. } => name.clone(),
@@ -488,7 +658,13 @@ impl Application for Library {
             drive_busy: false,
             project_name: String::new(),
             sort: Sort::load(),
-            show: Show::load(),
+            filter: Filter::load(),
+            bin_items: vec![],
+            phones: vec![],
+            phone_items: None,
+            rename: String::new(),
+            query: String::new(),
+            search_id: widget::Id::unique(),
         };
         l.scan();
         l.view = if l.picking() { 0 } else if l.inbox().is_empty() { 1 } else { 0 };
@@ -498,8 +674,14 @@ impl Application for Library {
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
             iced::time::every(Duration::from_secs(3)).map(|_| Message::Rescan),
+            iced::time::every(Duration::from_millis(500)).map(|_| Message::Frame),
             event::listen_with(|e, status, _| match e {
                 iced::Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) => Some(Message::Key(key, status)),
+                iced::Event::Window(iced::window::Event::Resized(size)) => Some(Message::Resized(size)),
+                iced::Event::Mouse(iced::mouse::Event::WheelScrolled { delta }) => Some(Message::Scroll(match delta {
+                    iced::mouse::ScrollDelta::Lines { y, .. } => y,
+                    iced::mouse::ScrollDelta::Pixels { y, .. } => y / 60.0,
+                })),
                 _ => None,
             }),
         ])
@@ -507,6 +689,95 @@ impl Application for Library {
 
     fn update(&mut self, m: Message) -> Task<Message> {
         match m {
+            Message::Resized(sz) => self.size = sz,
+            Message::RenameInput(v) => self.rename = v,
+            Message::PhoneLoaded(uri, r) => {
+                self.drive_busy = false;
+                match r {
+                    Ok(items) => {
+                        self.note = Some(if items.is_empty() { "No photos or videos on it.".into() } else { format!("{} photos, videos and files. SPACE marks, C copies into Library.", items.len()) });
+                        self.phone_items = Some((uri, items));
+                        self.focus = Focus::Grid;
+                        self.sel = 0;
+                    }
+                    Err(e) => self.note = Some(e),
+                }
+            }
+            Message::Copied(r) => {
+                self.drive_busy = false;
+                self.note = Some(match r {
+                    Ok(m) => m,
+                    Err(e) => e,
+                });
+                self.marked.clear();
+                self.scan();
+            }
+            Message::RenameSubmit => {
+                if let Some(it) = self.current_item() {
+                    let new = self.rename.trim().to_string();
+                    let to = it.path.with_file_name(&new);
+                    self.note = Some(if new.is_empty() || new.contains('/') || new == "." || new == ".." {
+                        "A name cannot be empty or have / in it.".to_string()
+                    } else if new == it.name {
+                        "The name is the same.".to_string()
+                    } else if to.exists() {
+                        format!("There is already a file called {new} there.")
+                    } else {
+                        match std::fs::rename(&it.path, &to) {
+                            Ok(()) => format!("Now called {new}."),
+                            Err(e) => format!("Could not rename: {e}"),
+                        }
+                    });
+                    self.focus = Focus::Grid;
+                    self.scan();
+                    // stay on the file under its new name
+                    let view = self.views.get(self.view).cloned().unwrap_or(View::Recent);
+                    if let Some(i) = self.items_in(&view).iter().position(|x| x.path == to) {
+                        self.sel = i;
+                    }
+                }
+            }
+            Message::Query(q) => {
+                self.query = q;
+                self.sel = 0;
+            }
+            Message::QuerySubmit => {
+                self.sel = 0;
+                self.focus = Focus::Grid;
+            }
+            Message::Frame => {
+                let _ = self.thumbs.take_done();
+            }
+            Message::Click(i) => {
+                let double = self.last_click.is_some_and(|(j, t)| j == i && t.elapsed() < Duration::from_millis(450));
+                self.last_click = Some((i, Instant::now()));
+                self.sel = i;
+                if !matches!(self.focus, Focus::Grid) && matches!(self.focus, Focus::Side | Focus::Ask(_) | Focus::Confirm) {
+                    self.focus = Focus::Grid;
+                }
+                if double {
+                    if let Some(it) = self.current_item() {
+                        if it.collection.is_none() && !matches!(self.views.get(self.view), Some(View::Drive(_) | View::Phone(_))) {
+                            self.focus = Focus::Ask(0);
+                        } else {
+                            self.opened(&it.path);
+                        }
+                    }
+                }
+            }
+            Message::Scroll(y) => {
+                if matches!(self.focus, Focus::Grid | Focus::Side) {
+                    let view = self.views.get(self.view).cloned().unwrap_or(View::Recent);
+                    let n = self.items_in(&view).len();
+                    let cols = self.cols();
+                    self.focus = Focus::Grid;
+                    if y < 0.0 && n > 0 {
+                        self.sel = (self.sel + cols).min(n - 1);
+                    } else if y > 0.0 {
+                        self.sel = self.sel.saturating_sub(cols);
+                    }
+                }
+            }
             Message::Rescan => {
                 if !matches!(self.focus, Focus::NewName | Focus::SaveName | Focus::DrivePassword | Focus::KeyPin | Focus::AddPassword | Focus::AddPin | Focus::NewProject(_)) {
                     self.scan();
@@ -608,7 +879,7 @@ impl Application for Library {
             if matches!(v, View::Kind(Kind::Photo)) {
                 side = side.push(space(1.0, 10.0)).push(text("BY KIND", MONO, 13.0, MUTED)).push(space(1.0, 6.0));
             }
-            if matches!(v, View::Drive(_)) && !matches!(self.views.get(i.wrapping_sub(1)), Some(View::Drive(_))) {
+            if matches!(v, View::Drive(_) | View::Phone(_)) && !matches!(self.views.get(i.wrapping_sub(1)), Some(View::Drive(_) | View::Phone(_))) {
                 side = side.push(space(1.0, 10.0)).push(text("DRIVES", MONO, 13.0, MUTED)).push(space(1.0, 6.0));
             }
             if matches!(v, View::Collection(_)) && !matches!(self.views.get(i.wrapping_sub(1)), Some(View::Collection(_))) {
@@ -637,22 +908,35 @@ impl Application for Library {
         let view = self.views.get(self.view).cloned().unwrap_or(View::Recent);
         let items = self.items_in(&view);
         let mut grid = widget::Column::new().spacing(22);
-        for (r, chunk) in items.chunks(COLS).enumerate() {
+        let cols = self.cols();
+        let card_w = self.card_width();
+        let thumb_h = (card_w * 0.66).round();
+        // the rows around the chosen file: it never goes off screen
+        let fit = self.rows_shown(thumb_h);
+        let rows = items.len().div_ceil(cols);
+        let first = (self.sel / cols).saturating_sub(fit.saturating_sub(1) / 3).min(rows.saturating_sub(fit));
+        for (r, chunk) in items.chunks(cols).enumerate().skip(first).take(fit) {
             let mut row = widget::Row::new().spacing(22);
             for (c, it) in chunk.iter().enumerate() {
-                let i = r * COLS + c;
+                let i = r * cols + c;
                 let on = i == self.sel && matches!(self.focus, Focus::Grid | Focus::Ask(_) | Focus::NewName | Focus::Confirm);
                 let marked = self.marked.contains(&it.path);
-                let thumb = fill(
-                    widget::container(fill(text(it.kind.badge(), MONO_BOLD, 24.0, BLACK), YELLOW).padding([4, 12]))
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .align_x(Alignment::Center)
-                        .align_y(Alignment::Center),
-                    PANEL_2,
-                )
-                .width(Length::Fill)
-                .height(Length::Fixed(130.0));
+                // the file itself when it can be pictured, its kind otherwise
+                let picture = self.thumbs.get(&it.path, it.size, it.modified);
+                let thumb: Element<'_, Message> = match picture {
+                    Some(p) => widget::image(widget::image::Handle::from_path(p)).content_fit(cosmic::iced::ContentFit::Cover).width(Length::Fill).height(Length::Fixed(thumb_h)).into(),
+                    None => fill(
+                        widget::container(fill(text(it.kind.badge(), MONO_BOLD, 24.0, BLACK), YELLOW).padding([4, 12]))
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .align_x(Alignment::Center)
+                            .align_y(Alignment::Center),
+                        PANEL_2,
+                    )
+                    .width(Length::Fill)
+                    .height(Length::Fixed(thumb_h))
+                    .into(),
+                };
                 let meta = format!(
                     "{}{} · {}",
                     if marked { "■ " } else { "" },
@@ -671,8 +955,8 @@ impl Application for Library {
                         ),
                     if on { YELLOW } else if marked { PANEL_2 } else { PANEL },
                 )
-                .width(Length::Fixed(250.0));
-                row = row.push(bracket(card, if on && self.focus == Focus::Grid { 1.0 } else { 0.0 }, 8.0));
+                .width(Length::Fixed(card_w));
+                row = row.push(widget::mouse_area(bracket(card, if on && self.focus == Focus::Grid { 1.0 } else { 0.0 }, 8.0)).on_press(Message::Click(i)));
             }
             grid = grid.push(row);
         }
@@ -680,27 +964,61 @@ impl Application for Library {
             let msg = match (&self.mode, &view) {
                 (Mode::Save { .. }, _) => "Choose where it goes, then press → to name it.",
                 (_, View::Inbox) => "Nothing waiting. New downloads appear here.",
-                _ if self.show != Show::All => "Nothing of this kind here. F shows another kind.",
+                _ if !self.query.trim().is_empty() => "No file is called like that. Esc clears the search.",
+                _ if !self.filter.is_all() => "Nothing here passes the filter. F changes it.",
                 _ => "Nothing here yet.",
             };
             grid = grid.push(text(msg, SANS, 22.0, TEXT_2));
         }
-        let order = if view == View::Recent { "Newest first".to_string() } else { self.sort.label().to_string() };
+        let order = if view == View::Recent && self.query.is_empty() { "Newest first".to_string() } else { self.sort.label().to_string() };
+        let title = if self.query.trim().is_empty() { self.view_label(&view) } else { format!("Results for “{}”", self.query.trim()) };
+        let search = text_input::text_input("Search all files ( / )", self.query.as_str())
+            .id(self.search_id.clone())
+            .on_input(Message::Query)
+            .on_submit(|_| Message::QuerySubmit)
+            .size(20)
+            .padding([10, 16])
+            .width(Length::Fixed(520.0));
         let main = widget::Column::new()
-            .push(text(self.view_label(&view), SANS_BOLD, 44.0, TEXT))
+            .push(widget::Row::new().push(text(title, SANS_BOLD, 44.0, TEXT)).push(hfill()).push(bracket(search, if self.focus == Focus::Search { 1.0 } else { 0.0 }, 6.0)).align_y(Alignment::Center))
             .push(space(1.0, 6.0))
             .push(text(
-                format!("{} · S      {} · F", order.to_uppercase(), self.show.label().to_uppercase()),
+                format!("{} · S      {} · F", order.to_uppercase(), self.filter.summary().to_uppercase()),
                 MONO,
                 14.0,
-                if self.show == Show::All { TEXT_2 } else { YELLOW },
+                if self.filter.is_all() { TEXT_2 } else { YELLOW },
             ))
             .push(space(1.0, 20.0))
-            .push(widget::scrollable(grid).id(self.grid_id.clone()).height(Length::Fill))
+            .push(if self.focus == Focus::Rename {
+                widget::Column::new()
+                    .push(text("NEW NAME", MONO, 13.0, YELLOW))
+                    .push(bracket(
+                        text_input::text_input("Name", self.rename.as_str())
+                            .id(self.input_id.clone())
+                            .on_input(Message::RenameInput)
+                            .on_submit(|_| Message::RenameSubmit)
+                            .size(22)
+                            .padding([12, 16])
+                            .width(Length::Fixed(640.0)),
+                        1.0,
+                        6.0,
+                    ))
+                    .push(space(1.0, 16.0))
+                    .spacing(6)
+                    .into()
+            } else {
+                space(1.0, 1.0)
+            })
+            .push(widget::container(grid).height(Length::Fill))
+            .push(text(if rows > fit { format!("{} of {} · scroll or arrows", (self.sel + 1).min(items.len()), items.len()) } else { String::new() }, MONO, 13.0, TEXT_2))
             .width(Length::Fill);
 
         let mut row = widget::Row::new().push(side).push(space(56.0, 1.0)).push(main).height(Length::Fill);
-        if let Some(panel) = self.project_panel() {
+        if let Some(panel) = self.filter_panel() {
+            row = row.push(space(30.0, 1.0)).push(panel);
+        } else if let Some(panel) = self.send_panel() {
+            row = row.push(space(30.0, 1.0)).push(panel);
+        } else if let Some(panel) = self.project_panel() {
             row = row.push(space(30.0, 1.0)).push(panel);
         } else if let Some(panel) = self.drive_panel(&view) {
             row = row.push(space(30.0, 1.0)).push(panel);
@@ -710,13 +1028,19 @@ impl Application for Library {
             row = row.push(space(30.0, 1.0)).push(panel);
         }
 
-        let on_drive = matches!(view, View::Drive(_));
+        let on_drive = matches!(view, View::Drive(_) | View::Phone(_));
         let mut h: Vec<(&str, &str, bool)> = match (&self.mode, self.focus) {
             (_, Focus::DrivePassword) => vec![("ENTER", "Unlock", true), ("ESC", "Back", false)],
             (_, Focus::KeyPin) => vec![("ENTER", "Open with the key", true), ("ESC", "Back", false)],
             (_, Focus::AddPassword) => vec![("ENTER", "Next", true), ("ESC", "Back", false)],
             (_, Focus::AddPin) => vec![("ENTER", "Add the key", true), ("ESC", "Back", false)],
             (_, Focus::NewProject(_)) => vec![("↑ ↓", "Language", false), ("ENTER", "Create", true), ("ESC", "Back", false)],
+            (_, Focus::Filter(_)) => vec![("↑ ↓", "Choose", false), ("ENTER", "On · Off", true), ("← →", "Change", false), ("ESC", "Done", false)],
+            (_, Focus::Rename) => vec![("ENTER", "Rename", true), ("ESC", "Back", false)],
+            (_, Focus::SendTo(_)) => vec![("↑ ↓", "Drive", false), ("ENTER", "Copy there", true), ("ESC", "Back", false)],
+            (Mode::Browse, Focus::Grid) if view == View::Bin => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Put back", true), ("DEL", "Delete for good", false)],
+            (Mode::Browse, Focus::Confirm) if view == View::Bin => vec![("ENTER", "Delete for good", true), ("ESC", "Keep", false)],
+            (_, Focus::Search) => vec![("TYPE", "Name", false), ("ENTER", "Results", true), ("ESC", "Clear", false)],
             (Mode::Browse, Focus::Side | Focus::Grid) if matches!(&view, View::Collection(c) if c == "Projects") => {
                 vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open in Typewriter", true), ("N", "New project", false), ("DEL", "Delete", false)]
             }
@@ -729,7 +1053,7 @@ impl Application for Library {
                 }
             }
             (Mode::Browse, Focus::Grid) if on_drive => {
-                vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("C", "Copy into Library", false), ("S", "Sort", false), ("F", "Show", false), ("E", "Take out", false)]
+                vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("SPACE", "Mark", false), ("C", "Copy into Library", false), ("F", "Filter", false), ("/", "Search", false), ("E", "Take out", false)]
             }
             (Mode::Open { folders: true, .. }, Focus::Side) => vec![("↑ ↓", "Collection", false), ("ENTER", "Choose this one", true), ("ESC", "Cancel", false)],
             (Mode::Open { .. }, Focus::Side) => vec![("↑ ↓", "View", false), ("→", "Files", true), ("ESC", "Cancel", false)],
@@ -738,8 +1062,8 @@ impl Application for Library {
             (Mode::Save { .. }, Focus::Side) => vec![("↑ ↓", "Where", false), ("→", "Name it", true), ("ESC", "Cancel", false)],
             (Mode::Save { .. }, _) => vec![("ENTER", "Save", true), ("ESC", "Back", false)],
             (_, Focus::SaveName) => vec![("ENTER", "Save", true), ("ESC", "Back", false)],
-            (_, Focus::Side) => vec![("↑ ↓", "View", false), ("→", "Files", true)],
-            (_, Focus::Grid) => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("M", "Move to…", false), ("S", "Sort", false), ("F", "Show", false), ("DEL", "Delete", false)],
+            (_, Focus::Side) => vec![("↑ ↓", "View", false), ("→", "Files", true), ("F", "Filter", false), ("/", "Search", false)],
+            (_, Focus::Grid) => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("SPACE", "Mark", false), ("C", "Copy to drive", false), ("M", "Move", false), ("R", "Rename", false), ("F", "Filter", false), ("/", "Search", false), ("DEL", "Delete", false)],
             (_, Focus::Ask(_)) => vec![("↑ ↓", "Choose", false), ("1–9", "Pick", false), ("ENTER", "File it", true), ("A", "Always", false), ("ESC", "Back", false)],
             (_, Focus::NewName) => vec![("ENTER", "Create", true), ("ESC", "Back", false)],
             (_, Focus::Confirm) => vec![("ENTER", "Delete", true), ("ESC", "Keep", false)],
@@ -761,11 +1085,276 @@ impl Library {
     /// same height, so scrolling to (row / last row) of the way down always
     /// shows that row, without knowing the window's size.
     fn follow(&self) -> Task<Message> {
+        // the grid shows the rows around the chosen file by itself
+        Task::none()
+    }
+
+    /// Keys on a phone. None: the usual meaning.
+    fn phone_key(&mut self, uri: String, named: Option<keyboard::key::Named>, ch: &str, n: usize) -> Option<Task<Message>> {
+        use keyboard::key::Named;
+        if self.drive_busy {
+            return Some(Task::none());
+        }
+        let loaded = matches!(&self.phone_items, Some((u, _)) if *u == uri);
+        match self.focus {
+            Focus::Side if matches!(named, Some(Named::ArrowRight) | Some(Named::Enter)) => {
+                if loaded && n > 0 {
+                    self.focus = Focus::Grid;
+                    self.sel = 0;
+                    return Some(Task::none());
+                }
+                let phone = self.phones.iter().find(|p| p.uri == uri).cloned()?;
+                self.drive_busy = true;
+                self.note = Some(format!("Opening {}… (unlock it if it asks)", phone.name));
+                Some(Task::perform(
+                    async move {
+                        let u = phone.uri.clone();
+                        let r = tokio::task::spawn_blocking(move || {
+                            let root = crate::phones::open(&phone)?;
+                            let mut items = vec![];
+                            for d in crate::phones::media_dirs(&root) {
+                                walk(&d, 0, &mut |p| {
+                                    if items.len() < 20000 {
+                                        items.push(item(p, Some("PHONE".into())));
+                                    }
+                                });
+                            }
+                            items.sort_by(|a: &Item, b: &Item| b.modified.cmp(&a.modified));
+                            Ok::<Vec<Item>, String>(items)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                        (u, r)
+                    },
+                    |(u, r)| cosmic::Action::App(Message::PhoneLoaded(u, r)),
+                ))
+            }
+            Focus::Grid => {
+                if ch == " " {
+                    if let Some(it) = self.current_item() {
+                        if let Some(p) = self.marked.iter().position(|m| *m == it.path) {
+                            self.marked.remove(p);
+                        } else {
+                            self.marked.push(it.path);
+                        }
+                        self.note = Some(format!("{} marked. C copies them into Library.", self.marked.len()));
+                    }
+                    return Some(Task::none());
+                }
+                if ch == "c" {
+                    let files: Vec<PathBuf> = if self.marked.is_empty() { self.current_item().map(|it| vec![it.path]).unwrap_or_default() } else { self.marked.clone() };
+                    if files.is_empty() {
+                        return Some(Task::none());
+                    }
+                    let dl = home().join("Downloads");
+                    self.drive_busy = true;
+                    self.note = Some(format!("Copying {} from the phone…", if files.len() == 1 { "1 file".to_string() } else { format!("{} files", files.len()) }));
+                    return Some(Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || copy_all(&files, &dl).map(|n| format!("{n} copied: they wait in \"Needs an answer\".")))
+                                .await
+                                .unwrap_or_else(|e| Err(e.to_string()))
+                        },
+                        |r| cosmic::Action::App(Message::Copied(r)),
+                    ));
+                }
+                match named {
+                    Some(Named::Enter) => {
+                        if let Some(it) = self.current_item() {
+                            self.opened(&it.path);
+                        }
+                        Some(Task::none())
+                    }
+                    // nothing on a phone is deleted or moved from here
+                    Some(Named::Delete) => Some(Task::none()),
+                    _ if ch == "m" || ch == "r" => Some(Task::none()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The drives that are open: (name, where their files are).
+    fn open_drives(&self) -> Vec<(String, PathBuf)> {
+        self.drives
+            .iter()
+            .filter_map(|d| match &d.state {
+                crate::drives::State::Open(p) => Some((d.name.clone(), p.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn send_panel(&self) -> Option<Element<'_, Message>> {
+        let Focus::SendTo(at) = self.focus else { return None };
+        let n = if self.marked.is_empty() { 1 } else { self.marked.len() };
+        let mut col = widget::Column::new().spacing(6).width(Length::Fixed(430.0));
+        col = col
+            .push(text("COPY TO A DRIVE", MONO, 14.0, YELLOW))
+            .push(text(if n == 1 { "1 file".to_string() } else { format!("{n} files") }, SANS_BOLD, 26.0, TEXT))
+            .push(text("A copy goes to the drive; the file stays here too.", SANS, 15.0, TEXT_2))
+            .push(space(1.0, 6.0));
+        for (i, (name, root)) in self.open_drives().into_iter().enumerate() {
+            let on = i == at;
+            col = col.push(
+                fill(
+                    widget::Column::new().push(text(name, SANS_BOLD, 19.0, if on { BLACK } else { TEXT })).push(text(root.display().to_string(), MONO, 12.0, if on { BLACK } else { TEXT_2 })),
+                    if on { YELLOW } else { PANEL },
+                )
+                .padding([12, 18])
+                .width(Length::Fill),
+            );
+        }
+        Some(col.into())
+    }
+
+    fn filter_rows(&self) -> Vec<FilterRow> {
+        let mut v: Vec<FilterRow> = Show::ALL.iter().filter(|s| **s != Show::All).map(|s| FilterRow::Kind(*s)).collect();
+        v.push(FilterRow::When);
+        if self.filter.when == When::Between {
+            v.push(FilterRow::From);
+            v.push(FilterRow::To);
+        }
+        v.push(FilterRow::Order);
+        v.push(FilterRow::Clear);
+        v
+    }
+
+    fn filter_key(&mut self, row: usize, named: Option<keyboard::key::Named>, ch: &str) -> Task<Message> {
+        use keyboard::key::Named;
+        let rows = self.filter_rows();
+        let Some(r) = rows.get(row).copied() else {
+            self.focus = Focus::Filter(0);
+            return Task::none();
+        };
+        let step = match named {
+            Some(Named::ArrowRight) => 1,
+            Some(Named::ArrowLeft) => -1,
+            _ => 0,
+        };
+        match named {
+            Some(Named::ArrowDown) => self.focus = Focus::Filter((row + 1).min(rows.len() - 1)),
+            Some(Named::ArrowUp) => self.focus = Focus::Filter(row.saturating_sub(1)),
+            Some(Named::Escape) => {
+                self.focus = Focus::Grid;
+                self.sel = 0;
+                return Task::none();
+            }
+            _ => {}
+        }
+        let press = named == Some(Named::Enter) || ch == " ";
+        match r {
+            FilterRow::Kind(k) if press => {
+                if let Some(i) = self.filter.kinds.iter().position(|x| *x == k) {
+                    self.filter.kinds.remove(i);
+                } else {
+                    self.filter.kinds.push(k);
+                    self.filter.kinds.sort_by_key(|x| Show::ALL.iter().position(|y| y == x));
+                }
+            }
+            FilterRow::When if step != 0 || press => {
+                let i = When::ALL.iter().position(|w| *w == self.filter.when).unwrap_or(0) as i32;
+                let d = if step == 0 { 1 } else { step };
+                self.filter.when = When::ALL[(i + d).rem_euclid(When::ALL.len() as i32) as usize];
+            }
+            FilterRow::From | FilterRow::To => {
+                let field = if r == FilterRow::From { &mut self.filter.from } else { &mut self.filter.to };
+                if named == Some(Named::Backspace) {
+                    field.pop();
+                } else if ch.len() == 1 && (ch.chars().all(|c| c.is_ascii_digit()) || ch == "-") && field.len() < 10 {
+                    field.push_str(ch);
+                    // the dashes come by themselves: 20261001 → 2026-10-01
+                    if field.len() == 4 || field.len() == 7 {
+                        field.push('-');
+                    }
+                    *field = field.replace("--", "-");
+                }
+            }
+            FilterRow::Order if step != 0 || press => {
+                let i = Sort::ALL.iter().position(|x| *x == self.sort).unwrap_or(0) as i32;
+                let d = if step == 0 { 1 } else { step };
+                self.sort = Sort::ALL[(i + d).rem_euclid(Sort::ALL.len() as i32) as usize];
+                self.sort.save();
+            }
+            FilterRow::Clear if press => {
+                self.filter = Filter::default();
+                self.focus = Focus::Filter(0);
+            }
+            _ => {}
+        }
+        self.filter.save();
+        self.sel = 0;
+        Task::none()
+    }
+
+    fn filter_panel(&self) -> Option<Element<'_, Message>> {
+        let Focus::Filter(at) = self.focus else { return None };
+        let line = |i: usize, label: String, value: String, on_value: bool| -> Element<'_, Message> {
+            let on = i == at;
+            fill(
+                widget::Row::new()
+                    .push(text(label, SANS_BOLD, 19.0, if on { BLACK } else { TEXT }))
+                    .push(hfill())
+                    .push(text(value, MONO_BOLD, 15.0, if on { BLACK } else if on_value { YELLOW } else { TEXT_2 }))
+                    .align_y(Alignment::Center),
+                if on { YELLOW } else { PANEL },
+            )
+            .padding([12, 18])
+            .width(Length::Fill)
+            .into()
+        };
+        let mut col = widget::Column::new().spacing(6).width(Length::Fixed(430.0));
+        col = col.push(text("FILTER", MONO, 14.0, YELLOW)).push(text("Show only", SANS_BOLD, 26.0, TEXT)).push(text("Choose one kind or several. None chosen: everything.", SANS, 15.0, TEXT_2)).push(space(1.0, 6.0));
+        for (i, r) in self.filter_rows().into_iter().enumerate() {
+            let el = match r {
+                FilterRow::Kind(k) => {
+                    let on = self.filter.kinds.contains(&k);
+                    let name = k.label().trim_start_matches("Only ").to_string();
+                    let name = name[..1].to_uppercase() + &name[1..];
+                    line(i, name, if on { "■ SHOWN".into() } else { "□".into() }, on)
+                }
+                FilterRow::When => {
+                    col = col.push(space(1.0, 10.0)).push(text("CHANGED", MONO, 13.0, MUTED));
+                    line(i, "When".into(), format!("‹ {} ›", self.filter.when.label()), self.filter.when != When::Any)
+                }
+                FilterRow::From => line(i, "From (YYYY-MM-DD)".into(), if self.filter.from.is_empty() { "type the date".into() } else { self.filter.from.clone() }, parse_date(&self.filter.from).is_some()),
+                FilterRow::To => line(i, "To (YYYY-MM-DD)".into(), if self.filter.to.is_empty() { "type the date".into() } else { self.filter.to.clone() }, parse_date(&self.filter.to).is_some()),
+                FilterRow::Order => {
+                    col = col.push(space(1.0, 10.0)).push(text("ORDER", MONO, 13.0, MUTED));
+                    line(i, "Order".into(), format!("‹ {} ›", self.sort.label()), false)
+                }
+                FilterRow::Clear => {
+                    col = col.push(space(1.0, 10.0));
+                    line(i, "Show everything again".into(), "ENTER".into(), false)
+                }
+            };
+            col = col.push(el);
+        }
         let view = self.views.get(self.view).cloned().unwrap_or(View::Recent);
-        let n = self.items_in(&view).len();
-        let rows = n.div_ceil(COLS);
-        let y = if rows <= 1 { 0.0 } else { (self.sel / COLS) as f32 / (rows - 1) as f32 };
-        cosmic::iced::widget::scrollable::snap_to(self.grid_id.clone(), cosmic::iced::widget::scrollable::RelativeOffset { x: None, y: Some(y.clamp(0.0, 1.0)) })
+        col = col.push(space(1.0, 10.0)).push(text(format!("{} files shown", self.items_in(&view).len()), MONO, 14.0, TEXT_2));
+        Some(col.into())
+    }
+
+    /// Files on a row: as many cards of about 280 pixels as fit beside the
+    /// collections (and the panel on the right, when one shows).
+    fn cols(&self) -> usize {
+        let view = self.views.get(self.view).cloned().unwrap_or(View::Recent);
+        let panel = if self.filter_panel().is_some() || self.send_panel().is_some() || self.project_panel().is_some() || self.drive_panel(&view).is_some() || self.save_panel(&view).is_some() { 460.0 } else { 0.0 };
+        let room = self.size.width - 330.0 - 56.0 - 144.0 - panel;
+        ((room / 302.0).floor() as usize).clamp(2, 10)
+    }
+    fn card_width(&self) -> f32 {
+        let view = self.views.get(self.view).cloned().unwrap_or(View::Recent);
+        let panel = if self.filter_panel().is_some() || self.send_panel().is_some() || self.project_panel().is_some() || self.drive_panel(&view).is_some() || self.save_panel(&view).is_some() { 460.0 } else { 0.0 };
+        let room = self.size.width - 330.0 - 56.0 - 144.0 - panel;
+        let cols = self.cols() as f32;
+        ((room - (cols - 1.0) * 22.0) / cols).clamp(200.0, 420.0)
+    }
+    /// Rows that fit on the screen.
+    fn rows_shown(&self, thumb_h: f32) -> usize {
+        let row_h = thumb_h + 80.0 + 22.0;
+        (((self.size.height - 300.0) / row_h).floor() as usize).max(1)
     }
 
     fn scan(&mut self) {
@@ -828,8 +1417,16 @@ impl Library {
         if matches!(self.mode, Mode::Browse | Mode::Open { folders: false, .. }) {
             views.extend(Kind::VIEWS.iter().map(|k| View::Kind(*k)));
         }
+        if self.mode == Mode::Browse {
+            views.push(View::Bin);
+            self.bin_items = bin_list();
+        }
         if matches!(self.mode, Mode::Browse | Mode::Open { folders: false, .. }) {
             views.extend(self.drives.iter().map(|d| View::Drive(d.id.clone())));
+        }
+        if self.mode == Mode::Browse {
+            self.phones = crate::phones::list();
+            views.extend(self.phones.iter().map(|p| View::Phone(p.uri.clone())));
         }
         if views.is_empty() {
             views.push(View::Collection(DEFAULT_COLLECTIONS[0].into()));
@@ -867,9 +1464,18 @@ impl Library {
     }
 
     fn items_in(&self, v: &View) -> Vec<Item> {
-        let mut items = self.unsorted_items_in(v);
-        if self.show != Show::All {
-            items.retain(|i| self.show.keeps(i));
+        // a search looks through everything, whatever view is open
+        let mut items = if self.query.trim().is_empty() {
+            self.unsorted_items_in(v)
+        } else {
+            let q = self.query.trim().to_lowercase();
+            let mut v: Vec<Item> = self.items.iter().chain(self.drive_items.iter()).filter(|i| i.name.to_lowercase().contains(&q)).cloned().collect();
+            v.sort_by_key(|i| !i.name.to_lowercase().starts_with(&q));
+            v.dedup_by(|a, b| a.path == b.path);
+            v
+        };
+        if !self.filter.is_all() {
+            items.retain(|i| self.filter.keeps(i));
         }
         // Recent is the newest files, whatever the order chosen
         if *v != View::Recent {
@@ -879,6 +1485,15 @@ impl Library {
     }
 
     fn unsorted_items_in(&self, v: &View) -> Vec<Item> {
+        if *v == View::Bin {
+            return self.bin_items.clone();
+        }
+        if let View::Phone(uri) = v {
+            return match &self.phone_items {
+                Some((u, items)) if u == uri => items.clone(),
+                _ => vec![],
+            };
+        }
         if let View::Drive(id) = v {
             let looking = matches!(self.views.get(self.view), Some(View::Drive(x)) if x == id);
             if !looking {
@@ -907,6 +1522,7 @@ impl Library {
                 View::Recent => true,
                 View::Collection(c) => i.collection.as_deref() == Some(c),
                 View::Kind(k) => i.kind == *k,
+                View::Bin | View::Phone(_) => false,
             })
             .take(if *v == View::Recent { 60 } else { usize::MAX })
             .cloned()
@@ -1031,6 +1647,11 @@ impl Library {
                 return t;
             }
         }
+        if let View::Phone(uri) = &view {
+            if let Some(t) = self.phone_key(uri.clone(), named, &ch, n) {
+                return t;
+            }
+        }
         if self.picking() {
             if let Some(t) = self.pick_key(named, &ch, &view, n) {
                 return t;
@@ -1051,12 +1672,37 @@ impl Library {
             self.project_name.clear();
             return text_input::focus(self.input_id.clone());
         }
-        if ch == "f" && matches!(self.focus, Focus::Side | Focus::Grid) {
-            self.show = self.show.next();
-            self.show.save();
+        if let Focus::Filter(row) = self.focus {
+            return self.filter_key(row, named, &ch);
+        }
+        if self.focus == Focus::Search {
+            match named {
+                Some(Named::Escape) => {
+                    self.query.clear();
+                    self.focus = Focus::Side;
+                }
+                Some(Named::ArrowDown) | Some(Named::Enter) => {
+                    self.sel = 0;
+                    self.focus = Focus::Grid;
+                }
+                _ => {}
+            }
+            return Task::none();
+        }
+        if ch == "f" && matches!(self.focus, Focus::Side | Focus::Grid) && !self.picking() {
+            self.focus = Focus::Filter(0);
+            return Task::none();
+        }
+        if ch == "/" && matches!(self.focus, Focus::Side | Focus::Grid) {
+            self.focus = Focus::Search;
+            return text_input::focus(self.search_id.clone());
+        }
+        // out of a search: Esc in the results clears it
+        if named == Some(Named::Escape) && !self.query.is_empty() && matches!(self.focus, Focus::Grid | Focus::Side) {
+            self.query.clear();
             self.sel = 0;
-            self.note = Some(format!("{}. F shows another kind.", self.show.label()));
-            return self.follow();
+            self.focus = Focus::Side;
+            return Task::none();
         }
         if ch == "s" && matches!(self.focus, Focus::Side | Focus::Grid) {
             if view == View::Recent {
@@ -1070,7 +1716,7 @@ impl Library {
             return self.follow();
         }
         match self.focus {
-            Focus::SaveName | Focus::DrivePassword | Focus::KeyPin | Focus::AddPassword | Focus::AddPin | Focus::NewProject(_) => {}
+            Focus::SaveName | Focus::DrivePassword | Focus::KeyPin | Focus::AddPassword | Focus::AddPin | Focus::NewProject(_) | Focus::Filter(_) | Focus::Search => {}
             Focus::NewName => {
                 if named == Some(Named::Escape) {
                     self.focus = Focus::Ask(0);
@@ -1094,23 +1740,47 @@ impl Library {
                 }
                 _ => {}
             },
+            Focus::Grid if view == View::Bin => match named {
+                Some(Named::ArrowRight) => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
+                Some(Named::ArrowLeft) => {
+                    if self.sel % self.cols() == 0 {
+                        self.focus = Focus::Side;
+                    } else {
+                        self.sel -= 1;
+                    }
+                }
+                Some(Named::ArrowDown) if self.sel + self.cols() < n => self.sel += self.cols(),
+                Some(Named::ArrowUp) if self.sel >= self.cols() => self.sel -= self.cols(),
+                Some(Named::Escape) => self.focus = Focus::Side,
+                Some(Named::Enter) => {
+                    if let Some(it) = self.current_item() {
+                        self.note = Some(match restore(&it.path) {
+                            Ok(to) => format!("{} is back in {}.", it.name, to.parent().map(|p| p.display().to_string()).unwrap_or_default()),
+                            Err(e) => format!("Could not put it back: {e}"),
+                        });
+                        self.scan();
+                    }
+                }
+                Some(Named::Delete) => self.focus = Focus::Confirm,
+                _ => {}
+            },
             Focus::Grid => match named {
                 Some(Named::ArrowRight) => self.sel = (self.sel + 1).min(n.saturating_sub(1)),
                 Some(Named::ArrowLeft) => {
-                    if self.sel % COLS == 0 {
+                    if self.sel % self.cols() == 0 {
                         self.focus = Focus::Side;
                     } else {
                         self.sel -= 1;
                     }
                 }
                 Some(Named::ArrowDown) => {
-                    if self.sel + COLS < n {
-                        self.sel += COLS;
+                    if self.sel + self.cols() < n {
+                        self.sel += self.cols();
                     }
                 }
                 Some(Named::ArrowUp) => {
-                    if self.sel >= COLS {
-                        self.sel -= COLS;
+                    if self.sel >= self.cols() {
+                        self.sel -= self.cols();
                     }
                 }
                 Some(Named::Escape) => self.focus = Focus::Side,
@@ -1128,8 +1798,74 @@ impl Library {
                     if ch == "m" {
                         self.focus = Focus::Ask(0);
                     }
+                    if ch == " " && self.mode == Mode::Browse {
+                        if let Some(it) = self.current_item() {
+                            if let Some(p) = self.marked.iter().position(|m| *m == it.path) {
+                                self.marked.remove(p);
+                            } else {
+                                self.marked.push(it.path);
+                            }
+                            self.note = Some(format!("{} marked. C copies them to a drive.", self.marked.len()));
+                        }
+                    }
+                    if ch == "c" && self.mode == Mode::Browse {
+                        if self.open_drives().is_empty() {
+                            self.note = Some("No drive is open. Plug one in, choose it under Drives, then →.".into());
+                        } else {
+                            self.focus = Focus::SendTo(0);
+                        }
+                    }
+                    if ch == "r" {
+                        if let Some(it) = self.current_item() {
+                            self.rename = it.name.clone();
+                            self.focus = Focus::Rename;
+                            return text_input::focus(self.input_id.clone());
+                        }
+                    }
                 }
             },
+            Focus::Rename => {
+                if named == Some(Named::Escape) {
+                    self.focus = Focus::Grid;
+                }
+            }
+            Focus::SendTo(i) => {
+                let drives = self.open_drives();
+                match named {
+                    Some(Named::ArrowDown) => self.focus = Focus::SendTo((i + 1).min(drives.len().saturating_sub(1))),
+                    Some(Named::ArrowUp) => self.focus = Focus::SendTo(i.saturating_sub(1)),
+                    Some(Named::Escape) => self.focus = Focus::Grid,
+                    Some(Named::Enter) => {
+                        let Some((name, root)) = drives.get(i).cloned() else { return Task::none() };
+                        let files: Vec<PathBuf> = if self.marked.is_empty() { self.current_item().map(|it| vec![it.path]).unwrap_or_default() } else { self.marked.clone() };
+                        self.focus = Focus::Grid;
+                        self.drive_busy = true;
+                        self.note = Some(format!("Copying {} to {name}…", if files.len() == 1 { "1 file".to_string() } else { format!("{} files", files.len()) }));
+                        return Task::perform(
+                            async move {
+                                let name2 = name.clone();
+                                tokio::task::spawn_blocking(move || copy_all(&files, &root).map(|n| format!("{n} copied to {name2}. Press E on the drive before taking it out.")))
+                                    .await
+                                    .unwrap_or_else(|e| Err(e.to_string()))
+                            },
+                            |r| cosmic::Action::App(Message::Copied(r)),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            Focus::Confirm if view == View::Bin => {
+                if named == Some(Named::Enter) {
+                    if let Some(it) = self.current_item() {
+                        self.note = Some(match forget(&it.path) {
+                            Ok(()) => format!("{} is gone for good.", it.name),
+                            Err(e) => format!("Could not delete: {e}"),
+                        });
+                    }
+                    self.scan();
+                }
+                self.focus = Focus::Grid;
+            }
             Focus::Confirm => match named {
                 Some(Named::Enter) => {
                     if let Some(it) = self.current_item() {
@@ -1235,6 +1971,7 @@ impl Library {
     fn view_label(&self, v: &View) -> String {
         match v {
             View::Drive(id) => self.drive(id).map(|d| d.name).unwrap_or_else(|| "Drive".into()),
+            View::Phone(uri) => self.phones.iter().find(|p| &p.uri == uri).map(|p| p.name.clone()).unwrap_or_else(|| "Phone".into()),
             other => other.label(),
         }
     }
@@ -1247,6 +1984,10 @@ impl Library {
                 Some(State::Closed) => "USB".into(),
                 Some(State::Open(_)) if n > 0 => n.to_string(),
                 _ => "OPEN".into(),
+            },
+            View::Phone(uri) => match &self.phone_items {
+                Some((u, _)) if u == uri => n.to_string(),
+                _ => "PHONE".into(),
             },
             _ => n.to_string(),
         }
@@ -1298,23 +2039,34 @@ impl Library {
                 }
             },
             Focus::Grid if !self.picking() => {
-                if ch == "c" {
+                if ch == " " {
                     if let Some(it) = self.current_item() {
-                        // a copy into Downloads: Library then asks where it belongs
-                        let dl = home().join("Downloads");
-                        let _ = std::fs::create_dir_all(&dl);
-                        let mut target = dl.join(&it.name);
-                        let mut k = 2;
-                        while target.exists() {
-                            target = dl.join(format!("{k}-{}", it.name));
-                            k += 1;
+                        if let Some(p) = self.marked.iter().position(|m| *m == it.path) {
+                            self.marked.remove(p);
+                        } else {
+                            self.marked.push(it.path);
                         }
-                        self.note = Some(match std::fs::copy(&it.path, &target) {
-                            Ok(_) => format!("{} copied: it waits in \"Needs an answer\".", it.name),
-                            Err(e) => format!("Could not copy: {e}"),
-                        });
+                        self.note = Some(format!("{} marked. C copies them into Library.", self.marked.len()));
                     }
                     return Some(Task::none());
+                }
+                if ch == "c" {
+                    // copies into Downloads: Library then asks where they belong
+                    let files: Vec<PathBuf> = if self.marked.is_empty() { self.current_item().map(|it| vec![it.path]).unwrap_or_default() } else { self.marked.clone() };
+                    if files.is_empty() {
+                        return Some(Task::none());
+                    }
+                    let dl = home().join("Downloads");
+                    self.drive_busy = true;
+                    self.note = Some(format!("Copying {} into Library…", if files.len() == 1 { "1 file".to_string() } else { format!("{} files", files.len()) }));
+                    return Some(Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || copy_all(&files, &dl).map(|n| format!("{n} copied: they wait in \"Needs an answer\".")))
+                                .await
+                                .unwrap_or_else(|e| Err(e.to_string()))
+                        },
+                        |r| cosmic::Action::App(Message::Copied(r)),
+                    ));
                 }
                 match named {
                     Some(Named::Enter) => {
@@ -1700,6 +2452,11 @@ fn file_into(path: &Path, collection: &str) -> std::io::Result<PathBuf> {
 }
 
 /// Into the freedesktop bin, so it can be restored.
+/// For Gallery: the same bin as Library's.
+pub(crate) fn trash_file(path: &Path) -> std::io::Result<()> {
+    trash(path)
+}
+
 fn trash(path: &Path) -> std::io::Result<()> {
     let data = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".local/share"));
     let bin = data.join("Trash");
@@ -1720,6 +2477,139 @@ fn trash(path: &Path) -> std::io::Result<()> {
     std::fs::rename(path, bin.join("files").join(target))
 }
 
+fn bin_dir() -> PathBuf {
+    std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".local/share")).join("Trash")
+}
+
+/// What is in the bin, newest first; what has been there 30 days goes.
+fn bin_list() -> Vec<Item> {
+    let bin = bin_dir();
+    let now = chrono::Local::now().naive_local();
+    let mut out = vec![];
+    let Ok(rd) = std::fs::read_dir(bin.join("files")) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        let info = std::fs::read_to_string(bin.join("info").join(format!("{name}.trashinfo"))).unwrap_or_default();
+        let deleted = info
+            .lines()
+            .find_map(|l| l.strip_prefix("DeletionDate="))
+            .and_then(|d| chrono::NaiveDateTime::parse_from_str(d.trim(), "%Y-%m-%dT%H:%M:%S").ok());
+        if deleted.is_some_and(|d| (now - d).num_days() >= 30) {
+            let _ = forget(&p);
+            continue;
+        }
+        let mut it = item(&p, Some("Bin".into()));
+        // shown under the name it had
+        if let Some(orig) = original_of(&info) {
+            it.name = orig.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or(it.name);
+        }
+        if let Some(d) = deleted {
+            it.modified = d.and_local_timezone(chrono::Local).single().map(SystemTime::from).unwrap_or(it.modified);
+        }
+        out.push(it);
+    }
+    out.sort_by(|a, b| b.modified.cmp(&a.modified));
+    out
+}
+
+/// The original place, from a .trashinfo ("Path=/home/x/My%20file.txt").
+fn original_of(info: &str) -> Option<PathBuf> {
+    let raw = info.lines().find_map(|l| l.strip_prefix("Path="))?.trim();
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?, 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    use std::os::unix::ffi::OsStringExt;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(out)))
+}
+
+/// Puts a file from the bin back where it was (under a new name if that
+/// place is taken now).
+fn restore(in_bin: &Path) -> std::io::Result<PathBuf> {
+    let bin = bin_dir();
+    let name = in_bin.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let info_path = bin.join("info").join(format!("{name}.trashinfo"));
+    let info = std::fs::read_to_string(&info_path).unwrap_or_default();
+    let mut to = original_of(&info).unwrap_or_else(|| library_dir().join(&name));
+    if let Some(d) = to.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let mut n = 2;
+    while to.exists() {
+        let stem = to.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let ext = to.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+        to = to.with_file_name(format!("{stem} ({n}){ext}"));
+        n += 1;
+    }
+    std::fs::rename(in_bin, &to)?;
+    let _ = std::fs::remove_file(info_path);
+    Ok(to)
+}
+
+/// Deletes a file in the bin for good.
+fn forget(in_bin: &Path) -> std::io::Result<()> {
+    let name = in_bin.file_name().unwrap_or_default().to_string_lossy().to_string();
+    if in_bin.is_dir() {
+        std::fs::remove_dir_all(in_bin)?;
+    } else {
+        std::fs::remove_file(in_bin)?;
+    }
+    let _ = std::fs::remove_file(bin_dir().join("info").join(format!("{name}.trashinfo")));
+    Ok(())
+}
+
+/// Copies files (and folders, with what is in them) into a folder; a name
+/// already there gets a number. Returns "3 files".
+fn copy_all(files: &[PathBuf], into: &Path) -> Result<String, String> {
+    fn copy_one(from: &Path, to: &Path) -> std::io::Result<u64> {
+        if from.is_dir() {
+            std::fs::create_dir_all(to)?;
+            let mut n = 0;
+            for e in std::fs::read_dir(from)?.flatten() {
+                n += copy_one(&e.path(), &to.join(e.file_name()))?;
+            }
+            Ok(n)
+        } else {
+            std::fs::copy(from, to)?;
+            Ok(1)
+        }
+    }
+    std::fs::create_dir_all(into).map_err(|e| format!("Could not copy: {e}"))?;
+    let mut count = 0;
+    for f in files {
+        let name = f.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let mut target = into.join(&name);
+        let mut k = 2;
+        while target.exists() {
+            target = into.join(format!("{k}-{name}"));
+            k += 1;
+        }
+        count += copy_one(f, &target).map_err(|e| {
+            if e.raw_os_error() == Some(libc::ENOSPC) {
+                "The drive is full.".to_string()
+            } else if e.raw_os_error() == Some(libc::EFBIG) {
+                format!("{name} is too big for this drive (FAT32 takes files up to 4 GB).")
+            } else {
+                format!("Could not copy {name}: {e}")
+            }
+        })?;
+    }
+    // written out before saying it is done
+    unsafe { libc::sync() };
+    Ok(if count == 1 { "1 file".into() } else { format!("{count} files") })
+}
+
 /// The bin wants the original place written like a URL path.
 fn url_path(p: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
@@ -1738,6 +2628,11 @@ fn url_path(p: &Path) -> String {
 /// app gets what the owner allows it, and this one file even when it may
 /// not see personal files. A folder opens in Typewriter. Says which app,
 /// or why nothing opens it.
+/// For Gallery: opens a file with its app, as Library does.
+pub(crate) fn open_file(path: &Path) -> Result<String, String> {
+    open(path)
+}
+
 fn open(path: &Path) -> Result<String, String> {
     let quoted = crate::apps::quote(&path.to_string_lossy());
     let apps = crate::apps::handlers();
@@ -1750,7 +2645,11 @@ fn open(path: &Path) -> Result<String, String> {
         let mime = crate::mime::of(path);
         let Some(app) = crate::mime::app_for(&mime, &apps).and_then(|id| apps.get(&id).cloned()) else {
             let what = path.extension().map(|e| format!(".{} files", e.to_string_lossy())).unwrap_or_else(|| format!("files of this kind ({mime})"));
-            return Err(format!("No app here opens {what}. Center → Get apps has more."));
+            let office = mime.starts_with("application/vnd.oasis") || mime.starts_with("application/vnd.openxmlformats") || mime.starts_with("application/vnd.ms-") || mime == "application/msword" || mime == "text/csv";
+            if office {
+                return Err(format!("No app here opens {what} yet. Get LibreOffice in Center → Get apps (type “libre”)."));
+            }
+            return Err(format!("No app here opens {what}. Center → Get apps may have one."));
         };
         // the command line is one word for `chlorum run`, which runs it through sh
         let line = format!("chlorum run {} --grant {} {}", crate::apps::quote(&app.id), quoted, crate::apps::quote(&format!("{} {}", app.exec, quoted)));
@@ -1826,6 +2725,25 @@ mod tests {
         assert!(Show::Office.keeps(&it("cv.docx")) && Show::Office.keeps(&it("book.pdf")) && !Show::Office.keeps(&it("notes.txt")));
         assert!(Show::Technical.keeps(&it("main.rs")) && Show::Technical.keeps(&it("Makefile")) && Show::Technical.keeps(&it("x.zip")));
         assert!(Show::All.keeps(&it("whatever")));
+        assert!(Show::Other.keeps(&it("whatever")) && !Show::Other.keeps(&it("a.jpg")));
+        // several kinds at once, and a time
+        let f = Filter { kinds: vec![Show::Photos, Show::Videos], when: When::Any, from: String::new(), to: String::new() };
+        assert!(f.keeps(&it("a.jpg")) && f.keeps(&it("b.mp4")) && !f.keeps(&it("c.txt")));
+        let old = Filter { kinds: vec![], when: When::Today, from: String::new(), to: String::new() };
+        assert!(!old.keeps(&it("a.jpg")));
+        let range = Filter { kinds: vec![], when: When::Between, from: "1969-12-31".into(), to: "1970-01-02".into() };
+        assert!(range.keeps(&it("a.jpg")));
+        assert_eq!(f.summary(), "Photos, Videos · Any time");
         assert_eq!(Show::ALL.iter().fold(Show::All, |s, _| s.next()), Show::All);
+    }
+}
+
+#[cfg(test)]
+mod bin_tests {
+    #[test]
+    fn original_place() {
+        let p = super::original_of("[Trash Info]\nPath=/home/r/Library/Docs/my%20file%C3%A9.txt\nDeletionDate=2026-10-28T10:00:00\n").unwrap();
+        assert_eq!(p, std::path::PathBuf::from("/home/r/Library/Docs/my fileé.txt"));
+        assert_eq!(super::url_path(&p), "/home/r/Library/Docs/my%20file%C3%A9.txt");
     }
 }
