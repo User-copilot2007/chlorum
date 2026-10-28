@@ -61,9 +61,29 @@ pub struct Tally {
     /// activity id → expected count announced for a kind of work
     expected: HashMap<(u64, u64), u64>,
     pub building: bool,
-    /// the last error Nix reported, for a failed update
+    /// the first error Nix reported, for a failed update
     pub error: String,
+    /// what Nix said, as plain text (the last few hundred lines), kept
+    /// next to the progress file for when something goes wrong
+    pub log: std::collections::VecDeque<String>,
 }
+
+/// Without terminal colours.
+fn plain(m: &str) -> String {
+    let mut out = String::new();
+    let mut esc = false;
+    for c in m.chars() {
+        match (esc, c) {
+            (false, '\x1b') => esc = true,
+            (true, 'm') => esc = false,
+            (true, _) => {}
+            (false, c) => out.push(c),
+        }
+    }
+    out
+}
+
+const RES_BUILD_LOG_LINE: u64 = 101;
 
 impl Tally {
     /// One line of Nix's log. Returns true when the numbers changed.
@@ -103,25 +123,35 @@ impl Tally {
                 }
                 false
             }
-            Some("msg") if v.get("level").and_then(|l| l.as_u64()) == Some(0) => {
-                let m = v.get("msg").and_then(|m| m.as_str()).unwrap_or("");
-                // without colours, first line only
-                let mut plain = String::new();
-                let mut esc = false;
-                for c in m.chars() {
-                    match (esc, c) {
-                        (false, '\x1b') => esc = true,
-                        (true, 'm') => esc = false,
-                        (true, _) => {}
-                        (false, '\n') => break,
-                        (false, c) => plain.push(c),
+            Some("msg") => {
+                let text = plain(v.get("msg").and_then(|m| m.as_str()).unwrap_or(""));
+                for l in text.lines() {
+                    self.keep(l);
+                }
+                if v.get("level").and_then(|l| l.as_u64()) == Some(0) && self.error.is_empty() {
+                    // the first real line of the first error: the cause; later
+                    // ones are often only "failed dependency"
+                    if let Some(l) = text.lines().map(|l| l.trim().trim_start_matches("error:").trim()).find(|l| !l.is_empty()) {
+                        self.error = l.chars().take(200).collect();
                     }
                 }
-                self.error = plain.trim().trim_start_matches("error:").trim().chars().take(160).collect();
+                false
+            }
+            Some("result") if ty == RES_BUILD_LOG_LINE => {
+                if let Some(l) = v.get("fields").and_then(|f| f.get(0)).and_then(|x| x.as_str()) {
+                    self.keep(&plain(l));
+                }
                 false
             }
             _ => false,
         }
+    }
+
+    fn keep(&mut self, line: &str) {
+        if self.log.len() >= 400 {
+            self.log.pop_front();
+        }
+        self.log.push_back(line.to_string());
     }
 
     /// (done, expected) over everything Nix has said so far.
@@ -169,6 +199,9 @@ pub fn cli(args: &[String]) -> Result<(), String> {
     (p.done, p.expected) = tally.totals();
     p.message = tally.error.clone();
     write(&path, &p);
+    // everything Nix said, readable without root (journalctl needs it)
+    let text: Vec<&str> = tally.log.iter().map(String::as_str).collect();
+    let _ = std::fs::write(path.with_extension("log"), text.join("\n") + "\n");
     Ok(())
 }
 
@@ -195,5 +228,20 @@ mod tests {
         let p = Progress { done: 11, expected: 44, ..Default::default() };
         assert_eq!(p.percent(), 25);
         assert_eq!(Progress::default().percent(), 0);
+    }
+
+    #[test]
+    fn keeps_the_first_real_error() {
+        let mut t = Tally::default();
+        for l in [
+            r#"@nix {"action":"msg","level":0,"msg":"\u001b[31;1merror:\u001b[0m\n       hash mismatch in fixed-output derivation 'x.drv'"}"#,
+            r#"@nix {"action":"result","id":5,"type":101,"fields":["cargo: compiling chlorum"]}"#,
+            r#"@nix {"action":"msg","level":0,"msg":"\u001b[31;1merror:\u001b[0m Build failed due to failed dependency"}"#,
+        ] {
+            t.line(l);
+        }
+        assert_eq!(t.error, "hash mismatch in fixed-output derivation 'x.drv'");
+        assert!(t.log.iter().any(|l| l.contains("compiling chlorum")));
+        assert!(t.log.iter().any(|l| l.contains("failed dependency")));
     }
 }

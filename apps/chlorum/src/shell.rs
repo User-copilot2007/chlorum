@@ -474,7 +474,7 @@ impl Shell {
                         self.seen_progress = Some(p.clone());
                         self.update = match p.phase.as_str() {
                             "done" => Update::Installed(p.version.clone()),
-                            "failed" => Update::Failed(if p.message.is_empty() { "the update stopped".into() } else { p.message.clone() }),
+                            "failed" => Update::Failed(if p.message.is_empty() { "the update stopped (details: /run/chlorum-update/update.log)".into() } else { p.message.clone() }),
                             _ => Update::Installing(Some(p)),
                         };
                     }
