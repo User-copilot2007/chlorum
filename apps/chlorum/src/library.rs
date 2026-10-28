@@ -226,6 +226,90 @@ impl Sort {
     }
 }
 
+/// Which files are shown (F changes it, in every view): all of them, or
+/// only one kind.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Show {
+    All,
+    Photos,
+    Videos,
+    Audio,
+    Text,
+    Technical,
+    Office,
+}
+
+impl Show {
+    const ALL: [Show; 7] = [Show::All, Show::Photos, Show::Videos, Show::Audio, Show::Text, Show::Technical, Show::Office];
+    fn key(self) -> &'static str {
+        match self {
+            Show::All => "all",
+            Show::Photos => "photos",
+            Show::Videos => "videos",
+            Show::Audio => "audio",
+            Show::Text => "text",
+            Show::Technical => "technical",
+            Show::Office => "office",
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Show::All => "All files",
+            Show::Photos => "Only photos",
+            Show::Videos => "Only videos",
+            Show::Audio => "Only audio",
+            Show::Text => "Only text",
+            Show::Technical => "Only technical files",
+            Show::Office => "Only office files",
+        }
+    }
+    fn next(self) -> Show {
+        let i = Show::ALL.iter().position(|s| *s == self).unwrap_or(0);
+        Show::ALL[(i + 1) % Show::ALL.len()]
+    }
+    fn path() -> PathBuf {
+        crate::apps::config_dir().join("chlorum/library-show")
+    }
+    fn load() -> Show {
+        let k = std::fs::read_to_string(Show::path()).unwrap_or_default();
+        Show::ALL.into_iter().find(|s| s.key() == k.trim()).unwrap_or(Show::All)
+    }
+    fn save(self) {
+        let p = Show::path();
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(p, self.key());
+    }
+    /// Is this file of the kind shown? (Folders show only with All, except
+    /// Workshop projects, which are technical.)
+    fn keeps(self, i: &Item) -> bool {
+        let ext = i.path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let e = ext.as_str();
+        match self {
+            Show::All => true,
+            Show::Photos => i.kind == Kind::Photo,
+            Show::Videos => i.kind == Kind::Video,
+            Show::Audio => i.kind == Kind::Music,
+            Show::Text => matches!(e, "txt" | "md" | "markdown" | "rst" | "org" | "log" | "tex" | "rtf" | "nfo"),
+            Show::Office => matches!(
+                e,
+                "pdf" | "epub" | "doc" | "docx" | "odt" | "ott" | "xls" | "xlsx" | "ods" | "ots" | "csv" | "tsv" | "ppt" | "pptx" | "odp" | "otp" | "odg" | "pages" | "numbers" | "key"
+            ),
+            Show::Technical => {
+                matches!(i.kind, Kind::Code | Kind::Project | Kind::Archive)
+                    || matches!(
+                        e,
+                        "rs" | "py" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "c" | "h" | "cc" | "cpp" | "hpp" | "go" | "java" | "kt" | "swift" | "rb" | "php" | "lua" | "zig" | "hs"
+                            | "nix" | "sh" | "bash" | "fish" | "ps1" | "bat" | "json" | "toml" | "yaml" | "yml" | "xml" | "ini" | "conf" | "cfg" | "env" | "html" | "css" | "scss" | "sql"
+                            | "kdl" | "lock" | "diff" | "patch" | "iso" | "img" | "deb" | "rpm" | "appimage" | "exe" | "msi" | "bin" | "elf" | "so" | "o" | "a" | "wasm" | "ipynb"
+                    )
+                    || matches!(i.name.as_str(), "Makefile" | "Dockerfile" | "CMakeLists.txt" | "justfile" | "flake.lock")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Item {
     path: PathBuf,
@@ -332,6 +416,7 @@ pub struct Library {
     drive_busy: bool,
     project_name: String,
     sort: Sort,
+    show: Show,
 }
 
 fn home() -> PathBuf {
@@ -403,6 +488,7 @@ impl Application for Library {
             drive_busy: false,
             project_name: String::new(),
             sort: Sort::load(),
+            show: Show::load(),
         };
         l.scan();
         l.view = if l.picking() { 0 } else if l.inbox().is_empty() { 1 } else { 0 };
@@ -594,6 +680,7 @@ impl Application for Library {
             let msg = match (&self.mode, &view) {
                 (Mode::Save { .. }, _) => "Choose where it goes, then press → to name it.",
                 (_, View::Inbox) => "Nothing waiting. New downloads appear here.",
+                _ if self.show != Show::All => "Nothing of this kind here. F shows another kind.",
                 _ => "Nothing here yet.",
             };
             grid = grid.push(text(msg, SANS, 22.0, TEXT_2));
@@ -602,7 +689,12 @@ impl Application for Library {
         let main = widget::Column::new()
             .push(text(self.view_label(&view), SANS_BOLD, 44.0, TEXT))
             .push(space(1.0, 6.0))
-            .push(text(format!("{} · S", order.to_uppercase()), MONO, 14.0, TEXT_2))
+            .push(text(
+                format!("{} · S      {} · F", order.to_uppercase(), self.show.label().to_uppercase()),
+                MONO,
+                14.0,
+                if self.show == Show::All { TEXT_2 } else { YELLOW },
+            ))
             .push(space(1.0, 20.0))
             .push(widget::scrollable(grid).id(self.grid_id.clone()).height(Length::Fill))
             .width(Length::Fill);
@@ -637,7 +729,7 @@ impl Application for Library {
                 }
             }
             (Mode::Browse, Focus::Grid) if on_drive => {
-                vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("C", "Copy into Library", false), ("S", "Sort", false), ("E", "Take out", false)]
+                vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("C", "Copy into Library", false), ("S", "Sort", false), ("F", "Show", false), ("E", "Take out", false)]
             }
             (Mode::Open { folders: true, .. }, Focus::Side) => vec![("↑ ↓", "Collection", false), ("ENTER", "Choose this one", true), ("ESC", "Cancel", false)],
             (Mode::Open { .. }, Focus::Side) => vec![("↑ ↓", "View", false), ("→", "Files", true), ("ESC", "Cancel", false)],
@@ -647,7 +739,7 @@ impl Application for Library {
             (Mode::Save { .. }, _) => vec![("ENTER", "Save", true), ("ESC", "Back", false)],
             (_, Focus::SaveName) => vec![("ENTER", "Save", true), ("ESC", "Back", false)],
             (_, Focus::Side) => vec![("↑ ↓", "View", false), ("→", "Files", true)],
-            (_, Focus::Grid) => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("M", "Move to…", false), ("S", "Sort", false), ("DEL", "Delete", false)],
+            (_, Focus::Grid) => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Open", true), ("M", "Move to…", false), ("S", "Sort", false), ("F", "Show", false), ("DEL", "Delete", false)],
             (_, Focus::Ask(_)) => vec![("↑ ↓", "Choose", false), ("1–9", "Pick", false), ("ENTER", "File it", true), ("A", "Always", false), ("ESC", "Back", false)],
             (_, Focus::NewName) => vec![("ENTER", "Create", true), ("ESC", "Back", false)],
             (_, Focus::Confirm) => vec![("ENTER", "Delete", true), ("ESC", "Keep", false)],
@@ -776,6 +868,9 @@ impl Library {
 
     fn items_in(&self, v: &View) -> Vec<Item> {
         let mut items = self.unsorted_items_in(v);
+        if self.show != Show::All {
+            items.retain(|i| self.show.keeps(i));
+        }
         // Recent is the newest files, whatever the order chosen
         if *v != View::Recent {
             self.sort.apply(&mut items);
@@ -956,6 +1051,13 @@ impl Library {
             self.project_name.clear();
             return text_input::focus(self.input_id.clone());
         }
+        if ch == "f" && matches!(self.focus, Focus::Side | Focus::Grid) {
+            self.show = self.show.next();
+            self.show.save();
+            self.sel = 0;
+            self.note = Some(format!("{}. F shows another kind.", self.show.label()));
+            return self.follow();
+        }
         if ch == "s" && matches!(self.focus, Focus::Side | Focus::Grid) {
             if view == View::Recent {
                 self.note = Some("Recent is always newest first. S sorts the other views.".into());
@@ -1017,7 +1119,7 @@ impl Library {
                         if it.collection.is_none() {
                             self.focus = Focus::Ask(0);
                         } else {
-                            open(&it.path);
+                            self.opened(&it.path);
                         }
                     }
                 }
@@ -1089,7 +1191,9 @@ impl Library {
                 self.note = Some(format!("{name} is ready. It opens in Typewriter; its terminal has the project's tools."));
                 self.focus = Focus::Side;
                 self.scan();
-                open(&dir);
+                if let Err(e) = open(&dir) {
+                    self.note = Some(e);
+                }
             }
             Err(e) => self.note = Some(e),
         }
@@ -1215,7 +1319,7 @@ impl Library {
                 match named {
                     Some(Named::Enter) => {
                         if let Some(it) = self.current_item() {
-                            open(&it.path);
+                            self.opened(&it.path);
                         }
                         Some(Task::none())
                     }
@@ -1227,6 +1331,14 @@ impl Library {
             }
             _ => None,
         }
+    }
+
+    /// Opens a file and says so (or why not).
+    fn opened(&mut self, path: &Path) {
+        self.note = Some(match open(path) {
+            Ok(app) => format!("Opening in {app}…"),
+            Err(e) => e,
+        });
     }
 
     fn open_drive(&mut self) -> Task<Message> {
@@ -1624,42 +1736,37 @@ fn url_path(p: &Path) -> String {
 
 /// Opens a file with the app made for its type, through `chlorum run`: the
 /// app gets what the owner allows it, and this one file even when it may
-/// not see personal files. A folder opens in Typewriter.
-fn open(path: &Path) {
-    let path = path.to_path_buf();
-    std::thread::spawn(move || {
-        let ask = |args: &[&std::ffi::OsStr]| {
-            std::process::Command::new("xdg-mime")
-                .args(args)
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())
+/// not see personal files. A folder opens in Typewriter. Says which app,
+/// or why nothing opens it.
+fn open(path: &Path) -> Result<String, String> {
+    let quoted = crate::apps::quote(&path.to_string_lossy());
+    let apps = crate::apps::handlers();
+    let (line, name) = if path.is_dir() {
+        match apps.get("chlorum-typewriter") {
+            Some(a) => (format!("chlorum run {} --grant {} {}", crate::apps::quote(&a.id), quoted, crate::apps::quote(&format!("{} {}", a.exec, quoted))), a.name.clone()),
+            None => (format!("typewriter {quoted}"), "Typewriter".to_string()),
+        }
+    } else {
+        let mime = crate::mime::of(path);
+        let Some(app) = crate::mime::app_for(&mime, &apps).and_then(|id| apps.get(&id).cloned()) else {
+            let what = path.extension().map(|e| format!(".{} files", e.to_string_lossy())).unwrap_or_else(|| format!("files of this kind ({mime})"));
+            return Err(format!("No app here opens {what}. Center → Get apps has more."));
         };
-        let id = if path.is_dir() {
-            Some("chlorum-typewriter".to_string())
-        } else {
-            ask(&["query".as_ref(), "filetype".as_ref(), path.as_os_str()])
-                .and_then(|mime| ask(&["query".as_ref(), "default".as_ref(), mime.as_ref()]))
-                .map(|d| d.trim_end_matches(".desktop").to_string())
-        };
-        let app = id.and_then(|id| crate::apps::installed().remove(&id));
-        let quoted = crate::apps::quote(&path.to_string_lossy());
-        let line = match app {
-            // the command line is one word for `chlorum run`, which runs it through sh
-            Some(a) => format!("chlorum run {} --grant {} {}", crate::apps::quote(&a.id), quoted, crate::apps::quote(&format!("{} {}", a.exec, quoted))),
-            None if path.is_dir() => format!("typewriter {quoted}"),
-            None => format!("xdg-open {quoted}"),
-        };
-        let _ = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(line)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .and_then(|mut c| c.wait());
-    });
+        // the command line is one word for `chlorum run`, which runs it through sh
+        let line = format!("chlorum run {} --grant {} {}", crate::apps::quote(&app.id), quoted, crate::apps::quote(&format!("{} {}", app.exec, quoted)));
+        (line, app.name)
+    };
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(line)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Could not start {name}: {e}"))?;
+    // reaped in the background
+    std::thread::spawn(move || child.wait());
+    Ok(name)
 }
 
 fn load_rules() -> HashMap<String, String> {
@@ -1699,5 +1806,26 @@ fn when(t: SystemTime) -> String {
         dt.format("%a").to_string().to_uppercase()
     } else {
         dt.format("%-d %b").to_string().to_uppercase()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn showing_one_kind() {
+        let it = |name: &str| {
+            let path = PathBuf::from(format!("/x/{name}"));
+            Item { kind: Kind::of(&path), path, name: name.into(), collection: None, modified: SystemTime::UNIX_EPOCH, size: 0 }
+        };
+        assert!(Show::Photos.keeps(&it("a.JPG")) && !Show::Photos.keeps(&it("a.mp4")));
+        assert!(Show::Videos.keeps(&it("a.mkv")));
+        assert!(Show::Audio.keeps(&it("a.flac")));
+        assert!(Show::Text.keeps(&it("notes.md")) && !Show::Text.keeps(&it("cv.docx")));
+        assert!(Show::Office.keeps(&it("cv.docx")) && Show::Office.keeps(&it("book.pdf")) && !Show::Office.keeps(&it("notes.txt")));
+        assert!(Show::Technical.keeps(&it("main.rs")) && Show::Technical.keeps(&it("Makefile")) && Show::Technical.keeps(&it("x.zip")));
+        assert!(Show::All.keeps(&it("whatever")));
+        assert_eq!(Show::ALL.iter().fold(Show::All, |s, _| s.next()), Show::All);
     }
 }

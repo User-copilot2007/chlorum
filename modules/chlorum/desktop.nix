@@ -595,6 +595,11 @@ in
       pkgs.mpv
       # scanning documents
       pkgs.simple-scan
+      # pictures and PDFs, both moved around with the keyboard
+      pkgs.imv
+      pkgs.zathura
+      # what kind of file is this (for anything still asking xdg-mime)
+      pkgs.file
       pkgs.neovim
       pkgs.ripgrep
       pkgs.fd
@@ -630,6 +635,27 @@ in
       "audio/ogg" = "mpv.desktop";
       "audio/x-wav" = "mpv.desktop";
       "audio/mp4" = "mpv.desktop";
+      "image/png" = "imv.desktop";
+      "image/jpeg" = "imv.desktop";
+      "image/gif" = "imv.desktop";
+      "image/webp" = "imv.desktop";
+      "image/bmp" = "imv.desktop";
+      "image/tiff" = "imv.desktop";
+      "image/svg+xml" = "imv.desktop";
+      "image/heif" = "imv.desktop";
+      "image/avif" = "imv.desktop";
+      "application/pdf" = "org.pwmt.zathura.desktop";
+      "application/epub+zip" = "org.pwmt.zathura.desktop";
+      "application/vnd.oasis.opendocument.text" = "writer.desktop";
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document" = "writer.desktop";
+      "application/msword" = "writer.desktop";
+      "application/vnd.oasis.opendocument.spreadsheet" = "calc.desktop";
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" = "calc.desktop";
+      "application/vnd.ms-excel" = "calc.desktop";
+      "text/csv" = "calc.desktop";
+      "application/vnd.oasis.opendocument.presentation" = "impress.desktop";
+      "application/vnd.openxmlformats-officedocument.presentationml.presentation" = "impress.desktop";
+      "application/vnd.ms-powerpoint" = "impress.desktop";
     };
     # BlexMono is IBM Plex Mono with the Nerd Font icons LazyVim shows
     fonts.packages = [ pkgs.ibm-plex pkgs.nerd-fonts.blex-mono pkgs.noto-fonts pkgs.noto-fonts-color-emoji ];

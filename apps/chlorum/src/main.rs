@@ -28,6 +28,7 @@ mod layout;
 mod library;
 mod lock;
 mod lockscreen;
+mod mime;
 mod niri;
 mod notify;
 mod pointer;

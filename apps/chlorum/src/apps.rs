@@ -14,6 +14,8 @@ pub struct App {
     pub wm_class: Option<String>,
     /// what it says it wants (X-Chlorum-Permissions=network;sound;)
     pub permissions: Option<String>,
+    /// the kinds of files it opens (MimeType=)
+    pub mime: Vec<String>,
 }
 
 impl App {
@@ -69,6 +71,16 @@ pub fn id_list(name: &str, default: &[&str]) -> Vec<String> {
 }
 
 pub fn installed() -> HashMap<String, App> {
+    scan(false)
+}
+
+/// Every app that can open files, also the ones that keep out of menus
+/// (an image viewer's "open the folder" entry…); not terminal ones.
+pub fn handlers() -> HashMap<String, App> {
+    scan(true)
+}
+
+fn scan(with_hidden: bool) -> HashMap<String, App> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(h) = std::env::var_os("XDG_DATA_HOME") {
         dirs.push(PathBuf::from(h).join("applications"));
@@ -90,7 +102,7 @@ pub fn installed() -> HashMap<String, App> {
             if out.contains_key(id) {
                 continue;
             }
-            if let Some(app) = parse(id, &e.path()) {
+            if let Some(app) = parse(id, &e.path(), with_hidden) {
                 out.insert(id.to_string(), app);
             }
         }
@@ -98,10 +110,11 @@ pub fn installed() -> HashMap<String, App> {
     out
 }
 
-fn parse(id: &str, path: &Path) -> Option<App> {
+fn parse(id: &str, path: &Path, with_hidden: bool) -> Option<App> {
     let text = std::fs::read_to_string(path).ok()?;
-    let (mut name, mut icon, mut exec, mut wm, mut perms) = (None, None, None, None, None);
+    let (mut name, mut icon, mut exec, mut wm, mut perms, mut mime) = (None, None, None, None, None, None);
     let mut hidden = false;
+    let mut not_an_app = false;
     let mut in_main = false;
     for line in text.lines() {
         let line = line.trim();
@@ -122,11 +135,15 @@ fn parse(id: &str, path: &Path) -> Option<App> {
             perms.get_or_insert(v.to_string());
         } else if let Some(v) = line.strip_prefix("StartupWMClass=") {
             wm.get_or_insert(v.to_string());
-        } else if line == "NoDisplay=true" || line == "Hidden=true" || line == "Terminal=true" {
+        } else if let Some(v) = line.strip_prefix("MimeType=") {
+            mime.get_or_insert(v.split(';').filter(|m| !m.is_empty()).map(str::to_string).collect::<Vec<_>>());
+        } else if line == "NoDisplay=true" {
             hidden = true;
+        } else if line == "Hidden=true" || line == "Terminal=true" {
+            not_an_app = true;
         } else if let Some(v) = line.strip_prefix("Type=") {
             if v != "Application" {
-                hidden = true;
+                not_an_app = true;
             }
         }
     }
@@ -135,7 +152,7 @@ fn parse(id: &str, path: &Path) -> Option<App> {
         .filter(|a| !(a.len() == 2 && a.starts_with('%')))
         .collect::<Vec<_>>()
         .join(" ");
-    if hidden && id != "chlorum-library" {
+    if not_an_app || (hidden && !with_hidden && id != "chlorum-library") {
         return None;
     }
     Some(App {
@@ -145,6 +162,7 @@ fn parse(id: &str, path: &Path) -> Option<App> {
         exec,
         wm_class: wm,
         permissions: perms,
+        mime: mime.unwrap_or_default(),
     })
 }
 
