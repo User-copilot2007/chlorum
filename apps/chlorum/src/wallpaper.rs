@@ -443,12 +443,21 @@ impl LayerShellHandler for App {
         let sf = self.screens.get(&id).and_then(|s| self.outputs.info(&s.output)).map(|i| i.scale_factor.max(1)).unwrap_or(1) as f64;
         let g = &self.gl;
         let screen = self.screens.get_mut(&id).unwrap();
-        if screen.size != (w, h) || screen.egl_window.is_none() || screen.drawn.0 != ((w as f64) * sf * RENDER_SCALE).round() as u32 {
+        let want_w = {
+            let (pw, ph) = ((w as f64) * sf * RENDER_SCALE, (h as f64) * sf * RENDER_SCALE);
+            (pw * ((2560.0 * 1440.0) / (pw * ph)).sqrt().min(1.0)).round() as u32
+        };
+        if screen.size != (w, h) || screen.egl_window.is_none() || screen.drawn.0 != want_w {
             screen.size = (w, h);
             let (dw, dh) = match &screen.viewport {
                 Some(vp) => {
                     vp.set_destination(w as i32, h as i32);
-                    (((w as f64) * sf * RENDER_SCALE).round().max(1.0) as u32, ((h as f64) * sf * RENDER_SCALE).round().max(1.0) as u32)
+                    // the real pixels, but not more than about 1440p: drawn
+                    // live it is only shown until the video is ready, and a
+                    // full 4K shader every frame is heavy
+                    let (pw, ph) = ((w as f64) * sf * RENDER_SCALE, (h as f64) * sf * RENDER_SCALE);
+                    let cap = ((2560.0 * 1440.0) / (pw * ph)).sqrt().min(1.0);
+                    ((pw * cap).round().max(1.0) as u32, (ph * cap).round().max(1.0) as u32)
                 }
                 None => (w, h),
             };

@@ -25,7 +25,7 @@ pub fn run() -> cosmic::iced::Result {
     }
     let _ = std::fs::create_dir_all(crate::apps::runtime_dir());
     let _ = std::fs::write(&flag, std::process::id().to_string());
-    let settings = Settings::default().no_main_window(true).default_font(SANS).default_icon_theme("Papirus-Dark");
+    let settings = Settings::default().scale_factor(crate::ui::screen_zoom()).no_main_window(true).default_font(SANS).default_icon_theme("Papirus-Dark");
     let r = cosmic::app::run::<Lock>(settings, ());
     let _ = std::fs::remove_file(flag);
     r

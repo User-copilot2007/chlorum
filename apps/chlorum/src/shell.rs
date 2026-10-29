@@ -63,7 +63,7 @@ fn watchdog() {
 
 pub fn run() -> cosmic::iced::Result {
     watchdog();
-    let settings = Settings::default()
+    let settings = Settings::default().scale_factor(crate::ui::screen_zoom())
         .no_main_window(true)
         .default_font(SANS)
         .transparent(true)
@@ -351,6 +351,8 @@ pub struct Shell {
 
     wifi: Vec<Wifi>,
     wifi_busy: bool,
+    /// how much Chlorum's screens are zoomed (see ui::zoom_for)
+    zoom: f32,
     /// keyboard layouts (niri's names) and the one in use
     kb_layouts: Vec<String>,
     kb_now: usize,
@@ -452,6 +454,7 @@ impl Application for Shell {
             last_frame: Instant::now(),
             wifi: vec![],
             wifi_busy: false,
+            zoom: crate::ui::screen_zoom(),
             kb_layouts: vec![],
             kb_now: 0,
             not_closing: None,
@@ -649,7 +652,23 @@ impl Shell {
                 return Task::perform(system::sound(), |s| cosmic::Action::App(Message::Sound(s)));
             }
             Message::SoundNote(n) => self.sound_note = n,
-            Message::Screens(v) => self.screens = v,
+            Message::Screens(v) => {
+                self.screens = v;
+                // the screen's size changed (the size of everything, a new
+                // resolution): Chlorum's screens zoom to fill it again
+                if let Some(sc) = self.screens.first() {
+                    if let Some((_, h, _)) = sc.current {
+                        let logical = h as f64 / sc.scale.max(0.1);
+                        let z = crate::ui::zoom_for(logical as f32);
+                        eprintln!("chlorum: zoom {} (screen {} logical px tall), was {}", z, logical, self.zoom);
+                        if (z - self.zoom).abs() > 0.01 {
+                            self.zoom = z;
+                            // a fresh configure, so the surfaces take the new zoom now
+                            return Task::batch([cosmic::command::set_scaling_factor(z), set_size(self.surface, None, None)]);
+                        }
+                    }
+                }
+            }
             Message::Bt(st) => {
                 self.bt = st;
                 let rows = self.rows(Section::Bluetooth);
@@ -858,7 +877,7 @@ fn note_layer(id: window::Id) -> SctkLayerSurfaceSettings {
         margin: IcedMargin { top: 0, right: 28, bottom: 96, left: 0 },
         size: Some((Some(480), Some(132))),
         exclusive_zone: 0,
-        size_limits: iced::Limits::NONE.min_width(1.0).min_height(1.0).max_width(480.0).max_height(132.0),
+        size_limits: iced::Limits::NONE.min_width(1.0).min_height(1.0).max_width(480.0 * 4.0).max_height(132.0 * 4.0),
         ..Default::default()
     }
 }
@@ -2449,8 +2468,8 @@ impl Shell {
             let bg = if on { if active { YELLOW } else { PANEL_2 } } else { Color::TRANSPARENT };
             let fg = if active { BLACK } else if on { YELLOW } else { TEXT_2 };
             sections = sections.push(
-                fill(text(s.label(), SANS_BOLD, 26.0, alpha(fg, f)), alpha(bg, f))
-                    .padding([18, 28])
+                fill(text(s.label(), SANS_BOLD, 24.0, alpha(fg, f)), alpha(bg, f))
+                    .padding([11, 28])
                     .width(Length::Fill),
             );
         }
@@ -2715,7 +2734,7 @@ impl Shell {
         if let Some(sc) = self.screens.first() {
             let scale = self.display.scale.unwrap_or(sc.scale);
             let si = SCALES.iter().position(|x| (x - scale).abs() < 0.01);
-            col = col.push(self.row_box(2, "Size of everything", scale_label(scale), chips(SCALES.iter().map(|x| scale_label(*x)).collect(), si, self.row == Some(2)), f));
+            col = col.push(self.row_box(2, "Size of apps", scale_label(scale), chips(SCALES.iter().map(|x| scale_label(*x)).collect(), si, self.row == Some(2)), f));
             if let Some((w, h, r)) = self.display.mode.filter(|m| sc.modes.contains(m)).or(sc.current) {
                 let sizes = sc.sizes();
                 let i = sizes.iter().position(|x| *x == (w, h)).unwrap_or(0);
@@ -3392,7 +3411,9 @@ impl Shell {
         }
         let shown = self.note_surface.is_some();
         self.note_surface = Some((self.note_id, Instant::now()));
-        if shown { Task::none() } else { Task::batch([set_layer(self.note_id, Layer::Overlay), set_size(self.note_id, Some(480), Some(132))]) }
+        // its size is the screen's, so with the zoom
+        let (w, h) = ((480.0 * self.zoom).round() as u32, (132.0 * self.zoom).round() as u32);
+        if shown { Task::none() } else { Task::batch([set_layer(self.note_id, Layer::Overlay), set_size(self.note_id, Some(w), Some(h))]) }
     }
 
     fn note_view(&self) -> Element<'_, Message> {

@@ -16,6 +16,24 @@ let
       lockFile = ../../apps/chlorum/Cargo.lock;
       allowBuiltinFetchGit = true;
     };
+    # libcosmic's layer-shell surfaces ignore an app's own scale factor
+    # (the buffer grows instead of the layout shrinking); Chlorum's screens
+    # zoom to fill any screen with it (patches/iced-winit-layer-zoom.patch)
+    prePatch = ''
+      found=
+      for d in "$cargoDepsCopy"/iced_winit-*; do
+        patch -d "$d" -p1 < ${../../apps/chlorum/patches/iced-winit-layer-zoom.patch}
+        found=1
+      done
+      if [ -z "$found" ]; then echo "iced_winit was not found to patch" >&2; exit 1; fi
+      # and libcosmic never handed that scale factor to iced at all
+      found=
+      for d in "$cargoDepsCopy"/libcosmic-*; do
+        patch -d "$d" -p1 < ${../../apps/chlorum/patches/libcosmic-scale-factor.patch}
+        found=1
+      done
+      if [ -z "$found" ]; then echo "libcosmic was not found to patch" >&2; exit 1; fi
+    '';
     nativeBuildInputs = [ pkgs.libcosmicAppHook pkgs.pkg-config ];
     buildInputs = [ pkgs.fontconfig pkgs.freetype pkgs.libGL pkgs.wayland pkgs.pam ];
     # unit tests (layouts, Wi-Fi lists, names) need nothing graphical

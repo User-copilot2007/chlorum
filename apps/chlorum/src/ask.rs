@@ -70,7 +70,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     if perms.is_empty() {
         return Ok(());
     }
-    let settings = Settings::default().no_main_window(true).default_font(SANS).default_icon_theme("Papirus-Dark");
+    let settings = Settings::default().scale_factor(crate::ui::screen_zoom()).no_main_window(true).default_font(SANS).default_icon_theme("Papirus-Dark");
     let r = cosmic::app::run::<Ask>(settings, Flags { name: name.clone(), icon: icon.clone(), perms }).map_err(|e| e.to_string());
     r?;
     // only reached when the window closed without answers

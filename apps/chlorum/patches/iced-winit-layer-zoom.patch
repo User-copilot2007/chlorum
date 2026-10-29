@@ -1,0 +1,37 @@
+--- a/src/window/state.rs	2026-10-26 01:06:35.950073443 +0000
++++ b/src/window/state.rs	2026-10-28 23:27:40.513188656 +0000
+@@ -122,7 +122,8 @@
+     }
+ 
+     pub fn set_logical_cursor_pos(&mut self, pos: LogicalPosition<f64>) {
+-        let physical = pos.to_physical(self.scale_factor());
++        // the compositor's logical position: its scale only, not the app's
++        let physical = pos.to_physical(self.scale_factor() / self.scale_factor.max(0.01));
+         self.cursor_position = Some(physical);
+     }
+ 
+--- a/src/platform_specific/wayland/sctk_event.rs	2026-10-26 01:06:35.949936509 +0000
++++ b/src/platform_specific/wayland/sctk_event.rs	2026-10-28 23:54:08.921622310 +0000
+@@ -897,7 +897,11 @@
+                                 .map(|v| (id.inner(), v))
+                         })
+                     {
+-                        let scale = w.state.scale_factor();
++                        // the surface's pixels: its size times the
++                        // compositor's scale only (the app's own scale
++                        // factor makes the layout smaller, not the buffer
++                        // bigger)
++                        let scale = w.raw.scale_factor();
+                         let p_w = (configure.new_size.0.max(1) as f64 * scale)
+                             .ceil() as u32;
+                         let p_h = (configure.new_size.1.max(1) as f64 * scale)
+@@ -1363,7 +1367,8 @@
+                             .map(|v| (id.inner(), v))
+                     })
+                 {
+-                    let scale = w.state.scale_factor();
++                    // the compositor's scale only (see layer surfaces)
++                    let scale = w.raw.scale_factor();
+                     let p_w = (configure.new_size.0.max(1) as f64 * scale)
+                         .round() as u32;
+                     let p_h = (configure.new_size.1.max(1) as f64 * scale)

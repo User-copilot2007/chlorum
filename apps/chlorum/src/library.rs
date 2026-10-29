@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 pub fn run() -> cosmic::iced::Result {
-    let settings = Settings::default()
+    let settings = Settings::default().scale_factor(crate::ui::screen_zoom())
         .default_font(SANS)
         .client_decorations(false)
         .default_icon_theme("Papirus-Dark")
@@ -42,7 +42,7 @@ static PICKED: std::sync::Mutex<Option<Vec<PathBuf>>> = std::sync::Mutex::new(No
 /// from collections, never from folders. Returns the chosen files, or None
 /// when the person backs out.
 pub fn pick(mode: Mode) -> Option<Vec<PathBuf>> {
-    let settings = Settings::default()
+    let settings = Settings::default().scale_factor(crate::ui::screen_zoom())
         .default_font(SANS)
         .client_decorations(false)
         .default_icon_theme("Papirus-Dark")
@@ -576,6 +576,8 @@ pub struct Library {
     filter: Filter,
     /// reading the disk in the background
     scanning: bool,
+    /// the drive whose files are read (they are not read again each time)
+    drive_read_for: Option<String>,
     /// what is in the bin (as files there)
     bin_items: Vec<Item>,
     phones: Vec<crate::phones::Phone>,
@@ -660,6 +662,7 @@ impl Application for Library {
             sort: Sort::load(),
             filter: Filter::load(),
             scanning: false,
+            drive_read_for: None,
             bin_items: vec![],
             phones: vec![],
             phone_items: None,
@@ -801,7 +804,10 @@ impl Application for Library {
             Message::Drives(d) => {
                 if d != self.drives {
                     self.drives = d;
-                    self.scan();
+                    // a drive opened or closed: its files are read in the
+                    // background (a big one takes a while)
+                    self.drive_read_for = None;
+                    return self.scan_later();
                 }
             }
             Message::DrivePassword(s) => self.drive_pw = s,
@@ -1377,9 +1383,9 @@ impl Library {
     }
 
     /// Reads everything again now (after something was done here); the
-    /// phones are asked about only in the background.
+    /// phones are asked about, and a drive is read, only in the background.
     fn scan(&mut self) {
-        let g = gather(&self.rules, self.drive_root(), self.mode == Mode::Browse, false);
+        let g = gather(&self.rules, None, self.mode == Mode::Browse, false);
         self.apply(g);
     }
 
@@ -1390,7 +1396,9 @@ impl Library {
             return Task::none();
         }
         self.scanning = true;
-        let (rules, root, browse) = (self.rules.clone(), self.drive_root(), self.mode == Mode::Browse);
+        // a drive's files are read once when it is looked at, not every time
+        let root = self.drive_root().filter(|(id, _, _)| self.drive_read_for.as_ref() != Some(id));
+        let (rules, browse) = (self.rules.clone(), self.mode == Mode::Browse);
         Task::perform(
             async move { tokio::task::spawn_blocking(move || gather(&rules, root, browse, true)).await.ok() },
             |g| cosmic::Action::App(Message::Scanned(Box::new(g))),
@@ -1442,10 +1450,16 @@ impl Library {
         // the files on the drive being looked at (read for the one that
         // was looked at when reading started)
         match &old_view {
-            Some(View::Drive(id)) if g.drive_for.as_ref() == Some(id) => self.drive_items = g.drive,
-            // read for another drive (it was changed meanwhile): kept as it was
+            Some(View::Drive(id)) if g.drive_for.as_ref() == Some(id) => {
+                self.drive_items = g.drive;
+                self.drive_read_for = Some(id.clone());
+            }
+            // not read this time (read already), or read for another drive
             Some(View::Drive(_)) => {}
-            _ => self.drive_items.clear(),
+            _ => {
+                self.drive_items.clear();
+                self.drive_read_for = None;
+            }
         }
         if let Some(v) = old_view {
             self.view = self.views.iter().position(|x| *x == v).unwrap_or(0);
@@ -2060,7 +2074,13 @@ impl Library {
                     if n > 0 {
                         self.focus = Focus::Grid;
                         self.sel = 0;
+                        return Some(Task::none());
                     }
+                    if self.drive_read_for.as_ref() != Some(&id) {
+                        self.note = Some(format!("Reading what is on {}…", d.name));
+                        return Some(self.scan_later());
+                    }
+                    self.note = Some(format!("{} is open, and empty.", d.name));
                     Some(Task::none())
                 }
             },

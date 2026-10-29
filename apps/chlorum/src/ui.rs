@@ -181,3 +181,26 @@ pub fn field_style() -> cosmic::theme::TextInput {
         disabled: Box::new(look),
     }
 }
+
+/// Chlorum's own screens are drawn for a screen 1080 (logical) pixels
+/// tall and zoomed to the real one, so they fill it the same way at any
+/// "size of everything" (that setting is for other apps). A 4K screen at
+/// 100% is 2160 tall: everything twice as big; at 250% it is 864: a bit
+/// smaller, so it all still fits.
+pub fn zoom_for(logical_height: f32) -> f32 {
+    (logical_height / 1080.0).clamp(0.5, 4.0)
+}
+
+/// The zoom for the screen in use now (asked of niri), or 1.
+pub fn screen_zoom() -> f32 {
+    let Ok(mut sock) = niri_ipc::socket::Socket::connect() else { return 1.0 };
+    let focused = match sock.send(niri_ipc::Request::FocusedOutput) {
+        Ok(Ok(niri_ipc::Response::FocusedOutput(Some(o)))) => o.logical,
+        _ => None,
+    };
+    let logical = focused.or_else(|| match sock.send(niri_ipc::Request::Outputs) {
+        Ok(Ok(niri_ipc::Response::Outputs(outs))) => outs.into_values().filter_map(|o| o.logical).max_by_key(|l| l.width * l.height),
+        _ => None,
+    });
+    logical.map(|l| zoom_for(l.height as f32)).unwrap_or(1.0)
+}

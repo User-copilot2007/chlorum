@@ -20,7 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let start = args.first().map(PathBuf::from).filter(|p| p.is_file());
-    let settings = Settings::default()
+    let settings = Settings::default().scale_factor(crate::ui::screen_zoom())
         .default_font(SANS)
         .client_decorations(false)
         .default_icon_theme("Papirus-Dark")

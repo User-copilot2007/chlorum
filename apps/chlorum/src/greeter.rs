@@ -22,7 +22,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub fn run() -> cosmic::iced::Result {
-    let settings = Settings::default()
+    let settings = Settings::default().scale_factor(crate::ui::screen_zoom())
         .default_font(SANS)
         .client_decorations(false)
         .default_icon_theme("Papirus-Dark")

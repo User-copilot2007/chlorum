@@ -1,0 +1,12 @@
+--- a/src/app/mod.rs	2026-10-25 05:13:50.987365146 +0000
++++ b/src/app/mod.rs	2026-10-28 23:53:41.113568930 +0000
+@@ -181,6 +181,9 @@
+             .title(cosmic::Cosmic::title)
+             .style(cosmic::Cosmic::style)
+             .theme(cosmic::Cosmic::theme)
++            // the app's own scale factor (Settings::scale_factor,
++            // command::set_scaling_factor) for every window
++            .scale_factor(cosmic::Cosmic::scale_factor)
+             .settings(settings)
+             .run()
+     }
