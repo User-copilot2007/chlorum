@@ -182,6 +182,32 @@ pub async fn apply(s: &Settings) {
     }
 }
 
+/// The saved settings put on the screens right away (no async runtime
+/// needed): the shell does it before it draws anything, so its first
+/// frame is already the right size.
+pub fn apply_now() {
+    let s = load();
+    let Ok(mut sock) = niri_ipc::socket::Socket::connect() else { return };
+    let Ok(Ok(Response::Outputs(outs))) = sock.send(Request::Outputs) else { return };
+    for o in outs.into_values() {
+        let Some(logical) = o.logical else { continue };
+        let modes: Vec<(u16, u16, u32)> = o.modes.iter().map(|m| (m.width, m.height, m.refresh_rate)).collect();
+        let current = o.current_mode.and_then(|i| modes.get(i).copied());
+        let scale = s.scale.or(current.map(|(_, h, _)| auto_scale(h)));
+        if let Some(x) = scale {
+            if (logical.scale - x).abs() > 0.001 {
+                let _ = sock.send(Request::Output { output: o.name.clone(), action: OutputAction::Scale { scale: ScaleToSet::Specific(x) } });
+            }
+        }
+        if let Some((w, h, r)) = s.mode {
+            if modes.contains(&(w, h, r)) && current != Some((w, h, r)) {
+                let mode = ConfiguredMode { width: w, height: h, refresh: Some(r as f64 / 1000.0) };
+                let _ = sock.send(Request::Output { output: o.name.clone(), action: OutputAction::Mode { mode: ModeToSet::Specific(mode) } });
+            }
+        }
+    }
+}
+
 /// "3840 × 2160", "60 Hz", "150%".
 pub fn size_label(w: u16, h: u16) -> String {
     format!("{w} × {h}")

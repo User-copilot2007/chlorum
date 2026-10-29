@@ -135,6 +135,102 @@ fn run(cache: &Path, file: &Path, cmd: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// Width and height of a photo or video. Photos: read from the start of
+/// the file (JPEG, PNG, GIF, WebP, BMP), fast; the rest (videos, HEIC…) by
+/// ffprobe in the same sandbox as the pictures.
+pub fn dims(file: &Path) -> Option<(u32, u32)> {
+    use std::io::Read;
+    let mut head = vec![0u8; 256 * 1024];
+    let n = std::fs::File::open(file).and_then(|mut f| f.read(&mut head)).ok()?;
+    head.truncate(n);
+    if let Some(d) = dims_from_header(&head) {
+        return Some(d);
+    }
+    if source(file)? == Source::Pdf {
+        return None;
+    }
+    probe_dims(file)
+}
+
+/// From a file's first bytes, for the common photo formats.
+pub fn dims_from_header(b: &[u8]) -> Option<(u32, u32)> {
+    let be16 = |i: usize| Some(u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32);
+    let le16 = |i: usize| Some(u16::from_le_bytes([*b.get(i)?, *b.get(i + 1)?]) as u32);
+    let be32 = |i: usize| Some(u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?));
+    let le32 = |i: usize| Some(u32::from_le_bytes(b.get(i..i + 4)?.try_into().ok()?));
+    // PNG
+    if b.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some((be32(16)?, be32(20)?));
+    }
+    // GIF
+    if b.starts_with(b"GIF8") {
+        return Some((le16(6)?, le16(8)?));
+    }
+    // BMP
+    if b.starts_with(b"BM") && b.len() > 26 {
+        let w = le32(18)? as i32;
+        let h = le32(22)? as i32;
+        return Some((w.unsigned_abs(), h.unsigned_abs()));
+    }
+    // WebP
+    if b.len() > 30 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        return match &b[12..16] {
+            b"VP8 " => Some((le16(26)? & 0x3fff, le16(28)? & 0x3fff)),
+            b"VP8L" => {
+                let v = le32(21)?;
+                Some(((v & 0x3fff) + 1, ((v >> 14) & 0x3fff) + 1))
+            }
+            b"VP8X" => {
+                let w = (b[24] as u32 | (b[25] as u32) << 8 | (b[26] as u32) << 16) + 1;
+                let h = (b[27] as u32 | (b[28] as u32) << 8 | (b[29] as u32) << 16) + 1;
+                Some((w, h))
+            }
+            _ => None,
+        };
+    }
+    // JPEG: the frame header (SOF), after the EXIF and other parts
+    if b.starts_with(&[0xff, 0xd8]) {
+        let mut i = 2;
+        while i + 9 < b.len() {
+            if b[i] != 0xff {
+                i += 1;
+                continue;
+            }
+            let m = b[i + 1];
+            if m == 0xff || m == 0x01 || (0xd0..=0xd9).contains(&m) {
+                i += 2;
+                continue;
+            }
+            let len = be16(i + 2)? as usize;
+            if matches!(m, 0xc0..=0xcf) && !matches!(m, 0xc4 | 0xc8 | 0xcc) {
+                return Some((be16(i + 7)?, be16(i + 5)?));
+            }
+            i += 2 + len;
+        }
+    }
+    None
+}
+
+/// ffprobe's answer ("1920x1080"), sandboxed, 10 seconds at most.
+fn probe_dims(file: &Path) -> Option<(u32, u32)> {
+    let parent = file.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "/".into());
+    let input = file.to_string_lossy().to_string();
+    let mut c = std::process::Command::new("timeout");
+    c.arg("10");
+    if which("bwrap") {
+        c.args(["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--ro-bind", &parent, &parent, "--unshare-all", "--die-with-parent", "--new-session", "--"]);
+    }
+    let out = c
+        .args(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", &input])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let t = String::from_utf8_lossy(&out.stdout);
+    let (w, h) = t.lines().next()?.trim().split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+}
+
 fn which(cmd: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(cmd).exists()))
 }
@@ -233,6 +329,12 @@ mod tests {
         assert_eq!(source(Path::new("/a/v.MKV")), Some(Source::Video));
         assert_eq!(source(Path::new("/a/b.pdf")), Some(Source::Pdf));
         assert_eq!(source(Path::new("/a/b.txt")), None);
+        // a PNG and a GIF header
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend(&1920u32.to_be_bytes());
+        png.extend(&1080u32.to_be_bytes());
+        assert_eq!(dims_from_header(&png), Some((1920, 1080)));
+        assert_eq!(dims_from_header(b"GIF89a\x40\x01\xf0\x00"), Some((320, 240)));
         let t = SystemTime::UNIX_EPOCH;
         assert_eq!(path_for(Path::new("/a"), 1, t, SIZE), path_for(Path::new("/a"), 1, t, SIZE));
         assert_ne!(path_for(Path::new("/a"), 1, t, SIZE), path_for(Path::new("/a"), 2, t, SIZE));

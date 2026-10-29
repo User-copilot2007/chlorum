@@ -63,6 +63,8 @@ fn watchdog() {
 
 pub fn run() -> cosmic::iced::Result {
     watchdog();
+    // the screen's size first, then everything is drawn for it
+    crate::display::apply_now();
     let settings = Settings::default().scale_factor(crate::ui::screen_zoom())
         .no_main_window(true)
         .default_font(SANS)

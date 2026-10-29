@@ -214,7 +214,7 @@ impl Sort {
         }
         let _ = std::fs::write(p, self.key());
     }
-    fn apply(self, items: &mut [Item]) {
+    fn apply(self, items: &mut [&Item]) {
         match self {
             Sort::Newest => items.sort_by(|a, b| b.modified.cmp(&a.modified)),
             Sort::Oldest => items.sort_by(|a, b| a.modified.cmp(&b.modified)),
@@ -1464,9 +1464,12 @@ impl Library {
         if let Some(v) = old_view {
             self.view = self.views.iter().position(|x| *x == v).unwrap_or(0);
         }
-        let list = self.items_in(&self.views[self.view].clone());
-        if let Some(p) = keep {
-            if let Some(i) = list.iter().position(|x| x.path == p) {
+        let view = self.views[self.view].clone();
+        let list = self.items_in(&view);
+        let found = keep.as_ref().map(|p| list.iter().position(|x| x.path == *p));
+        let n = list.len();
+        if let Some(found) = found {
+            if let Some(i) = found {
                 self.sel = i;
             } else if matches!(self.focus, Focus::Confirm | Focus::Ask(_) | Focus::Rename | Focus::NewName) {
                 // the file went away meanwhile: nothing is done to another
@@ -1474,7 +1477,6 @@ impl Library {
                 self.note = Some("That file is not there any more.".into());
             }
         }
-        let n = list.len();
         if self.sel >= n {
             self.sel = n.saturating_sub(1);
         }
@@ -1484,7 +1486,7 @@ impl Library {
         self.items.iter().filter(|i| i.collection.is_none()).collect()
     }
 
-    fn items_in(&self, v: &View) -> Vec<Item> {
+    fn items_in(&self, v: &View) -> Vec<&Item> {
         // a search looks through everything, whatever view is open
         let mut items = if self.query.trim().is_empty() {
             self.unsorted_items_in(v)
@@ -1495,7 +1497,7 @@ impl Library {
             self.unsorted_items_in(v).into_iter().filter(|i| i.name.to_lowercase().contains(&q)).collect()
         } else {
             let q = self.query.trim().to_lowercase();
-            let mut v: Vec<Item> = self.items.iter().filter(|i| i.name.to_lowercase().contains(&q)).cloned().collect();
+            let mut v: Vec<&Item> = self.items.iter().filter(|i| i.name.to_lowercase().contains(&q)).collect();
             v.sort_by_key(|i| !i.name.to_lowercase().starts_with(&q));
             v.dedup_by(|a, b| a.path == b.path);
             v
@@ -1524,13 +1526,13 @@ impl Library {
         }
     }
 
-    fn unsorted_items_in(&self, v: &View) -> Vec<Item> {
+    fn unsorted_items_in(&self, v: &View) -> Vec<&Item> {
         if *v == View::Bin {
-            return self.bin_items.clone();
+            return self.bin_items.iter().collect();
         }
         if let View::Phone(uri) = v {
             return match &self.phone_items {
-                Some((u, items)) if u == uri => items.clone(),
+                Some((u, items)) if u == uri => items.iter().collect(),
                 _ => vec![],
             };
         }
@@ -1543,11 +1545,11 @@ impl Library {
                 Mode::Open { exts, .. } => exts,
                 _ => &[],
             };
-            return self.drive_items.iter().filter(|i| exts.is_empty() || exts.contains(&ext_of(&i.path))).cloned().collect();
+            return self.drive_items.iter().filter(|i| exts.is_empty() || exts.contains(&ext_of(&i.path))).collect();
         }
         if matches!(self.mode, Mode::Save { .. } | Mode::Open { folders: true, .. }) {
             // choosing a place, not a file: show what is already there
-            return self.items.iter().filter(|i| matches!(v, View::Collection(c) if i.collection.as_deref() == Some(c))).take(40).cloned().collect();
+            return self.items.iter().filter(|i| matches!(v, View::Collection(c) if i.collection.as_deref() == Some(c))).take(40).collect();
         }
         let exts: &[String] = match &self.mode {
             Mode::Open { exts, .. } => exts,
@@ -1565,7 +1567,6 @@ impl Library {
                 View::Bin | View::Phone(_) => false,
             })
             .take(if *v == View::Recent { 60 } else { usize::MAX })
-            .cloned()
             .collect()
     }
 
@@ -1585,8 +1586,8 @@ impl Library {
         v
     }
 
-    fn ask_panel(&self, items: &[Item]) -> Option<Element<'_, Message>> {
-        let it = items.get(self.sel)?;
+    fn ask_panel(&self, items: &[&Item]) -> Option<Element<'_, Message>> {
+        let it = *items.get(self.sel)?;
         let asking = matches!(self.focus, Focus::Ask(_) | Focus::NewName) || it.collection.is_none();
         if !asking && self.focus != Focus::Confirm {
             return None;
@@ -1666,7 +1667,7 @@ impl Library {
 
     fn current_item(&self) -> Option<Item> {
         let v = self.views.get(self.view)?.clone();
-        self.items_in(&v).get(self.sel).cloned()
+        self.items_in(&v).get(self.sel).map(|i| (*i).clone())
     }
 
     fn key(&mut self, key: keyboard::Key, status: event::Status) -> Task<Message> {
