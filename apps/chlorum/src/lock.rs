@@ -85,6 +85,9 @@ pub fn authenticate(user: &str, password: &str) -> Result<(), String> {
         if r == PAM_SUCCESS {
             r = pam_acct_mgmt(h, 0);
         }
+        if r != PAM_SUCCESS {
+            eprintln!("chlorum lock: PAM answered {r} for the password");
+        }
         let result = if r == PAM_SUCCESS {
             Ok(())
         } else if r == 7 || r == 10 {

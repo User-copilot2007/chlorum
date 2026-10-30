@@ -18,8 +18,12 @@ pub fn run() -> cosmic::iced::Result {
     // one lock screen at a time
     let flag = crate::apps::runtime_dir().join("locked");
     if let Ok(pid) = std::fs::read_to_string(&flag) {
-        let comm = std::fs::read_to_string(format!("/proc/{}/comm", pid.trim())).unwrap_or_default();
-        if comm.trim() == "chlorum" {
+        // a lock screen that is really running (not another chlorum that
+        // got the same process number later)
+        let cmd = std::fs::read(format!("/proc/{}/cmdline", pid.trim())).unwrap_or_default();
+        let args: Vec<&[u8]> = cmd.split(|b| *b == 0).collect();
+        let is_chlorum = args.first().is_some_and(|a| a.ends_with(b"chlorum"));
+        if is_chlorum && args.get(1).is_some_and(|a| *a == b"lock") {
             return Ok(());
         }
     }
@@ -216,7 +220,9 @@ impl Application for Lock {
                 let (u, p) = (self.user.clone(), self.password.clone());
                 return Task::perform(
                     async move {
-                        tokio::task::spawn_blocking(move || crate::lock::authenticate(&u, &p))
+                        // checked by the root helper, as the login screen
+                        // checks it; by itself only on a system without one
+                        tokio::task::spawn_blocking(move || crate::keyd::check_password(&p).unwrap_or_else(|| crate::lock::authenticate(&u, &p)))
                             .await
                             .unwrap_or_else(|e| Err(e.to_string()))
                     },
@@ -229,6 +235,15 @@ impl Application for Lock {
                 let mut t: Vec<Task<Message>> = self.surfaces.drain(..).map(session_lock::destroy_lock_surface).collect();
                 t.push(session_lock::unlock());
                 t.push(Task::perform(tokio::time::sleep(Duration::from_millis(400)), |_| cosmic::Action::App(Message::Quit)));
+                // With no surface left the app may not run that task: a lock
+                // screen still running afterwards would make the next lock
+                // think one is up already, and the screen would not lock.
+                // So it also ends by itself, once the unlock has gone out.
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_millis(1500));
+                    let _ = std::fs::remove_file(crate::apps::runtime_dir().join("locked"));
+                    std::process::exit(0);
+                });
                 return Task::batch(t);
             }
             Message::Checked(Err(e)) => {
@@ -271,9 +286,13 @@ impl Application for Lock {
                 let shown = if self.password.is_empty() {
                     text("Type your password", SANS, 26.0, MUTED)
                 } else {
-                    text(format!("{}▏", "•".repeat(self.password.chars().count().min(40))), MONO_BOLD, 30.0, TEXT)
+                    // a long password's dots get smaller, so they always
+                    // fit in the field
+                    let n = self.password.chars().count().min(64);
+                    let size = (30.0_f32).min(820.0 / (n as f32 + 1.0)).max(12.0);
+                    text(format!("{}▏", "•".repeat(n)), MONO_BOLD, size, TEXT)
                 };
-                let field = fill(shown, cosmic::iced::Color::from_rgb(0.05, 0.05, 0.05)).padding([20, 24]).width(Length::Fixed(560.0));
+                let field = fill(shown, cosmic::iced::Color::from_rgb(0.05, 0.05, 0.05)).padding([0, 24]).width(Length::Fixed(560.0)).height(Length::Fixed(80.0)).align_y(Alignment::Center);
                 col = col.push(bracket(field, 1.0, 10.0));
             }
             if let Some(e) = &self.error {

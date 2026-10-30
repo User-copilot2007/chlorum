@@ -7,6 +7,13 @@
 //!   {"op":"enroll", "device":"/dev/sdb1", "password":"…", "pin":"…"}
 //!                                                               add the key to it
 //!   {"op":"lock",   "device":"/dev/sdb1"}                       close what unlock opened
+//!   {"op":"password", "password":"…"}                           is this the asker's
+//!                                                               profile password?
+//!
+//! The password check is for the lock screen: a profile kept by
+//! systemd-homed can only be checked reliably by root (as the login screen
+//! does through greetd). It only ever checks the password of the user who
+//! asks, and waits two seconds after a wrong one.
 //!
 //! It only ever touches removable LUKS2 drives (never the computer's own
 //! disk), and only answers programs that are not in an app sandbox. The
@@ -60,6 +67,15 @@ pub async fn enroll(device: String, password: String, pin: String) -> Result<(),
     .map_err(|e| e.to_string())?
 }
 
+/// Checks the password of the profile of whoever asks (the lock screen).
+/// None: the helper is not there (an older system); the caller checks
+/// it itself then.
+pub fn check_password(password: &str) -> Option<Result<(), String>> {
+    let s = UnixStream::connect(SOCK).ok()?;
+    drop(s);
+    Some(ask(json!({"op": "password", "password": password}), Duration::from_secs(40)))
+}
+
 /// Closes a drive that `unlock` opened (after it was unmounted).
 pub async fn lock(device: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || ask(json!({"op": "lock", "device": device}), Duration::from_secs(30)))
@@ -71,7 +87,8 @@ pub async fn lock(device: String) -> Result<(), String> {
 
 /// A program asking from inside an app sandbox has its own mount
 /// namespace: it may not use the key helper.
-fn peer_allowed(stream: &UnixStream) -> bool {
+/// The user id of a program outside any app sandbox that is asking.
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
     use std::os::fd::AsRawFd;
     let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -80,11 +97,40 @@ fn peer_allowed(stream: &UnixStream) -> bool {
         libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred as *mut _ as *mut libc::c_void, &mut len)
     };
     if r != 0 || cred.pid <= 0 {
-        return false;
+        return None;
     }
     let theirs = std::fs::read_link(format!("/proc/{}/ns/mnt", cred.pid));
     let ours = std::fs::read_link("/proc/self/ns/mnt");
-    matches!((theirs, ours), (Ok(a), Ok(b)) if a == b)
+    matches!((theirs, ours), (Ok(a), Ok(b)) if a == b).then_some(cred.uid)
+}
+
+/// The login name of a user id (homed profiles too, through NSS).
+fn user_name(uid: u32) -> Option<String> {
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut out: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: getpwuid_r with a buffer we own; the name is copied out
+    let r = unsafe { libc::getpwuid_r(uid, &mut pw, buf.as_mut_ptr(), buf.len(), &mut out) };
+    if r != 0 || out.is_null() || pw.pw_name.is_null() {
+        return None;
+    }
+    Some(unsafe { std::ffi::CStr::from_ptr(pw.pw_name) }.to_string_lossy().to_string())
+}
+
+/// The lock screen's question: the asker's own password, checked as root.
+fn check_own_password(uid: u32, req: &Value) -> Value {
+    let Some(user) = user_name(uid).filter(|_| uid != 0) else {
+        return json!({"error": "Could not check the password."});
+    };
+    let pw = req.get("password").and_then(|v| v.as_str()).unwrap_or("");
+    match crate::lock::authenticate(&user, pw) {
+        Ok(()) => json!({"ok": true}),
+        Err(e) => {
+            // slows guessing down
+            std::thread::sleep(Duration::from_secs(2));
+            json!({"error": e})
+        }
+    }
 }
 
 /// Runs a command with a time limit; returns (success, everything it said).
@@ -365,10 +411,10 @@ pub fn run_daemon() -> Result<(), String> {
 }
 
 fn serve(mut stream: UnixStream, work: &std::sync::Mutex<()>) {
-    if !peer_allowed(&stream) {
+    let Some(uid) = peer_uid(&stream) else {
         let _ = stream.write_all(b"{\"error\":\"Apps may not use security keys this way.\"}\n");
         return;
-    }
+    };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
     let mut line = String::new();
@@ -382,7 +428,11 @@ fn serve(mut stream: UnixStream, work: &std::sync::Mutex<()>) {
     let reply = match serde_json::from_str::<Value>(&line) {
         Ok(req) => {
             let _one = work.lock().unwrap_or_else(|e| e.into_inner());
-            handle(&req)
+            if req.get("op").and_then(|v| v.as_str()) == Some("password") {
+                check_own_password(uid, &req)
+            } else {
+                handle(&req)
+            }
         }
         Err(_) => json!({"error": "Something went wrong. Please try again."}),
     };

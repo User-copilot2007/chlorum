@@ -124,6 +124,8 @@ enum Kind {
     Project,
     Archive,
     Other,
+    /// a folder inside a collection: an album (Photos › Rome 2019)
+    Album,
 }
 
 impl Kind {
@@ -150,6 +152,7 @@ impl Kind {
             Kind::Project => "Projects",
             Kind::Archive => "Archives",
             Kind::Other => "Other",
+            Kind::Album => "Albums",
         }
     }
     fn badge(self) -> &'static str {
@@ -162,6 +165,7 @@ impl Kind {
             Kind::Project => "PROJECT",
             Kind::Archive => "ZIP",
             Kind::Other => "FILE",
+            Kind::Album => "ALBUM",
         }
     }
 }
@@ -241,18 +245,6 @@ enum Show {
 
 impl Show {
     const ALL: [Show; 8] = [Show::All, Show::Photos, Show::Videos, Show::Audio, Show::Text, Show::Technical, Show::Office, Show::Other];
-    fn key(self) -> &'static str {
-        match self {
-            Show::All => "all",
-            Show::Photos => "photos",
-            Show::Videos => "videos",
-            Show::Audio => "audio",
-            Show::Text => "text",
-            Show::Technical => "technical",
-            Show::Office => "office",
-            Show::Other => "other",
-        }
-    }
     fn label(self) -> &'static str {
         match self {
             Show::All => "All files",
@@ -309,17 +301,6 @@ enum When {
 
 impl When {
     const ALL: [When; 7] = [When::Any, When::Today, When::Week, When::Month, When::Year, When::LastYear, When::Between];
-    fn key(self) -> &'static str {
-        match self {
-            When::Any => "any",
-            When::Today => "today",
-            When::Week => "week",
-            When::Month => "month",
-            When::Year => "year",
-            When::LastYear => "lastyear",
-            When::Between => "between",
-        }
-    }
     fn label(self) -> &'static str {
         match self {
             When::Any => "Any time",
@@ -355,31 +336,6 @@ fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
 }
 
 impl Filter {
-    fn path() -> PathBuf {
-        crate::apps::config_dir().join("chlorum/library-filter")
-    }
-    fn load() -> Filter {
-        let mut f = Filter::default();
-        for l in std::fs::read_to_string(Filter::path()).unwrap_or_default().lines() {
-            let Some((k, v)) = l.split_once(' ') else { continue };
-            match k {
-                "kinds" => f.kinds = v.split(',').filter_map(|x| Show::ALL.into_iter().find(|s| s.key() == x && *s != Show::All)).collect(),
-                "when" => f.when = When::ALL.into_iter().find(|w| w.key() == v).unwrap_or(When::Any),
-                "from" => f.from = v.to_string(),
-                "to" => f.to = v.to_string(),
-                _ => {}
-            }
-        }
-        f
-    }
-    fn save(&self) {
-        let p = Filter::path();
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let kinds: Vec<&str> = self.kinds.iter().map(|k| k.key()).collect();
-        let _ = std::fs::write(p, format!("kinds {}\nwhen {}\nfrom {}\nto {}\n", kinds.join(","), self.when.key(), self.from, self.to));
-    }
     fn is_all(&self) -> bool {
         self.kinds.is_empty() && self.when == When::Any
     }
@@ -442,8 +398,13 @@ pub struct Item {
     /// collection it is filed in; None while it waits for an answer
     collection: Option<String>,
     modified: SystemTime,
-    /// bytes (0 for a folder)
+    /// bytes (0 for a folder; for an album, how many files it holds)
     size: u64,
+    /// the album it is in, inside its collection ("Rome" or "Trips/Rome");
+    /// for an album, the album itself
+    album: Option<String>,
+    /// an album's picture: its newest photo or video
+    cover: Option<(PathBuf, u64, SystemTime)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -498,6 +459,8 @@ enum Focus {
     Search,
     /// typing a file's new name
     Rename,
+    /// typing the name of a new album
+    NewAlbum,
     /// choosing the drive to copy files to
     SendTo(usize),
 }
@@ -532,6 +495,7 @@ pub enum Message {
     /// a phone's photos and videos were read (its address, the files)
     PhoneLoaded(String, Result<Vec<Item>, String>),
     RenameSubmit,
+    AlbumSubmit,
     QuerySubmit,
     /// a file was clicked (twice quickly: opened)
     Click(usize),
@@ -542,6 +506,10 @@ pub enum Message {
 
 pub struct Library {
     core: Core,
+    /// the folders inside collections
+    albums: Vec<Item>,
+    /// the album being looked at: its collection and its path in it
+    album_at: Option<(String, String)>,
     /// the window's size: how many files fit on a row and on the screen
     size: iced::Size,
     thumbs: crate::thumbs::Maker,
@@ -660,7 +628,11 @@ impl Application for Library {
             drive_busy: false,
             project_name: String::new(),
             sort: Sort::load(),
-            filter: Filter::load(),
+            // a filter starts afresh each time: one left on from before
+            // would hide files without anyone remembering why
+            filter: Filter::default(),
+            albums: vec![],
+            album_at: None,
             scanning: false,
             drive_read_for: None,
             bin_items: vec![],
@@ -746,6 +718,7 @@ impl Application for Library {
                     }
                 }
             }
+            Message::AlbumSubmit => return self.make_album(),
             Message::Query(q) => {
                 self.query = q;
                 self.sel = 0;
@@ -765,6 +738,10 @@ impl Application for Library {
                     self.focus = Focus::Grid;
                 }
                 if double {
+                    if let Some(it) = self.current_item().filter(|i| i.kind == Kind::Album) {
+                        self.enter_album(&it);
+                        return Task::none();
+                    }
                     if let Some(it) = self.current_item() {
                         if it.collection.is_none() && !matches!(self.views.get(self.view), Some(View::Drive(_) | View::Phone(_))) {
                             self.focus = Focus::Ask(0);
@@ -788,7 +765,7 @@ impl Application for Library {
                 }
             }
             Message::Rescan => {
-                let read = if !matches!(self.focus, Focus::NewName | Focus::SaveName | Focus::DrivePassword | Focus::KeyPin | Focus::AddPassword | Focus::AddPin | Focus::NewProject(_) | Focus::Rename | Focus::Confirm | Focus::Ask(_) | Focus::SendTo(_)) {
+                let read = if !matches!(self.focus, Focus::NewName | Focus::SaveName | Focus::DrivePassword | Focus::KeyPin | Focus::AddPassword | Focus::AddPin | Focus::NewProject(_) | Focus::Rename | Focus::NewAlbum | Focus::Confirm | Focus::Ask(_) | Focus::SendTo(_)) {
                     self.scan_later()
                 } else {
                     Task::none()
@@ -869,10 +846,18 @@ impl Application for Library {
             Message::NewName(s) => self.new_name = s,
             Message::NewSubmit => return self.create_and_file(),
             Message::Key(k, status) => {
+                // Enter in a text field was its submit: not also a key here
+                // (it would open the album just made, or the file renamed)
+                if status == event::Status::Captured && k == keyboard::Key::Named(keyboard::key::Named::Enter) {
+                    return Task::none();
+                }
                 let before = (self.view, self.sel);
                 let t = self.key(k, status);
-                if self.view != before.0 && self.mode == Mode::Browse {
-                    self.marked.clear();
+                if self.view != before.0 {
+                    self.album_at = None;
+                    if self.mode == Mode::Browse {
+                        self.marked.clear();
+                    }
                 }
                 if (self.view, self.sel) != before {
                     return Task::batch([t, self.follow()]);
@@ -946,7 +931,11 @@ impl Application for Library {
                 let on = i == self.sel && matches!(self.focus, Focus::Grid | Focus::Ask(_) | Focus::NewName | Focus::Confirm);
                 let marked = self.marked.contains(&it.path);
                 // the file itself when it can be pictured, its kind otherwise
-                let picture = self.thumbs.get(&it.path, it.size, it.modified);
+                let picture = match (&it.kind, &it.cover) {
+                    (Kind::Album, Some((p, size, m))) => self.thumbs.get(p, *size, *m),
+                    (Kind::Album, None) => None,
+                    _ => self.thumbs.get(&it.path, it.size, it.modified),
+                };
                 let thumb: Element<'_, Message> = match picture {
                     Some(p) => widget::image(widget::image::Handle::from_path(p)).content_fit(cosmic::iced::ContentFit::Cover).width(Length::Fill).height(Length::Fixed(thumb_h)).into(),
                     None => fill(
@@ -961,12 +950,16 @@ impl Application for Library {
                     .height(Length::Fixed(thumb_h))
                     .into(),
                 };
-                let meta = format!(
-                    "{}{} · {}",
-                    if marked { "■ " } else { "" },
-                    it.collection.clone().unwrap_or_else(|| "NEW".into()).to_uppercase(),
-                    when(it.modified)
-                );
+                let meta = if it.kind == Kind::Album {
+                    format!("ALBUM · {} {}", it.size, if it.size == 1 { "FILE" } else { "FILES" })
+                } else {
+                    format!(
+                        "{}{} · {}",
+                        if marked { "■ " } else { "" },
+                        it.collection.clone().unwrap_or_else(|| "NEW".into()).to_uppercase(),
+                        when(it.modified)
+                    )
+                };
                 let card = fill(
                     widget::Column::new()
                         .push(thumb)
@@ -985,18 +978,32 @@ impl Application for Library {
             grid = grid.push(row);
         }
         if items.is_empty() {
+            let hidden = if self.filter.is_all() { 0 } else { self.unsorted_items_in(&view).len() };
             let msg = match (&self.mode, &view) {
-                (Mode::Save { .. }, _) => "Choose where it goes, then press → to name it.",
-                (_, View::Inbox) => "Nothing waiting. New downloads appear here.",
-                _ if !self.query.trim().is_empty() && !self.filter.is_all() => "Nothing called like that passes the filter. F changes the filter, Esc clears the search.",
-                _ if !self.query.trim().is_empty() => "No file is called like that. Esc clears the search.",
-                _ if !self.filter.is_all() => "Nothing here passes the filter. F changes it.",
-                _ => "Nothing here yet.",
+                (Mode::Save { .. }, _) => "Choose where it goes, then press → to name it.".to_string(),
+                _ if hidden > 0 => format!(
+                    "{hidden} {} here {} hidden by the filter ({}). Backspace shows everything.",
+                    if hidden == 1 { "file" } else { "files" },
+                    if hidden == 1 { "is" } else { "are" },
+                    self.filter.summary()
+                ),
+                _ if !self.query.trim().is_empty() => "No file is called like that. Esc clears the search.".to_string(),
+                (_, View::Inbox) => "Nothing waiting. New downloads appear here.".to_string(),
+                (Mode::Browse, View::Collection(c)) if c != "Projects" && self.album_at.is_some() => "This album is empty. M on a file elsewhere moves it in.".to_string(),
+                (Mode::Browse, View::Collection(c)) if c != "Projects" => "Nothing here yet. N makes an album.".to_string(),
+                _ => "Nothing here yet.".to_string(),
             };
             grid = grid.push(text(msg, SANS, 22.0, TEXT_2));
         }
         let order = if view == View::Recent && self.query.is_empty() { "Newest first".to_string() } else { self.sort.label().to_string() };
-        let title = if self.query.trim().is_empty() { self.view_label(&view) } else { format!("Results for “{}”", self.query.trim()) };
+        let title = if !self.query.trim().is_empty() {
+            format!("Results for “{}”", self.query.trim())
+        } else {
+            match (&view, &self.album_at) {
+                (View::Collection(c), Some((ac, r))) if ac == c => format!("{c} › {}", r.replace('/', " › ")),
+                _ => self.view_label(&view),
+            }
+        };
         let search = text_input::text_input("Search all files ( / )", self.query.as_str())
             .id(self.search_id.clone())
             .on_input(Message::Query)
@@ -1014,14 +1021,15 @@ impl Application for Library {
                 if self.filter.is_all() { TEXT_2 } else { YELLOW },
             ))
             .push(space(1.0, 20.0))
-            .push(if self.focus == Focus::Rename {
+            .push(if matches!(self.focus, Focus::Rename | Focus::NewAlbum) {
+                let album = self.focus == Focus::NewAlbum;
                 widget::Column::new()
-                    .push(text("NEW NAME", MONO, 13.0, YELLOW))
+                    .push(text(if album { "NEW ALBUM" } else { "NEW NAME" }, MONO, 13.0, YELLOW))
                     .push(bracket(
-                        text_input::text_input("Name", self.rename.as_str())
+                        text_input::text_input(if album { "Name of the album" } else { "Name" }, self.rename.as_str())
                             .id(self.input_id.clone())
                             .on_input(Message::RenameInput)
-                            .on_submit(|_| Message::RenameSubmit)
+                            .on_submit(move |_| if album { Message::AlbumSubmit } else { Message::RenameSubmit })
                             .size(22)
                             .padding([12, 16])
                             .width(Length::Fixed(640.0)),
@@ -1062,6 +1070,27 @@ impl Application for Library {
             (_, Focus::NewProject(_)) => vec![("↑ ↓", "Language", false), ("ENTER", "Create", true), ("ESC", "Back", false)],
             (_, Focus::Filter(_)) => vec![("↑ ↓", "Choose", false), ("ENTER", "On · Off", true), ("← →", "Change", false), ("ESC", "Done", false)],
             (_, Focus::Rename) => vec![("ENTER", "Rename", true), ("ESC", "Back", false)],
+            (_, Focus::NewAlbum) => vec![("ENTER", "Make the album", true), ("ESC", "Back", false)],
+            (Mode::Browse, Focus::Grid) if matches!(&view, View::Collection(_)) && self.current_item().is_some_and(|i| i.kind == Kind::Album) => vec![
+                ("← ↑ ↓ →", "Move", false),
+                ("ENTER", "Open the album", true),
+                ("N", "New album", false),
+                ("M", "Move", false),
+                ("R", "Rename", false),
+                ("DEL", "Delete", false),
+                ("ESC", if self.album_at.is_some() { "Up" } else { "Back" }, false),
+            ],
+            (Mode::Browse, Focus::Grid) if matches!(&view, View::Collection(c) if c != "Projects") => vec![
+                ("← ↑ ↓ →", "Move", false),
+                ("ENTER", "Open", true),
+                ("N", "New album", false),
+                ("M", "Move", false),
+                ("R", "Rename", false),
+                ("SPACE", "Mark", false),
+                ("F", "Filter", false),
+                ("DEL", "Delete", false),
+                ("ESC", if self.album_at.is_some() { "Up" } else { "Back" }, false),
+            ],
             (_, Focus::SendTo(_)) => vec![("↑ ↓", "Drive", false), ("ENTER", "Copy there", true), ("ESC", "Back", false)],
             (Mode::Browse, Focus::Grid) if view == View::Bin => vec![("← ↑ ↓ →", "Move", false), ("ENTER", "Put back", true), ("DEL", "Delete for good", false)],
             (Mode::Browse, Focus::Confirm) if view == View::Bin => vec![("ENTER", "Delete for good", true), ("ESC", "Keep", false)],
@@ -1308,7 +1337,6 @@ impl Library {
             }
             _ => {}
         }
-        self.filter.save();
         self.sel = 0;
         Task::none()
     }
@@ -1420,6 +1448,13 @@ impl Library {
         // the file chosen stays chosen, wherever new files push it
         let keep = self.current_item().map(|i| i.path);
         self.items = g.items;
+        self.albums = g.albums;
+        // the album looked at went away (deleted, renamed): its collection
+        if let Some((c, r)) = &self.album_at {
+            if !self.albums.iter().any(|a| a.collection.as_deref() == Some(c) && a.album.as_deref() == Some(r)) {
+                self.album_at = None;
+            }
+        }
         self.collections = g.collections.clone();
         let mut views = match &self.mode {
             Mode::Browse => vec![View::Inbox, View::Recent],
@@ -1503,12 +1538,14 @@ impl Library {
             v
         };
         if !self.filter.is_all() {
-            items.retain(|i| self.filter.keeps(i));
+            items.retain(|i| i.kind == Kind::Album || self.filter.keeps(i));
         }
         // Recent is the newest files, whatever the order chosen
         if *v != View::Recent {
             self.sort.apply(&mut items);
         }
+        // albums before files
+        items.sort_by_key(|i| i.kind != Kind::Album);
         items
     }
 
@@ -1518,7 +1555,7 @@ impl Library {
         match v {
             View::Bin => self.bin_items.iter().filter(|i| ok(i)).count(),
             View::Phone(_) | View::Drive(_) => self.unsorted_items_in(v).iter().filter(|i| ok(i)).count(),
-            _ if !matches!(self.mode, Mode::Browse) => self.unsorted_items_in(v).len(),
+            _ if !matches!(self.mode, Mode::Browse) => self.unsorted_items_in(v).iter().filter(|i| ok(i)).count(),
             View::Inbox => self.items.iter().filter(|i| i.collection.is_none() && ok(i)).count(),
             View::Recent => self.items.iter().filter(|i| ok(i)).take(60).count(),
             View::Collection(c) => self.items.iter().filter(|i| i.collection.as_deref() == Some(c.as_str()) && ok(i)).count(),
@@ -1551,6 +1588,17 @@ impl Library {
             // choosing a place, not a file: show what is already there
             return self.items.iter().filter(|i| matches!(v, View::Collection(c) if i.collection.as_deref() == Some(c))).take(40).collect();
         }
+        if let (Mode::Browse, View::Collection(c)) = (&self.mode, v) {
+            // the albums here first, then the files right here
+            let here = self.album_here(c);
+            let mut out: Vec<&Item> = self
+                .albums
+                .iter()
+                .filter(|a| a.collection.as_deref() == Some(c.as_str()) && a.album.as_deref().map(parent_album) == Some(here.as_str()))
+                .collect();
+            out.extend(self.items.iter().filter(|i| i.collection.as_deref() == Some(c.as_str()) && i.album.as_deref().unwrap_or("") == here));
+            return out;
+        }
         let exts: &[String] = match &self.mode {
             Mode::Open { exts, .. } => exts,
             _ => &[],
@@ -1570,7 +1618,27 @@ impl Library {
             .collect()
     }
 
-    /// The answers offered for a file: collections, best guess first.
+    /// The album looked at in collection `c` ("" for the collection itself).
+    fn album_here(&self, c: &str) -> String {
+        match &self.album_at {
+            Some((ac, r)) if ac == c => r.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// Where a file or album is now ("Photos/Rome"), as `choices` names places.
+    fn place_of(it: &Item) -> Option<String> {
+        let c = it.collection.clone()?;
+        let inner = if it.kind == Kind::Album { it.album.as_deref().map(parent_album) } else { it.album.as_deref() };
+        Some(match inner {
+            Some(r) if !r.is_empty() => format!("{c}/{r}"),
+            _ => c,
+        })
+    }
+
+    /// The answers offered for a file: collections and their albums
+    /// ("Photos/Rome"), the best guess first; never where it already is,
+    /// nor (for an album) inside itself.
     fn choices(&self, it: &Item) -> Vec<String> {
         let guess = match it.kind {
             Kind::Photo => "Photos",
@@ -1578,12 +1646,69 @@ impl Library {
             Kind::Music => "Music",
             _ => "Documents",
         };
-        let mut v: Vec<String> = self.collections.clone();
+        let mut v: Vec<String> = vec![];
+        for c in &self.collections {
+            v.push(c.clone());
+            let mut inside: Vec<String> = self.albums.iter().filter(|a| a.collection.as_deref() == Some(c.as_str())).filter_map(|a| a.album.clone()).map(|r| format!("{c}/{r}")).collect();
+            inside.sort_by_key(|x| x.to_lowercase());
+            v.extend(inside);
+        }
         if let Some(p) = v.iter().position(|c| c == guess) {
             let g = v.remove(p);
             v.insert(0, g);
         }
+        let here = Library::place_of(it);
+        let own = (it.kind == Kind::Album).then(|| format!("{}/{}", it.collection.clone().unwrap_or_default(), it.album.clone().unwrap_or_default()));
+        v.retain(|c| Some(c) != here.as_ref() && !own.as_ref().is_some_and(|o| c == o || c.starts_with(&format!("{o}/"))));
         v
+    }
+
+    /// Makes a new album where Library is looking (Browse, a collection).
+    fn make_album(&mut self) -> Task<Message> {
+        let name = self.rename.trim().to_string();
+        let Some(View::Collection(c)) = self.views.get(self.view).cloned() else { return Task::none() };
+        if name.is_empty() || name.contains('/') || name.starts_with('.') {
+            self.note = Some("An album's name cannot be empty, start with a dot or have / in it.".into());
+            return Task::none();
+        }
+        let here = self.album_here(&c);
+        let dir = if here.is_empty() { library_dir().join(&c) } else { library_dir().join(&c).join(&here) };
+        let target = dir.join(&name);
+        if target.exists() {
+            self.note = Some(format!("There is already something called {name} here."));
+            return Task::none();
+        }
+        self.note = Some(match std::fs::create_dir_all(&target) {
+            Ok(()) => format!("Album {name} made. M on a file moves it in."),
+            Err(e) => format!("Could not make the album: {e}"),
+        });
+        self.focus = Focus::Grid;
+        self.scan();
+        let view = View::Collection(c);
+        if let Some(i) = self.items_in(&view).iter().position(|x| x.path == target) {
+            self.sel = i;
+        }
+        Task::none()
+    }
+
+    /// Into an album (Enter on it).
+    fn enter_album(&mut self, it: &Item) {
+        if let (Some(c), Some(r)) = (&it.collection, &it.album) {
+            self.album_at = Some((c.clone(), r.clone()));
+            self.sel = 0;
+        }
+    }
+
+    /// Out of the album to the one around it; false when not in one.
+    fn album_up(&mut self) -> bool {
+        let Some((c, r)) = self.album_at.clone() else { return false };
+        let up = parent_album(&r).to_string();
+        self.album_at = if up.is_empty() { None } else { Some((c.clone(), up)) };
+        // back on the album just left
+        let left = library_dir().join(&c).join(&r);
+        let view = View::Collection(c);
+        self.sel = self.items_in(&view).iter().position(|x| x.path == left).unwrap_or(0);
+        true
     }
 
     fn ask_panel(&self, items: &[&Item]) -> Option<Element<'_, Message>> {
@@ -1597,11 +1722,20 @@ impl Library {
             col = col
                 .push(text("DELETE", MONO, 14.0, RED))
                 .push(text(it.name.clone(), SANS_BOLD, 22.0, TEXT))
-                .push(text("It goes to the bin and can be brought back for 30 days.", SANS, 18.0, TEXT_2))
+                .push(text(
+                    if it.kind == Kind::Album {
+                        format!("The album and the {} files in it go to the bin and can be brought back for 30 days.", it.size)
+                    } else {
+                        "It goes to the bin and can be brought back for 30 days.".to_string()
+                    },
+                    SANS,
+                    18.0,
+                    TEXT_2,
+                ))
                 .push(fill(text("ENTER  Delete", SANS_BOLD, 20.0, BLACK), RED).padding([14, 22]));
             return Some(fill(col.padding(30), PANEL).into());
         }
-        let title = if it.collection.is_none() { "Where does this belong?" } else { "Move to…" };
+        let title = if it.collection.is_none() { "Where does this belong?" } else if it.kind == Kind::Album { "Move the album to…" } else { "Move to…" };
         col = col
             .push(text(if it.collection.is_none() { "NEEDS AN ANSWER".to_string() } else { "MOVE".to_string() }, MONO, 14.0, YELLOW))
             .push(text(short(&it.name, 34), SANS_BOLD, 22.0, TEXT))
@@ -1613,13 +1747,20 @@ impl Library {
             Focus::Ask(i) => Some(i),
             _ => None,
         };
-        for (i, c) in choices.iter().enumerate() {
+        // as many as fit, around the chosen one
+        let fit = (((self.size.height - 520.0) / 62.0).max(3.0)) as usize;
+        let first = sel.unwrap_or(0).saturating_sub(fit / 2).min(choices.len().saturating_sub(fit));
+        if first > 0 {
+            col = col.push(text(format!("↑ {first} more"), MONO, 13.0, TEXT_2));
+        }
+        for (i, c) in choices.iter().enumerate().skip(first).take(fit) {
             let on = sel == Some(i);
+            let c = &c.replace('/', " › ");
             col = col.push(
                 fill(
                     widget::Row::new()
-                        .push(boxed(text((i + 1).to_string(), MONO_BOLD, 15.0, if on { BLACK } else { TEXT }), Color::TRANSPARENT, if on { BLACK } else { TEXT_2 }, 1.5).padding([2, 8]))
-                        .push(text(c.clone(), SANS_BOLD, 21.0, if on { BLACK } else { TEXT }))
+                        .push(boxed(text(if i < 9 { (i + 1).to_string() } else { "·".into() }, MONO_BOLD, 15.0, if on { BLACK } else { TEXT }), Color::TRANSPARENT, if on { BLACK } else { TEXT_2 }, 1.5).padding([2, 8]))
+                        .push(text(short(c, 30), SANS_BOLD, 21.0, if on { BLACK } else { TEXT }))
                         .spacing(16)
                         .align_y(Alignment::Center),
                     if on { YELLOW } else { PANEL_2 },
@@ -1627,6 +1768,9 @@ impl Library {
                 .padding([14, 18])
                 .width(Length::Fill),
             );
+        }
+        if first + fit < choices.len() {
+            col = col.push(text(format!("↓ {} more", choices.len() - first - fit), MONO, 13.0, TEXT_2));
         }
         let new_on = sel == Some(choices.len()) || self.focus == Focus::NewName;
         let new_row: Element<'_, Message> = if self.focus == Focus::NewName {
@@ -1712,6 +1856,18 @@ impl Library {
             self.focus = Focus::NewProject(0);
             self.project_name.clear();
             return text_input::focus(self.input_id.clone());
+        }
+        if ch == "n" && self.mode == Mode::Browse && matches!(&view, View::Collection(c) if c != "Projects") && matches!(self.focus, Focus::Side | Focus::Grid) {
+            self.focus = Focus::NewAlbum;
+            self.rename.clear();
+            return text_input::focus(self.input_id.clone());
+        }
+        // Backspace with a filter on (and no album to go up from): everything again
+        if named == Some(Named::Backspace) && !self.filter.is_all() && self.album_at.is_none() && matches!(self.focus, Focus::Side | Focus::Grid) {
+            self.filter = Filter::default();
+            self.sel = 0;
+            self.note = Some("Filter off: everything is shown.".into());
+            return Task::none();
         }
         if let Focus::Filter(row) = self.focus {
             return self.filter_key(row, named, &ch);
@@ -1824,10 +1980,16 @@ impl Library {
                         self.sel -= self.cols();
                     }
                 }
-                Some(Named::Escape) => self.focus = Focus::Side,
+                Some(Named::Escape) | Some(Named::Backspace) => {
+                    if !self.album_up() && named == Some(Named::Escape) {
+                        self.focus = Focus::Side;
+                    }
+                }
                 Some(Named::Enter) => {
                     if let Some(it) = self.current_item() {
-                        if it.collection.is_none() {
+                        if it.kind == Kind::Album {
+                            self.enter_album(&it);
+                        } else if it.collection.is_none() {
                             self.focus = Focus::Ask(0);
                         } else {
                             self.opened(&it.path);
@@ -1865,7 +2027,7 @@ impl Library {
                     }
                 }
             },
-            Focus::Rename => {
+            Focus::Rename | Focus::NewAlbum => {
                 if named == Some(Named::Escape) {
                     self.focus = Focus::Grid;
                 }
@@ -2419,7 +2581,7 @@ impl Library {
                         save_rules(&self.rules);
                     }
                 }
-                self.note = Some(format!("{} → {}", it.name, collection));
+                self.note = Some(format!("{} → {}", it.name, collection.replace('/', " › ")));
             }
             Err(e) => self.note = Some(format!("Could not move it: {e}")),
         }
@@ -2461,6 +2623,71 @@ fn walk(dir: &Path, depth: usize, f: &mut dyn FnMut(&Path)) {
     }
 }
 
+/// The album a file is in: its folder below the collection's ("Rome",
+/// "Trips/Rome"), None right in the collection.
+fn album_of(root: &Path, p: &Path) -> Option<String> {
+    let rel = p.parent()?.strip_prefix(root).ok()?;
+    let s = rel.to_string_lossy().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Every folder inside a collection (but Workshop projects, which are one
+/// thing each): the albums. `f` gets the folder and its path below `root`.
+fn album_dirs(root: &Path, dir: &Path, depth: usize, f: &mut dyn FnMut(&Path, String)) {
+    if depth > 5 {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if e.file_name().to_string_lossy().starts_with('.') || !p.is_dir() || crate::workshop::is_project(&p) {
+            continue;
+        }
+        if let Ok(rel) = p.strip_prefix(root) {
+            f(&p, rel.to_string_lossy().to_string());
+        }
+        album_dirs(root, &p, depth + 1, f);
+    }
+}
+
+/// How many files each album holds (with the albums inside it), when it
+/// last changed, and its picture.
+fn fill_albums(albums: &mut [Item], items: &[Item]) {
+    let mut at: HashMap<(String, String), usize> = HashMap::new();
+    for (i, a) in albums.iter().enumerate() {
+        if let (Some(c), Some(r)) = (&a.collection, &a.album) {
+            at.insert((c.clone(), r.clone()), i);
+        }
+    }
+    for it in items {
+        let (Some(c), Some(r)) = (&it.collection, &it.album) else { continue };
+        // the album and every album around it
+        let mut rel = r.as_str();
+        loop {
+            if let Some(i) = at.get(&(c.clone(), rel.to_string())) {
+                let a = &mut albums[*i];
+                a.size += 1;
+                if it.modified > a.modified || a.cover.is_none() {
+                    a.modified = a.modified.max(it.modified);
+                }
+                let pictured = matches!(it.kind, Kind::Photo | Kind::Video);
+                if pictured && a.cover.as_ref().is_none_or(|(_, _, m)| it.modified > *m) {
+                    a.cover = Some((it.path.clone(), it.size, it.modified));
+                }
+            }
+            match rel.rsplit_once('/') {
+                Some((up, _)) => rel = up,
+                None => break,
+            }
+        }
+    }
+}
+
+/// The album that holds an album ("Trips/Rome" → "Trips"; "Rome" → "").
+fn parent_album(rel: &str) -> &str {
+    rel.rsplit_once('/').map(|(up, _)| up).unwrap_or("")
+}
+
 /// Like `walk`, but stops when `f` says so (big drives).
 fn walk_until(dir: &Path, depth: usize, f: &mut dyn FnMut(&Path) -> bool) -> bool {
     if depth > 12 {
@@ -2493,6 +2720,8 @@ fn item(p: &Path, collection: Option<String>) -> Item {
         collection,
         modified: std::fs::metadata(p).and_then(|m| m.modified()).unwrap_or(SystemTime::UNIX_EPOCH),
         size: std::fs::metadata(p).map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0),
+        album: None,
+        cover: None,
     }
 }
 
@@ -2570,6 +2799,8 @@ pub struct Gathered {
     with_phones: bool,
     collections: Vec<String>,
     items: Vec<Item>,
+    /// the folders inside collections
+    albums: Vec<Item>,
     drive: Vec<Item>,
     bin: Vec<Item>,
     phones: Vec<crate::phones::Phone>,
@@ -2586,8 +2817,20 @@ fn gather(rules: &HashMap<String, String>, drive: Option<(String, String, PathBu
             .map(|rd| rd.flatten().filter(|e| e.path().is_dir()).map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| !n.starts_with('.')).collect())
             .unwrap_or_default();
         collections.sort();
+        let mut albums: Vec<Item> = vec![];
         for c in &collections {
-            walk(&lib.join(c), 0, &mut |p| items.push(item(p, Some(c.clone()))));
+            let root = lib.join(c);
+            walk(&root, 0, &mut |p| {
+                let mut it = item(p, Some(c.clone()));
+                it.album = album_of(&root, p);
+                items.push(it);
+            });
+            album_dirs(&root, &root, 0, &mut |d, rel| {
+                let mut a = item(d, Some(c.clone()));
+                a.kind = Kind::Album;
+                a.album = Some(rel);
+                albums.push(a);
+            });
         }
         for d in inbox_dirs() {
             if let Ok(rd) = std::fs::read_dir(&d) {
@@ -2629,7 +2872,8 @@ fn gather(rules: &HashMap<String, String>, drive: Option<(String, String, PathBu
         let bin = if browse { bin_list() } else { vec![] };
         let with_phones = browse && phones;
         let phones = if with_phones { crate::phones::list() } else { vec![] };
-        return Gathered { drive_for: drive.map(|d| d.0), with_phones, collections, items, drive: drive_items, bin, phones };
+        fill_albums(&mut albums, &items);
+        return Gathered { drive_for: drive.map(|d| d.0), with_phones, collections, items, albums, drive: drive_items, bin, phones };
     }
     Gathered::default()
 }
@@ -2890,7 +3134,7 @@ mod tests {
     fn showing_one_kind() {
         let it = |name: &str| {
             let path = PathBuf::from(format!("/x/{name}"));
-            Item { kind: Kind::of(&path), path, name: name.into(), collection: None, modified: SystemTime::UNIX_EPOCH, size: 0 }
+            Item { kind: Kind::of(&path), path, name: name.into(), collection: None, modified: SystemTime::UNIX_EPOCH, size: 0, album: None, cover: None }
         };
         assert!(Show::Photos.keeps(&it("a.JPG")) && !Show::Photos.keeps(&it("a.mp4")));
         assert!(Show::Videos.keeps(&it("a.mkv")));
@@ -2908,6 +3152,33 @@ mod tests {
         let range = Filter { kinds: vec![], when: When::Between, from: "1969-12-31".into(), to: "1970-01-02".into() };
         assert!(range.keeps(&it("a.jpg")));
         assert_eq!(f.summary(), "Photos, Videos · Any time");
+    }
+}
+
+#[cfg(test)]
+mod album_tests {
+    use super::*;
+
+    fn it(path: &str, c: &str, album: Option<&str>, kind: Kind) -> Item {
+        Item { path: path.into(), name: path.rsplit('/').next().unwrap().into(), kind, collection: Some(c.into()), modified: SystemTime::UNIX_EPOCH, size: 1, album: album.map(String::from), cover: None }
+    }
+
+    #[test]
+    fn albums_count_what_is_inside() {
+        let root = Path::new("/l/Photos");
+        assert_eq!(album_of(root, Path::new("/l/Photos/a.jpg")), None);
+        assert_eq!(album_of(root, Path::new("/l/Photos/Trips/Rome/a.jpg")).as_deref(), Some("Trips/Rome"));
+        assert_eq!(parent_album("Trips/Rome"), "Trips");
+        assert_eq!(parent_album("Rome"), "");
+        let mut albums = vec![it("/l/Photos/Trips", "Photos", Some("Trips"), Kind::Album), it("/l/Photos/Trips/Rome", "Photos", Some("Trips/Rome"), Kind::Album)];
+        for a in &mut albums {
+            a.size = 0;
+        }
+        let items = vec![it("/l/Photos/Trips/Rome/a.jpg", "Photos", Some("Trips/Rome"), Kind::Photo), it("/l/Photos/Trips/b.txt", "Photos", Some("Trips"), Kind::Document), it("/l/Photos/c.jpg", "Photos", None, Kind::Photo)];
+        fill_albums(&mut albums, &items);
+        assert_eq!(albums[0].size, 2);
+        assert_eq!(albums[1].size, 1);
+        assert_eq!(albums[0].cover.as_ref().map(|c| c.0.clone()), Some(PathBuf::from("/l/Photos/Trips/Rome/a.jpg")));
     }
 }
 

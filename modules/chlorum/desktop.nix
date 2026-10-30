@@ -594,7 +594,9 @@ in
       };
     };
 
-    # The lock screen checks the profile password through PAM (homed)
+    # The lock screen checks the profile password through PAM (homed). It
+    # asks chlorum keyd to do it as root, as greetd does for the login
+    # screen: a homed profile cannot always be checked from inside it.
     security.pam.services.chlorum-lock = { };
 
     # Logging out ends everything the profile started, so its encrypted

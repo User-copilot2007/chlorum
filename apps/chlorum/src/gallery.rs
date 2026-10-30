@@ -5,7 +5,8 @@
 //! folder.
 //!
 //! Keys, grid: arrows move, Enter views, Tab shows all / photos / videos /
-//! screenshots, S sorts (date, name, resolution, file size), T shows the
+//! screenshots, A shows the albums (the folders they are in), S sorts
+//! (date, name, resolution, file size), T shows the
 //! timeline (jump to any year and month), PageUp/PageDown go a month back
 //! or on, typing a year (2019) or, sorted by name, a name jumps there,
 //! Delete puts in the bin (Enter to confirm), Esc closes.
@@ -189,8 +190,8 @@ impl Sort {
 
 /// The order of the photos shown: indexes into the list, filtered (Tab)
 /// and sorted (S).
-fn order(all: &[Media], show: Show, sort: Sort) -> Vec<usize> {
-    let mut v: Vec<usize> = (0..all.len()).filter(|i| show.keeps(&all[*i])).collect();
+fn order(all: &[Media], show: Show, sort: Sort, album: Option<&Path>) -> Vec<usize> {
+    let mut v: Vec<usize> = (0..all.len()).filter(|i| show.keeps(&all[*i]) && album.is_none_or(|a| all[*i].path.parent() == Some(a))).collect();
     let pixels = |i: &usize| all[*i].dims.map(|(w, h)| w as u64 * h as u64);
     let name = |i: &usize| all[*i].name().to_lowercase();
     match sort {
@@ -317,6 +318,7 @@ pub enum Message {
 enum Panel {
     Sort(usize),
     Timeline(usize),
+    Albums(usize),
 }
 
 pub struct Gallery {
@@ -353,6 +355,8 @@ pub struct Gallery {
     dims_read: (usize, usize),
     /// mouse wheel: when it last moved, for speeding up
     last_wheel: Instant,
+    /// only the photos and videos of this folder (an album), when chosen
+    album: Option<PathBuf>,
 }
 
 impl Gallery {
@@ -366,10 +370,35 @@ impl Gallery {
     /// on the same photo.
     fn reorder(&mut self) {
         let keep = self.at(self.sel).map(|m| m.path.clone());
-        self.order = order(&self.all, self.show, self.sort);
+        self.order = order(&self.all, self.show, self.sort, self.album.as_deref());
         self.version += 1;
         self.sel = keep.and_then(|p| self.order.iter().position(|k| self.all[*k].path == p)).unwrap_or(0).min(self.order.len().saturating_sub(1));
     }
+    /// The albums: every folder holding photos or videos, with how many
+    /// (of the kind shown), by name. The first line is "everything".
+    fn albums(&self) -> Vec<(Option<PathBuf>, String, usize)> {
+        let mut count: std::collections::HashMap<&Path, usize> = std::collections::HashMap::new();
+        for m in self.all.iter().filter(|m| self.show.keeps(m)) {
+            if let Some(d) = m.path.parent() {
+                *count.entry(d).or_default() += 1;
+            }
+        }
+        let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+        let mut v: Vec<(Option<PathBuf>, String, usize)> = count
+            .into_iter()
+            .map(|(d, n)| {
+                // "Photos › Rome": where it is, without the home (or Library)
+                let inside = d.strip_prefix(home.join("Library")).or_else(|_| d.strip_prefix(&home)).unwrap_or(d);
+                let shown = inside.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect::<Vec<_>>().join(" › ");
+                (Some(d.to_path_buf()), shown, n)
+            })
+            .collect();
+        v.sort_by_key(|(_, l, _)| l.to_lowercase());
+        let total = self.all.iter().filter(|m| self.show.keeps(m)).count();
+        v.insert(0, (None, "Everything".into(), total));
+        v
+    }
+
     /// The start of each section (month, letter…) with its name and size.
     fn sections(&self) -> Vec<(String, usize, usize)> {
         let mut out: Vec<(String, usize, usize)> = vec![];
@@ -453,7 +482,7 @@ impl Gallery {
                 self.all.retain(|x| x.path != m.path);
                 // the old order points into the old list: made afresh, the
                 // next photo taking this one's place
-                self.order = order(&self.all, self.show, self.sort);
+                self.order = order(&self.all, self.show, self.sort, self.album.as_deref());
                 self.version += 1;
                 let n = self.len();
                 if n == 0 {
@@ -474,7 +503,7 @@ impl Gallery {
         let n = self.len();
         // typing jumps: a year when by date, the start of a name when by name
         let typing = !self.typed.0.is_empty() && self.typed.1.elapsed() < Duration::from_millis(2500);
-        let command = ch == "s" || ch == "t";
+        let command = ch == "s" || ch == "t" || ch == "a";
         if named.is_none() && ch.chars().count() == 1 && ch != " " && (!command || typing) {
             if self.typed.1.elapsed() > Duration::from_millis(2500) {
                 self.typed.0.clear();
@@ -507,6 +536,11 @@ impl Gallery {
         }
         if ch == "s" {
             self.panel = Some(Panel::Sort(Sort::ALL.iter().position(|x| *x == self.sort).unwrap_or(0)));
+            return Task::none();
+        }
+        if ch == "a" {
+            let at = self.albums().iter().position(|(d, _, _)| *d == self.album).unwrap_or(0);
+            self.panel = Some(Panel::Albums(at));
             return Task::none();
         }
         if ch == "t" {
@@ -570,6 +604,11 @@ impl Gallery {
                 self.viewing = true;
                 return self.prefetch();
             }
+            // out of an album first, then closed
+            Some(Named::Escape) if self.album.is_some() => {
+                self.album = None;
+                self.reorder();
+            }
             Some(Named::Escape) => std::process::exit(0),
             _ => {}
         }
@@ -582,10 +621,12 @@ impl Gallery {
         let len = match p {
             Panel::Sort(_) => Sort::ALL.len(),
             Panel::Timeline(_) => self.sections().len(),
+            Panel::Albums(_) => self.albums().len(),
         };
         let (i, make): (usize, fn(usize) -> Panel) = match p {
             Panel::Sort(i) => (i, Panel::Sort),
             Panel::Timeline(i) => (i, Panel::Timeline),
+            Panel::Albums(i) => (i, Panel::Albums),
         };
         match named {
             Some(Named::ArrowDown) => self.panel = Some(make((i + 1).min(len.saturating_sub(1)))),
@@ -610,6 +651,16 @@ impl Gallery {
                     Panel::Timeline(i) => {
                         if let Some((_, start, _)) = self.sections().get(i) {
                             self.sel = *start;
+                        }
+                    }
+                    Panel::Albums(i) => {
+                        if let Some((d, label, _)) = self.albums().get(i).cloned() {
+                            self.album = d;
+                            self.reorder();
+                            self.sel = 0;
+                            if self.album.is_some() {
+                                self.say(format!("{label}. Esc shows everything again."));
+                            }
                         }
                     }
                 }
@@ -640,6 +691,16 @@ impl Gallery {
                 for (i, s) in Sort::ALL.iter().enumerate() {
                     let detail = if *s == self.sort { "NOW".to_string() } else if matches!(s, Sort::Largest | Sort::Smallest) && self.dims_read.0 < self.dims_read.1 { format!("{}%", self.dims_read.0 * 100 / self.dims_read.1.max(1)) } else { String::new() };
                     col = col.push(row(s.label().to_string(), detail, i == at));
+                }
+            }
+            Panel::Albums(at) => {
+                col = col.push(text("ALBUMS", MONO, 14.0, YELLOW)).push(space(1.0, 6.0));
+                let all = self.albums();
+                let shown = ((self.size.height - 300.0) / 46.0).max(5.0) as usize;
+                let first = at.saturating_sub(shown / 2).min(all.len().saturating_sub(shown));
+                for (i, (_, label, n)) in all.iter().enumerate().skip(first).take(shown) {
+                    let short: String = if label.chars().count() > 34 { format!("…{}", label.chars().rev().take(33).collect::<Vec<_>>().into_iter().rev().collect::<String>()) } else { label.clone() };
+                    col = col.push(row(short, format!("{n}"), i == at));
                 }
             }
             Panel::Timeline(at) => {
@@ -786,7 +847,8 @@ impl Gallery {
             String::new()
         } else {
             let place = self.at(self.sel).map(|m| section_of(m, self.sort)).unwrap_or_default();
-            format!("{} of {}  ·  {}  ·  {}", self.sel + 1, n, place, self.sort.label().to_uppercase())
+            let album = self.album.as_ref().and_then(|a| a.file_name()).map(|a| format!("ALBUM {}  ·  ", a.to_string_lossy().to_uppercase())).unwrap_or_default();
+            format!("{album}{} of {}  ·  {}  ·  {}", self.sel + 1, n, place, self.sort.label().to_uppercase())
         };
         let mut col = widget::Column::new()
             .push(widget::Row::new().push(text("Gallery", SANS_BOLD, 44.0, TEXT)).push(hfill()).push(tabs).align_y(Alignment::Center))
@@ -821,11 +883,12 @@ impl Gallery {
                 ("ENTER", "View", true),
                 ("PG UP · DOWN", if self.sort.by_date() { "Month" } else { "Section" }, false),
                 ("T", "Timeline", false),
+                ("A", "Albums", false),
                 ("S", "Order", false),
                 ("TYPE", if self.sort.by_date() { "A year" } else { "A name" }, false),
                 ("TAB", "Photos · Videos", false),
                 ("DEL", "Bin", false),
-                ("ESC", "Close", false),
+                ("ESC", if self.album.is_some() { "Everything" } else { "Close" }, false),
             ],
             1.0,
         ));
@@ -919,6 +982,7 @@ impl Application for Gallery {
             typed: (String::new(), Instant::now()),
             dims_read: (0, 0),
             last_wheel: Instant::now(),
+            album: None,
         };
         let load = Task::perform(
             async move {
@@ -1180,7 +1244,7 @@ mod tests {
     #[test]
     fn months_start_new_rows() {
         let list = vec![m("a", 0), m("b", 0), m("c", 0), m("d", 400), m("e", 400)];
-        let ord = order(&list, Show::All, Sort::Newest);
+        let ord = order(&list, Show::All, Sort::Newest, None);
         let ls = lines(&list, &ord, Sort::Newest, 2);
         assert_eq!(ls[0], Line::Month("This month".into()));
         assert_eq!(ls[1], Line::Row(vec![0, 1]));
@@ -1191,11 +1255,11 @@ mod tests {
         let mut list = list;
         list[0].dims = Some((100, 100));
         list[3].dims = Some((4000, 3000));
-        let ord = order(&list, Show::All, Sort::Largest);
+        let ord = order(&list, Show::All, Sort::Largest, None);
         assert_eq!(ord[0], 3);
         assert_eq!(ord[1], 0);
         // by name, Z to A
-        let ord = order(&list, Show::All, Sort::NameZa);
+        let ord = order(&list, Show::All, Sort::NameZa, None);
         assert_eq!(list[ord[0]].name(), "e");
     }
 }
