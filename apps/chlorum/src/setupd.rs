@@ -26,6 +26,7 @@ pub const LAYOUTS: &[(&str, &str, &str)] = &[
     ("es", "es", "Spanish"),
     ("it", "it", "Italian"),
     ("pl", "pl", "Polish"),
+    ("ru", "ru", "Russian"),
 ];
 
 const ADJECTIVES: &[&str] = &[

@@ -1885,10 +1885,17 @@ impl Shell {
             }
             Section::Keyboard => {
                 if dir == 0 {
+                    // Enter turns a layout on or off; English (US) stays on
                     if let Some(l) = crate::setupd::LAYOUTS.get(row) {
-                        system::set_keyboard(l.0);
-                        self.keyboard = l.0.to_string();
-                        self.toast(&format!("Keyboard: {}", l.2));
+                        match system::toggle_layout(&self.keyboard, l.0) {
+                            Ok(new) => {
+                                let on = system::keyboard_list(&new).iter().any(|x| x == l.0);
+                                system::set_keyboard(&new);
+                                self.keyboard = new;
+                                self.toast(&format!("{}: {}. Alt + Shift switches.", l.2, if on { "on" } else { "off" }));
+                            }
+                            Err(e) => self.toast(&e),
+                        }
                     }
                 }
             }
@@ -2822,10 +2829,11 @@ impl Shell {
     fn keyboard_view(&self, f: f32) -> Element<'_, Message> {
         let mut col = widget::Column::new().spacing(8);
         col = col
-            .push(text("Alt + Shift switches between this layout and English (US).", SANS, 20.0, alpha(TEXT_2, f)))
+            .push(text("Enter turns a layout on or off. Alt + Shift switches between the ones that are on.", SANS, 20.0, alpha(TEXT_2, f)))
             .push(space(1.0, 10.0));
         for (i, (id, _, name)) in crate::setupd::LAYOUTS.iter().enumerate() {
-            let detail = if *id == self.keyboard { "IN USE".to_string() } else { id.to_uppercase() };
+            let on = system::keyboard_list(&self.keyboard).iter().any(|x| x == id);
+            let detail = if *id == "us" { "ALWAYS ON".to_string() } else if on { "ON".to_string() } else { "OFF".to_string() };
             col = col.push(self.list_row(i, name.to_string(), detail, f));
         }
         widget::scrollable(col).height(Length::Fill).into()

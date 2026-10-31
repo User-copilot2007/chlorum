@@ -191,8 +191,10 @@ let
     dir="''${XDG_RUNTIME_DIR:-/tmp}/chlorum"
     mkdir -p "$dir"
 
-    # keyboard: the layout chosen on first start, plus US for shortcuts
+    # keyboard: the layouts turned on ("ua,ru"; the one chosen on first
+    # start until then), after US for shortcuts and passwords
     layout=$(cat "$HOME/.config/chlorum/keyboard" 2>/dev/null || cat /var/lib/chlorum/xkb-layout 2>/dev/null || echo us)
+    layout=$(printf %s "$layout" | tr -cd 'a-z,')
     case "$layout" in
       us|"") layout=us ;;
       *) layout="us,$layout" ;;   # US first: passwords are typed on it

@@ -573,17 +573,44 @@ pub fn keyboard() -> String {
         .unwrap_or_else(|_| "us".into())
 }
 
-/// The niri layout string: the chosen layout plus US. Passwords are Latin
-/// words, so a non-Latin layout (Ukrainian) comes second: what you type at
-/// the login and lock screens is always Latin, Alt+Shift switches.
-pub fn xkb_layouts(id: &str) -> String {
-    // US QWERTY always comes first: passwords are made and typed on it, so
-    // the login and lock screens read them the same way. The other layout is
-    // one Alt+Shift away.
-    match id {
-        "us" | "" => "us".into(),
-        other => format!("us,{other}"),
+/// The layouts turned on besides English (US), in order: "ua,ru" → [ua, ru].
+pub fn keyboard_list(saved: &str) -> Vec<String> {
+    let mut v: Vec<String> = vec![];
+    for id in saved.split(',').map(str::trim).filter(|x| !x.is_empty() && *x != "us") {
+        if !v.iter().any(|x| x == id) {
+            v.push(id.to_string());
+        }
     }
+    v
+}
+
+/// xkb takes at most four layouts: English (US) and three more.
+pub const MAX_EXTRA_LAYOUTS: usize = 3;
+
+/// Turns a layout on or off ("ua" in "ua,ru"); the new saved value, or why not.
+pub fn toggle_layout(saved: &str, id: &str) -> Result<String, String> {
+    let mut v = keyboard_list(saved);
+    if id == "us" {
+        return Err("English (US) is always on: passwords are typed on it.".into());
+    }
+    if let Some(i) = v.iter().position(|x| x == id) {
+        v.remove(i);
+    } else if v.len() >= MAX_EXTRA_LAYOUTS {
+        return Err("At most four layouts can be on. Turn one off first.".into());
+    } else {
+        v.push(id.to_string());
+    }
+    Ok(if v.is_empty() { "us".into() } else { v.join(",") })
+}
+
+/// The niri layout string: US, then the layouts turned on ("ua,ru" →
+/// "us,ua,ru"). US QWERTY always comes first: passwords are made and typed
+/// on it, so the login and lock screens read them the same way. Alt+Shift
+/// goes through the others.
+pub fn xkb_layouts(saved: &str) -> String {
+    let mut v = vec!["us".to_string()];
+    v.extend(keyboard_list(saved));
+    v.join(",")
 }
 
 /// Saves the layout and switches to it now: niri reloads its config file.
@@ -630,5 +657,12 @@ mod tests {
         assert_eq!(xkb_layouts("ua"), "us,ua");
         assert_eq!(xkb_layouts("de"), "us,de");
         assert_eq!(xkb_layouts("us"), "us");
+        assert_eq!(xkb_layouts("ua,ru"), "us,ua,ru");
+        assert_eq!(xkb_layouts("us,ua,ua"), "us,ua");
+        assert_eq!(toggle_layout("ua", "ru").unwrap(), "ua,ru");
+        assert_eq!(toggle_layout("ua,ru", "ua").unwrap(), "ru");
+        assert_eq!(toggle_layout("ru", "ru").unwrap(), "us");
+        assert!(toggle_layout("ua,ru,de", "fr").is_err());
+        assert!(toggle_layout("ua", "us").is_err());
     }
 }
