@@ -1,6 +1,6 @@
 [package]
 name = "chlorum"
-version = "0.13.4"
+version = "0.14.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Chlorum shell: Home, system menu, app layouts, login screen and Library"
@@ -21,6 +21,16 @@ khronos-egl = { version = "6", features = ["static"] }
 glow = "0.16"
 # notifications from apps
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+# the network guard: OpenSnitch's daemon asks Chlorum (its UI, over gRPC)
+tonic = { version = "=0.12.3", default-features = false, features = ["transport", "codegen", "prost"] }
+prost = "0.13"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[dev-dependencies]
+# the network guard's test plays the daemon over a Unix socket
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tower = "0.4"
+hyper-util = { version = "0.1", features = ["tokio"] }
 
 [dependencies.libcosmic]
 git = "https://github.com/pop-os/libcosmic.git"

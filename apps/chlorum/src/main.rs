@@ -30,6 +30,7 @@ mod library;
 mod lock;
 mod lockscreen;
 mod mime;
+mod netguard;
 mod niri;
 mod notify;
 mod phones;

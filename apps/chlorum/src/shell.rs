@@ -158,6 +158,7 @@ enum Section {
     Screen,
     Home,
     Apps,
+    Internet,
     GetApps,
     Updates,
     Shortcuts,
@@ -165,7 +166,7 @@ enum Section {
 }
 
 impl Section {
-    const ALL: [Section; 12] = [
+    const ALL: [Section; 13] = [
         Section::Wallpaper,
         Section::Network,
         Section::Bluetooth,
@@ -174,6 +175,7 @@ impl Section {
         Section::Screen,
         Section::Home,
         Section::Apps,
+        Section::Internet,
         Section::GetApps,
         Section::Updates,
         Section::Shortcuts,
@@ -189,6 +191,7 @@ impl Section {
             Section::Screen => "Screen",
             Section::Home => "Home",
             Section::Apps => "Apps",
+            Section::Internet => "Internet",
             Section::GetApps => "Get apps",
             Section::Updates => "Updates",
             Section::Shortcuts => "Shortcuts",
@@ -254,6 +257,8 @@ pub enum Message {
     StoreFound(String, Result<Vec<crate::store::Found>, String>),
     StoreInstalled(std::collections::BTreeSet<String>),
     Store(crate::store::Event),
+    /// the network guard: a question, the rules, the latest connections
+    Net(crate::netguard::Event),
 }
 
 pub struct Shell {
@@ -369,6 +374,15 @@ pub struct Shell {
     wifi_note: Option<String>,
     keyboard: String,
 
+    /// the network guard: questions waiting (the first is shown), when each
+    /// came, and the option chosen in it
+    net_asks: std::collections::VecDeque<(crate::netguard::Ask, Instant)>,
+    net_choice: usize,
+    /// the rules Chlorum made, the latest connections, the daemon is there
+    net_kept: Vec<crate::netguard::Kept>,
+    net_seen: Vec<crate::netguard::Seen>,
+    net_on: bool,
+
     notes: Vec<Note>,
     note_surface: Option<(window::Id, Instant)>,
 
@@ -467,6 +481,11 @@ impl Application for Shell {
             wifi_pw: String::new(),
             wifi_note: None,
             keyboard: system::keyboard(),
+            net_asks: Default::default(),
+            net_choice: 0,
+            net_kept: vec![],
+            net_seen: vec![],
+            net_on: false,
             notes: vec![],
             note_surface: None,
             started_at: Instant::now(),
@@ -498,6 +517,7 @@ impl Application for Shell {
             Subscription::run(commands),
             Subscription::run(notify::events).map(Message::Note),
             Subscription::run(crate::bluetooth::agent).map(Message::BtAgent),
+            Subscription::run(crate::netguard::events).map(Message::Net),
             Subscription::run(notify::sleeps).map(|_| Message::Command("lock".into())),
             Subscription::run(crate::drives::plugged).map(|name| {
                 Message::Note(notify::Event::Show(Note {
@@ -546,6 +566,14 @@ impl Application for Shell {
         if id != self.surface {
             return widget::Space::new().into();
         }
+        if let Some((ask, _)) = self.net_asks.front() {
+            let base: Element<'_, Message> = match (self.home.is_some(), self.menu.is_some()) {
+                (true, _) => self.home_view(),
+                (false, true) => self.menu_view(),
+                _ => widget::Space::new().into(),
+            };
+            return cosmic::iced::widget::Stack::new().push(base).push(self.net_ask_view(ask)).width(Length::Fill).height(Length::Fill).into();
+        }
         match (self.home.is_some(), self.menu.is_some()) {
             (true, true) => cosmic::iced::widget::Stack::new()
                 .push(self.home_view())
@@ -565,6 +593,15 @@ impl Shell {
         match message {
             Message::Frame => return self.step(),
             Message::Tick => {
+                // the daemon blocks after 30 seconds: the question is moot
+                let before = self.net_asks.len();
+                self.net_asks.retain(|(_, at)| at.elapsed() < Duration::from_secs(30));
+                if self.net_asks.len() < before {
+                    self.net_choice = 0;
+                    if self.net_asks.is_empty() {
+                        return self.lower_if_idle();
+                    }
+                }
                 // looking for Bluetooth devices: show new ones as they come
                 if let Some(until) = self.bt_scan_until {
                     if Instant::now() > until {
@@ -821,7 +858,33 @@ impl Shell {
             }
             Message::Note(notify::Event::Show(n)) => return self.show_note(n),
             Message::Note(notify::Event::Close(id)) => self.notes.retain(|n| n.id != id),
+            Message::Net(e) => {
+                use crate::netguard::Event;
+                match e {
+                    Event::Ask(a) => {
+                        self.net_asks.push_back((a, Instant::now()));
+                        if self.net_asks.len() == 1 {
+                            self.net_choice = 0;
+                            return self.raise();
+                        }
+                    }
+                    Event::Kept(k) => {
+                        self.net_kept = k;
+                        if Section::ALL[self.section] == Section::Internet {
+                            if let Some(r) = self.row {
+                                self.row = Some(r.min(self.net_kept.len().saturating_sub(1)));
+                            }
+                        }
+                    }
+                    Event::Seen(s) => self.net_seen = s,
+                    Event::Connected(on) => self.net_on = on,
+                }
+            }
             Message::Key(id, key, mods) => {
+                // a network question comes before anything else on screen
+                if id == self.surface && !self.net_asks.is_empty() {
+                    return self.net_key(key);
+                }
                 if Some(id) == self.menu && !self.menu_closing {
                     return self.menu_key(key);
                 }
@@ -1132,7 +1195,7 @@ impl Shell {
     /// Nothing to show: send the (now transparent) surface below the apps
     /// and give the keyboard back.
     fn lower_if_idle(&mut self) -> Task<Message> {
-        if !self.surface_up || self.home.is_some() || self.menu.is_some() {
+        if !self.surface_up || self.home.is_some() || self.menu.is_some() || !self.net_asks.is_empty() {
             return Task::none();
         }
         self.surface_up = false;
@@ -1730,7 +1793,19 @@ impl Shell {
             }
             return Task::none();
         };
-        let flat = matches!(section, Section::Network | Section::Keyboard | Section::Bluetooth | Section::GetApps) || (section == Section::Apps && self.perm_app.is_none());
+        let flat = matches!(section, Section::Network | Section::Keyboard | Section::Bluetooth | Section::GetApps | Section::Internet) || (section == Section::Apps && self.perm_app.is_none());
+        // Delete forgets a rule of the network guard: the app asks again
+        if section == Section::Internet && matches!(named, Some(Named::Delete) | Some(Named::Backspace)) {
+            if let Some(k) = self.net_kept.get(row).cloned() {
+                let what = format!("{} · {}", self.app_label(&k.app), k.place.clone().unwrap_or_else(|| "everything".into()));
+                if crate::netguard::forget(&k.name) {
+                    self.toast(&format!("Forgotten: {what}. It will ask again."));
+                } else {
+                    self.toast("The network guard is not running.");
+                }
+            }
+            return Task::none();
+        }
         // Delete removes an installed app
         if section == Section::GetApps && named == Some(Named::Delete) {
             return self.store_key(row, 0, true);
@@ -1959,7 +2034,7 @@ impl Shell {
                     }
                 }
             }
-            Section::About | Section::Shortcuts => {}
+            Section::About | Section::Shortcuts | Section::Internet => {}
         }
         Task::none()
     }
@@ -2255,6 +2330,7 @@ impl Shell {
             },
             Section::Home => 1,
             Section::Apps => if self.perm_app.is_some() { crate::sandbox::Perm::ALL.len() } else { self.app_list().len() },
+            Section::Internet => self.net_kept.len(),
             Section::GetApps => self.store_rows().len(),
             Section::Updates => 1,
             Section::About | Section::Shortcuts => 0,
@@ -2491,13 +2567,14 @@ impl Shell {
             Section::Screen => self.screen_view(f),
             Section::Home => self.home_settings_view(f),
             Section::Apps => self.apps_view(f),
+            Section::Internet => self.internet_view(f),
             Section::GetApps => self.store_view(f),
             Section::Updates => self.updates_view(f),
             Section::About => self.about_view(f),
             Section::Shortcuts => self.shortcuts_view(f),
         };
         let sec = Section::ALL[self.section];
-        let flat = matches!(sec, Section::Network | Section::Keyboard);
+        let flat = matches!(sec, Section::Network | Section::Keyboard | Section::Internet);
         let h: &[(&str, &str, bool)] = if self.wifi_entry.is_some() {
             &[("ENTER", "Connect", true), ("ESC", "Cancel", false)]
         } else if sec == Section::Apps && self.row.is_some() && self.perm_app.is_none() {
@@ -2822,6 +2899,163 @@ impl Shell {
         }
         if list.len() > SHOWN {
             col = col.push(text(format!("{} of {}", sel + 1, list.len()), MONO, 14.0, alpha(TEXT_2, f)));
+        }
+        col.into()
+    }
+
+    /// An app's name as people know it ("LibreWolf"), from its id.
+    fn app_label(&self, id: &str) -> String {
+        self.installed.get(id).map(|a| a.name.clone()).unwrap_or_else(|| id.to_string())
+    }
+
+    /// The choices of a network question, in order.
+    fn net_options(&self, ask: &crate::netguard::Ask) -> [(crate::netguard::Answer, String); 4] {
+        use crate::netguard::Answer;
+        let place = ask.place();
+        let app = self.app_label(&ask.app);
+        [
+            (Answer::AllowPlace, format!("Allow {place}")),
+            (Answer::AllowApp, format!("Allow everything for {app}")),
+            (Answer::BlockPlace, format!("Block {place}")),
+            (Answer::BlockOnce, "Not now".to_string()),
+        ]
+    }
+
+    /// Keys while a network question is on screen: ↑ ↓ and Enter, 1–4, Esc
+    /// is "Not now".
+    fn net_key(&mut self, key: keyboard::Key) -> Task<Message> {
+        use crate::netguard::Answer;
+        use keyboard::key::Named;
+        let Some((ask, _)) = self.net_asks.front().cloned() else { return Task::none() };
+        let opts = self.net_options(&ask);
+        let chosen = match key.as_ref() {
+            keyboard::Key::Named(Named::ArrowDown) => {
+                self.net_choice = (self.net_choice + 1).min(opts.len() - 1);
+                None
+            }
+            keyboard::Key::Named(Named::ArrowUp) => {
+                self.net_choice = self.net_choice.saturating_sub(1);
+                None
+            }
+            keyboard::Key::Named(Named::Enter) => Some(opts[self.net_choice].0),
+            keyboard::Key::Named(Named::Escape) => Some(Answer::BlockOnce),
+            keyboard::Key::Character(c) => c.parse::<usize>().ok().filter(|n| (1..=opts.len()).contains(n)).map(|n| opts[n - 1].0),
+            _ => None,
+        };
+        let Some(a) = chosen else { return Task::none() };
+        crate::netguard::answer(ask.id, a);
+        self.net_asks.pop_front();
+        self.net_choice = 0;
+        let app = self.app_label(&ask.app);
+        match a {
+            Answer::AllowPlace => self.toast(&format!("{app} may reach {} from now on.", ask.place())),
+            Answer::AllowApp => self.toast(&format!("{app} may reach any place. Center → Internet changes it.")),
+            Answer::BlockPlace => self.toast(&format!("{} is blocked for {app}.", ask.place())),
+            Answer::BlockOnce => {}
+        }
+        if self.net_asks.is_empty() { self.lower_if_idle() } else { Task::none() }
+    }
+
+    fn net_ask_view(&self, ask: &crate::netguard::Ask) -> Element<'_, Message> {
+        let app = self.installed.get(&ask.app);
+        let name = self.app_label(&ask.app);
+        let icon = app.map(|a| a.icon.clone()).unwrap_or_else(|| "application-x-executable".into());
+        let mut col = widget::Column::new()
+            .spacing(12)
+            .width(Length::Fixed(620.0))
+            .push(text("INTERNET", MONO, 15.0, YELLOW))
+            .push(
+                widget::Row::new()
+                    .push(widget::icon::from_name(icon).size(64))
+                    .push(widget::Column::new().push(text(format!("{name} wants to reach"), SANS, 22.0, TEXT_2)).push(text(ask.place(), SANS_BOLD, 34.0, TEXT)))
+                    .spacing(20)
+                    .align_y(Alignment::Center),
+            )
+            .push(text(
+                format!(
+                    "port {}{}{}",
+                    ask.port,
+                    if ask.protocol.is_empty() { String::new() } else { format!(" · {}", ask.protocol.to_uppercase()) },
+                    if ask.host.is_empty() { String::new() } else { format!(" · {}", ask.ip) }
+                ),
+                MONO,
+                15.0,
+                TEXT_2,
+            ))
+            .push(space(1.0, 8.0));
+        for (i, (_, label)) in self.net_options(ask).iter().enumerate() {
+            let on = i == self.net_choice;
+            col = col.push(
+                fill(
+                    widget::Row::new()
+                        .push(text(format!("{}", i + 1), MONO_BOLD, 16.0, if on { BLACK } else { TEXT_2 }))
+                        .push(text(label.clone(), SANS_BOLD, 22.0, if on { BLACK } else { TEXT }))
+                        .spacing(18)
+                        .align_y(Alignment::Center),
+                    if on { YELLOW } else { PANEL_2 },
+                )
+                .padding([14, 22])
+                .width(Length::Fill),
+            );
+        }
+        let left = 30u64.saturating_sub(self.net_asks.front().map(|(_, at)| at.elapsed().as_secs()).unwrap_or(0));
+        let more = self.net_asks.len().saturating_sub(1);
+        col = col.push(space(1.0, 6.0)).push(text(
+            format!("No answer in {left} s: not now.{}", if more > 0 { format!("  {more} more waiting.") } else { String::new() }),
+            SANS,
+            17.0,
+            TEXT_2,
+        ));
+        col = col.push(hints(&[("↑ ↓", "Choose", false), ("ENTER", "Answer", true), ("1–4", "Pick", false), ("ESC", "Not now", false)], 1.0));
+        widget::container(fill(col.padding(36), PANEL).width(Length::Shrink))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .class(cosmic::theme::Container::custom(|_| cosmic::iced::widget::container::Style {
+                background: Some(cosmic::iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.72))),
+                ..Default::default()
+            }))
+            .into()
+    }
+
+    /// Center → Internet: the rules the guard keeps, and the latest
+    /// connections of apps.
+    fn internet_view(&self, f: f32) -> Element<'_, Message> {
+        let mut col = widget::Column::new().spacing(8);
+        col = col.push(text(
+            if self.net_on {
+                "The first time an app reaches a new place, Chlorum asks. Delete forgets an answer: the app asks again."
+            } else {
+                "The network guard is not running: apps with internet reach any place."
+            },
+            SANS,
+            20.0,
+            alpha(TEXT_2, f),
+        ));
+        col = col.push(space(1.0, 10.0));
+        if self.net_kept.is_empty() {
+            col = col.push(text("No answers yet.", SANS, 20.0, alpha(TEXT_2, f)));
+        }
+        let shown = 7;
+        for i in self.window(0, self.net_kept.len(), shown) {
+            let k = &self.net_kept[i];
+            let what = match &k.place {
+                Some(p) => format!("{} · {p}", self.app_label(&k.app)),
+                None => format!("{} · every place", self.app_label(&k.app)),
+            };
+            col = col.push(self.list_row(i, what, if k.allow { "ALLOWED".into() } else { "BLOCKED".into() }, f));
+        }
+        if !self.net_seen.is_empty() {
+            col = col.push(space(1.0, 14.0)).push(text("LATELY", MONO, 15.0, alpha(TEXT_2, f)));
+            for s in self.net_seen.iter().take(8) {
+                col = col.push(text(
+                    format!("{}  {}  {} :{}  {}", s.time, self.app_label(&s.app), s.place, s.port, if s.allowed { "" } else { "· blocked" }),
+                    MONO,
+                    15.0,
+                    alpha(if s.allowed { TEXT_2 } else { RED }, f),
+                ));
+            }
         }
         col.into()
     }

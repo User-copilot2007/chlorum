@@ -596,6 +596,38 @@ in
       };
     };
 
+    # The network guard: OpenSnitch holds every new connection and asks
+    # Chlorum's shell (its UI, on a socket in /run/chlorum-netui) when an
+    # app reaches a place nobody has decided about; the answers are kept as
+    # its rules. With nobody to ask (no one logged in), connections go
+    # through, as they would without it. See apps/chlorum/src/netguard.rs.
+    services.opensnitch = {
+      enable = true;
+      settings = {
+        # a relative path, so the daemon's gRPC "authority" is the plain
+        # "osui.sock" (a full path is refused by the shell's HTTP/2 side)
+        Server.Address = "unix:osui.sock";
+        Server.Authentication.Type = "simple";
+        DefaultAction = "allow";
+        DefaultDuration = "once";
+        InterceptUnknown = false;
+        Firewall = "nftables";
+      };
+      # the system's own services (root) are never asked about
+      rules."000-chlorum-system-root" = {
+        name = "000-chlorum-system-root";
+        enabled = true;
+        precedence = true;
+        action = "allow";
+        duration = "always";
+        operator = { type = "simple"; sensitive = false; operand = "user.id"; data = "0"; };
+      };
+    };
+    # only the owner's shell may answer for the daemon, which looks for
+    # the socket in its working folder
+    systemd.tmpfiles.rules = [ "d /run/chlorum-netui 0770 root chlorum-owner -" ];
+    systemd.services.opensnitchd.serviceConfig.WorkingDirectory = "/run/chlorum-netui";
+
     # The lock screen checks the profile password through PAM (homed). It
     # asks chlorum keyd to do it as root, as greetd does for the login
     # screen: a homed profile cannot always be checked from inside it.
