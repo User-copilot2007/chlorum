@@ -1,6 +1,6 @@
 [package]
 name = "chlorum"
-version = "0.14.0"
+version = "0.14.1"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "Chlorum shell: Home, system menu, app layouts, login screen and Library"
@@ -25,6 +25,8 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 tonic = { version = "=0.12.3", default-features = false, features = ["transport", "codegen", "prost"] }
 prost = "0.13"
 tokio-stream = { version = "0.1", features = ["net"] }
+# Passwords: a KeePass (KDBX 4) vault
+keepass = { version = "0.17", features = ["save_kdbx4"] }
 
 [dev-dependencies]
 # the network guard's test plays the daemon over a Unix socket

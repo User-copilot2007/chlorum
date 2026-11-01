@@ -64,6 +64,18 @@ let
       StartupWMClass=chlorum-library
       Categories=Utility;FileManager;
       EOF
+      # Passwords: nothing allowed (no internet, no files but its own)
+      install -Dm644 /dev/stdin $out/share/applications/chlorum-passwords.desktop <<EOF
+      [Desktop Entry]
+      Type=Application
+      Name=Passwords
+      Comment=Your logins, locked in a vault
+      Icon=dialog-password
+      Exec=$out/bin/chlorum passwords
+      StartupWMClass=chlorum-passwords
+      Categories=Utility;Security;
+      X-Chlorum-Permissions=none
+      EOF
       # the open/save window every app gets (xdg-desktop-portal backend)
       install -Dm644 /dev/stdin $out/share/xdg-desktop-portal/portals/chlorum.portal <<EOF
       [portal]

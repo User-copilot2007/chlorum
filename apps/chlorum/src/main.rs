@@ -33,6 +33,7 @@ mod mime;
 mod netguard;
 mod niri;
 mod notify;
+mod passwords;
 mod phones;
 mod pointer;
 mod portal;
@@ -73,6 +74,7 @@ fn main() {
         "greeter" => greeter::run().map_err(|e| e.to_string()),
         "library" => library::run().map_err(|e| e.to_string()),
         "gallery" => gallery::run(&args[2..]),
+        "passwords" => passwords::run(),
         "pick" => library::pick_cli(&args[2..]),
         "portal" => portal::run(),
         "pointer" => pointer::run(),
